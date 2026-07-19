@@ -18,10 +18,8 @@ pub fn assign_data_for_state(
             if matches!(committee, Committee::Trainer) {
                 Some(client)
             } else {
-                match committee {
-                    Committee::TieBreaker => assert_eq!(round.tie_breaker_tasks, 0), // TODO
-                    Committee::Verifier => assert_eq!(coordinator.config.verification_percent, 0), // TODO
-                    _ => {}
+                if matches!(committee, Committee::TieBreaker) {
+                    assert_eq!(round.tie_breaker_tasks, 0);
                 }
                 None
             }

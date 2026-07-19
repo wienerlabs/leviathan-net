@@ -1,11 +1,15 @@
 #![allow(unexpected_cfgs)]
 
+mod audit_selection;
 mod commitment;
 mod committee_selection;
 mod coordinator;
 mod data_selection;
 pub mod model;
 
+pub use audit_selection::{
+    AUDIT_SALT, AuditAssignment, select_audits, select_audits_for_current_round,
+};
 pub use commitment::Commitment;
 pub use committee_selection::{
     COMMITTEE_SALT, Committee, CommitteeProof, CommitteeSelection, WITNESS_SALT, WitnessProof,

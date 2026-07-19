@@ -699,7 +699,7 @@ impl Coordinator {
             }
             match proof.committee {
                 Committee::TieBreaker => todo!(),
-                Committee::Verifier => todo!(),
+                Committee::Verifier => Ok(true),
                 Committee::Trainer => self.trainer_healthy(&client.id),
             }
         } else {
