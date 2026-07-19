@@ -287,14 +287,19 @@ impl SolanaBackend {
             &authorization,
             id,
         );
-        // TODO (vbrunet) - what was the point of doing specifically a timeout here but not the other TXs ?
-        // We timeout the transaction at 5s max, since internally send() polls Solana until the
-        // tx is confirmed; we'd rather cancel early and attempt again.
+        // send() polls Solana until the tx is confirmed; we cancel early and let the
+        // caller retry on the next epoch. The public devnet RPC frequently needs more
+        // than a few seconds to confirm, so the deadline is env-tunable and defaults
+        // to a value that survives it (LEVIATHAN_JOIN_TIMEOUT_SECS).
+        let join_timeout_secs = std::env::var("LEVIATHAN_JOIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
         event!(coordinator::RpcCallSubmitted {
             call_type: RpcCallType::Join
         });
         let result = match timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(join_timeout_secs),
             self.send_and_retry("Join run", &[instruction], &[]),
         )
         .await
