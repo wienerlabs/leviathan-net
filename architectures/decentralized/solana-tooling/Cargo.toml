@@ -31,6 +31,19 @@ psyche-solana-distributor = { path = "../solana-distributor/programs/solana-dist
   "cpi",
 ] }
 
+[[bin]]
+name = "devnet-conviction-demo"
+path = "src/bin/devnet_conviction_demo.rs"
+required-features = ["demo"]
+
+[features]
+demo = ["dep:tokio"]
+
+[dependencies.tokio]
+version = "1.42.0"
+features = ["rt-multi-thread", "macros", "time"]
+optional = true
+
 [dev-dependencies]
 tokio = "1.42.0"
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
