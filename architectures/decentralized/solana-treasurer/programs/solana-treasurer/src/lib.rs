@@ -85,6 +85,13 @@ pub mod psyche_solana_treasurer {
     ) -> Result<()> {
         participant_bond_finalize_withdraw_processor(context, params)
     }
+
+    pub fn run_slash(
+        context: Context<RunSlashAccounts>,
+        params: RunSlashParams,
+    ) -> Result<()> {
+        run_slash_processor(context, params)
+    }
 }
 
 #[error_code]

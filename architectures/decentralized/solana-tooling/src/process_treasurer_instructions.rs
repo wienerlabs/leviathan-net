@@ -11,6 +11,7 @@ use psyche_solana_treasurer::accounts::ParticipantClaimAccounts;
 use psyche_solana_treasurer::accounts::ParticipantCreateAccounts;
 use psyche_solana_treasurer::accounts::RunBondConfigUpdateAccounts;
 use psyche_solana_treasurer::accounts::RunCreateAccounts;
+use psyche_solana_treasurer::accounts::RunSlashAccounts;
 use psyche_solana_treasurer::accounts::RunUpdateAccounts;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::find_run;
@@ -21,6 +22,7 @@ use psyche_solana_treasurer::instruction::ParticipantClaim;
 use psyche_solana_treasurer::instruction::ParticipantCreate;
 use psyche_solana_treasurer::instruction::RunBondConfigUpdate;
 use psyche_solana_treasurer::instruction::RunCreate;
+use psyche_solana_treasurer::instruction::RunSlash;
 use psyche_solana_treasurer::instruction::RunUpdate;
 use psyche_solana_treasurer::logic::ParticipantBondDepositParams;
 use psyche_solana_treasurer::logic::ParticipantBondFinalizeWithdrawParams;
@@ -29,6 +31,7 @@ use psyche_solana_treasurer::logic::ParticipantClaimParams;
 use psyche_solana_treasurer::logic::ParticipantCreateParams;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
+use psyche_solana_treasurer::logic::RunSlashParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -144,6 +147,44 @@ pub async fn process_treasurer_run_bond_config_update(
     };
     endpoint
         .process_instruction_with_signers(payer, instruction, &[main_authority])
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_treasurer_run_slash(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    authority: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    index: u64,
+) -> Result<()> {
+    let coordinator_instance = find_coordinator_instance(run_id);
+    let accounts = RunSlashAccounts {
+        authority: authority.pubkey(),
+        run: *run,
+        coordinator_instance,
+        coordinator_account: *coordinator_account,
+        coordinator_program: psyche_solana_coordinator::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSlash {
+            params: RunSlashParams {
+                index,
+                batch_start: 0,
+                batch_end: 0,
+                committed_hash: [0x11; 32],
+                replayed_hash: [0x22; 32],
+            },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[authority])
         .await?;
     Ok(())
 }
