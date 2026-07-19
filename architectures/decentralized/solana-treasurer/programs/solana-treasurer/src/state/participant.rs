@@ -7,6 +7,11 @@ pub struct Participant {
 
     pub claimed_collateral_amount: u64,
     pub claimed_earned_points: u64,
+
+    pub bond_amount: u64,
+    pub bond_withdraw_pending_amount: u64,
+    pub bond_withdraw_requested_at: i64,
+    pub bond_settled_slashed_points: u64,
 }
 
 impl Participant {

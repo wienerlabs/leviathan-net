@@ -16,6 +16,10 @@ pub struct Run {
 
     pub total_claimed_collateral_amount: u64,
     pub total_claimed_earned_points: u64,
+
+    pub total_bonded_amount: u64,
+    pub bond_minimum_amount: u64,
+    pub bond_withdraw_delay_seconds: i64,
 }
 
 impl Run {

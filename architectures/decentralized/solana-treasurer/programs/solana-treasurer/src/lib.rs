@@ -57,6 +57,34 @@ pub mod psyche_solana_treasurer {
     ) -> Result<()> {
         participant_claim_processor(context, params)
     }
+
+    pub fn run_bond_config_update(
+        context: Context<RunBondConfigUpdateAccounts>,
+        params: RunBondConfigUpdateParams,
+    ) -> Result<()> {
+        run_bond_config_update_processor(context, params)
+    }
+
+    pub fn participant_bond_deposit(
+        context: Context<ParticipantBondDepositAccounts>,
+        params: ParticipantBondDepositParams,
+    ) -> Result<()> {
+        participant_bond_deposit_processor(context, params)
+    }
+
+    pub fn participant_bond_request_withdraw(
+        context: Context<ParticipantBondRequestWithdrawAccounts>,
+        params: ParticipantBondRequestWithdrawParams,
+    ) -> Result<()> {
+        participant_bond_request_withdraw_processor(context, params)
+    }
+
+    pub fn participant_bond_finalize_withdraw(
+        context: Context<ParticipantBondFinalizeWithdrawAccounts>,
+        params: ParticipantBondFinalizeWithdrawParams,
+    ) -> Result<()> {
+        participant_bond_finalize_withdraw_processor(context, params)
+    }
 }
 
 #[error_code]
@@ -66,4 +94,10 @@ pub enum ProgramError {
 
     #[msg("run_id must be 32 bytes or less")]
     RunIdInvalidLength,
+
+    #[msg("Bond balance is insufficient for this request")]
+    InsufficientBond,
+
+    #[msg("The bond withdraw delay has not elapsed yet")]
+    WithdrawDelayNotElapsed,
 }

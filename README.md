@@ -1,3 +1,11 @@
+# leviathan-net
+
+Wiener Labs fork of [PsycheFoundation/nousnet](https://github.com/PsycheFoundation/nousnet) (Apache-2.0), the network substrate for Leviathan. This fork carries the layer upstream designed but left unimplemented: bonded contributions, random replay audits, and dispute-driven slashing. Design docs, whitepaper and the phase ladder live in wienerlabs/leviathan; the working code map is docs/CODEMAP.md there.
+
+Devnet deployment (2026-07-19): coordinator JD9rHTiqBFgHjViWZc7gFZX74LvKKysbLbqFRaFvtmmN, authorizer 2Kg5ERG6ubuzyPmQ24axsws7V2ja2EvWp5CHMKFCrTxv, treasurer 9A1kc8Dr9dFJW9t1npAk7EHrADm6TAyFeVLH27CDdvv8, run leviathan-dev live. Builds use anchor build --no-idl.
+
+Upstream README follows.
+
 # psyche
 
 <p align="center" width="100%">
