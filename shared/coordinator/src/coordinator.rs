@@ -225,6 +225,7 @@ pub enum CoordinatorError {
     InvalidWithdraw,
     InvalidCommitteeSelection,
     InvalidCommitteeProof,
+    InvalidSlash,
 }
 
 pub enum TickResult {
@@ -376,6 +377,7 @@ impl std::fmt::Display for CoordinatorError {
             CoordinatorError::InvalidWithdraw => write!(f, "Invalid withdraw"),
             CoordinatorError::InvalidCommitteeSelection => write!(f, "Invalid committee selection"),
             CoordinatorError::InvalidCommitteeProof => write!(f, "Invalid committee proof"),
+            CoordinatorError::InvalidSlash => write!(f, "Invalid slash"),
         }
     }
 }
@@ -649,6 +651,23 @@ impl Coordinator {
                 let _ = self.withdraw(client_index as u64); // we need to withdraw everyone, ignore error of already withdrawn
             }
         }
+    }
+
+    /// Marks a client as ejected after a dispute has convicted it. Ejection is
+    /// how a fraud verdict reaches the reward layer: an ejected client is moved
+    /// into exited_clients at the epoch boundary, where the slashing rate is
+    /// applied. Only a currently participating client can be ejected; anyone who
+    /// already withdrew or was ejected is untouched.
+    pub fn eject(&mut self, index: u64) -> std::result::Result<(), CoordinatorError> {
+        let index = index as usize;
+        if index < self.epoch_state.clients.len() {
+            let client = &mut self.epoch_state.clients[index];
+            if client.state == ClientState::Healthy || client.state == ClientState::Dropped {
+                client.state = ClientState::Ejected;
+                return Ok(());
+            }
+        }
+        Err(CoordinatorError::InvalidSlash)
     }
 
     pub fn pause(&mut self, unix_timestamp: u64) -> std::result::Result<(), CoordinatorError> {

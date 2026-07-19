@@ -319,6 +319,36 @@ pub mod psyche_solana_coordinator {
         account.increment_nonce();
         account.state.checkpoint(ctx.accounts.user.key, repo)
     }
+
+    pub fn slash_client(
+        ctx: Context<OwnerCoordinatorAccounts>,
+        params: SlashClientParams,
+    ) -> Result<()> {
+        msg!(
+            "slash_client: index={} batch=[{}, {}] committed={} replayed={}",
+            params.index,
+            params.batch_start,
+            params.batch_end,
+            hex_prefix(&params.committed_hash),
+            hex_prefix(&params.replayed_hash),
+        );
+        let mut account = ctx.accounts.coordinator_account.load_mut()?;
+        account.increment_nonce();
+        account.state.slash(params.index)
+    }
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct SlashClientParams {
+    pub index: u64,
+    pub batch_start: u64,
+    pub batch_end: u64,
+    pub committed_hash: [u8; 32],
+    pub replayed_hash: [u8; 32],
+}
+
+fn hex_prefix(bytes: &[u8; 32]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[derive(Accounts)]

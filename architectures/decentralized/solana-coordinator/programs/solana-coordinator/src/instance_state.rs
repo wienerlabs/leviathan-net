@@ -394,6 +394,13 @@ impl CoordinatorInstanceState {
         self.tick()
     }
 
+    pub fn slash(&mut self, index: u64) -> Result<()> {
+        self.coordinator
+            .eject(index)
+            .map_err(|err| anchor_lang::error!(ProgramError::from(err)))?;
+        Ok(())
+    }
+
     pub fn checkpoint(
         &mut self,
         payer: &Pubkey,

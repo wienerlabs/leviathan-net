@@ -16,7 +16,9 @@ use psyche_solana_coordinator::instruction::FreeCoordinator;
 use psyche_solana_coordinator::instruction::InitCoordinator;
 use psyche_solana_coordinator::instruction::JoinRun;
 use psyche_solana_coordinator::instruction::SetFutureEpochRates;
+use psyche_solana_coordinator::SlashClientParams;
 use psyche_solana_coordinator::instruction::SetPaused;
+use psyche_solana_coordinator::instruction::SlashClient;
 use psyche_solana_coordinator::instruction::Tick;
 use psyche_solana_coordinator::instruction::Update;
 use psyche_solana_coordinator::instruction::Witness;
@@ -159,6 +161,42 @@ pub async fn process_coordinator_set_paused(
     let instruction = Instruction {
         accounts: accounts.to_account_metas(None),
         data: SetPaused { paused }.data(),
+        program_id: psyche_solana_coordinator::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[authority])
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_coordinator_slash_client(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    authority: &Keypair,
+    coordinator_instance: &Pubkey,
+    coordinator_account: &Pubkey,
+    index: u64,
+    committed_hash: [u8; 32],
+    replayed_hash: [u8; 32],
+) -> Result<()> {
+    let accounts = OwnerCoordinatorAccounts {
+        authority: authority.pubkey(),
+        coordinator_instance: *coordinator_instance,
+        coordinator_account: *coordinator_account,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: SlashClient {
+            params: SlashClientParams {
+                index,
+                batch_start: 0,
+                batch_end: 0,
+                committed_hash,
+                replayed_hash,
+            },
+        }
+        .data(),
         program_id: psyche_solana_coordinator::ID,
     };
     endpoint
