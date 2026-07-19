@@ -56,7 +56,14 @@ multi-epoch training by a real client on a real model, and the full conviction
 loop (bond, dispute, slash, forfeit) proven end to end by
 `devnet-conviction-demo` and the memnet suites.
 
-Next (Phase 2): bond deposit enforced at join so every training node is bonded
-by the protocol rather than by convention, a verifier daemon that audits live
-training contributions and slashes on a fraud verdict, and a multi-volunteer
-swarm behind an iroh relay.
+Reward accrual is proven deterministically in the memnet suites (a client that
+stays Healthy through a full epoch earns its share of the epoch rate). Smooth
+per-epoch reward cycling on the live run wants either several connected nodes or
+a dedicated RPC: the public devnet endpoint is slow enough that single-node epoch
+completion and run-manager operations are unreliable, which is an infrastructure
+constraint rather than a protocol one.
+
+Next (Phase 2): a dedicated devnet RPC for reliable operations, bond deposit
+enforced at join so every training node is bonded by the protocol rather than by
+convention, a verifier daemon that audits live training contributions and slashes
+on a fraud verdict, and a multi-volunteer swarm behind an iroh relay.
