@@ -4,10 +4,8 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use anyhow::anyhow;
-use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::RunState;
-use psyche_coordinator::SOLANA_MAX_NUM_WITNESSES;
 use psyche_coordinator::model::Checkpoint;
 use psyche_coordinator::model::HubRepo;
 use psyche_coordinator::model::LLM;
@@ -21,7 +19,6 @@ use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::CoordinatorAccount;
-use psyche_solana_coordinator::instruction::Witness;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_participant;
@@ -29,7 +26,6 @@ use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_a
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
@@ -90,7 +86,7 @@ async fn main() -> Result<()> {
     let join_authority = Keypair::new();
     let stranger = Keypair::new();
     let ticker = Keypair::new();
-    let clients: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
+    let clients: Vec<Keypair> = (0..1).map(|_| Keypair::new()).collect();
     let cheater = 0usize;
 
     println!("[+] creating collateral mint");
@@ -198,12 +194,12 @@ async fn main() -> Result<()> {
                 round_witness_time: WITNESS_TIME,
                 min_clients: 1,
                 init_min_clients: 1,
-                global_batch_size_start: 1,
+                global_batch_size_start: clients.len() as u16,
                 global_batch_size_end: clients.len() as u16,
                 global_batch_size_warmup_tokens: 0,
                 verification_percent: 0,
                 witness_nodes: 0,
-                epoch_time: 10,
+                epoch_time: 45,
                 total_steps: 100,
                 waiting_for_members_extra_time: WAITING_EXTRA,
             }),
@@ -267,16 +263,6 @@ async fn main() -> Result<()> {
         .unwrap();
     }
 
-    println!("[+] warming up");
-    sleep_seconds(WAITING_EXTRA as u64).await;
-    process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account)
-        .await
-        .unwrap();
-    sleep_seconds(WARMUP_TIME).await;
-    process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account)
-        .await
-        .unwrap();
-
     println!("[+] a stranger tries to open a dispute (must fail)");
     let stranger_result = process_treasurer_run_slash(
         &mut endpoint,
@@ -290,80 +276,64 @@ async fn main() -> Result<()> {
     .await;
     println!("    stranger run_slash rejected = {}", stranger_result.is_err());
 
-    println!("[+] driving the epoch; the run authority convicts the cheater in cooldown");
+    println!("[+] driving one epoch; the run authority convicts the cheater while it trains");
+    let cheater_key = clients[cheater].pubkey().to_bytes();
     let mut slashed_done = false;
-    for _ in 0..30 {
+    for step in 0..60 {
         let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
             .await
             .unwrap()
             .unwrap();
-        match state.coordinator.run_state {
-            RunState::RoundTrain => {
-                for client in &clients {
-                    let position = state
-                        .coordinator
-                        .epoch_state
-                        .clients
-                        .iter()
-                        .position(|c| *c.id.signer() == client.pubkey().to_bytes());
-                    let Some(position) = position else { continue };
-                    let witness_proof = CommitteeSelection::from_coordinator(&state.coordinator, 0)
-                        .unwrap()
-                        .get_witness(position as u64);
-                    if witness_proof.position >= SOLANA_MAX_NUM_WITNESSES as u64 {
-                        continue;
-                    }
-                    let _ = process_coordinator_witness(
-                        &mut endpoint,
-                        &payer,
-                        client,
-                        &coordinator_instance,
-                        &coordinator_account,
-                        &Witness {
-                            proof: witness_proof,
-                            participant_bloom: Default::default(),
-                            broadcast_bloom: Default::default(),
-                            broadcast_merkle: Default::default(),
-                            metadata: Default::default(),
-                        },
-                    )
-                    .await;
-                }
-                sleep_seconds(WITNESS_TIME).await;
-                let _ = process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account).await;
-            }
-            RunState::RoundWitness => {
-                sleep_seconds(WITNESS_TIME).await;
-                let _ = process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account).await;
-            }
-            RunState::Cooldown => {
-                if !slashed_done {
-                    process_treasurer_run_slash(
-                        &mut endpoint,
-                        &payer,
-                        &main_authority,
-                        &run,
-                        &coordinator_account,
-                        &run_id,
-                        cheater as u64,
-                    )
-                    .await
-                    .unwrap();
-                    println!("    convicted cheater at index {}", cheater);
+        let run_state = state.coordinator.run_state;
+        let cheater_index = state
+            .coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|c| *c.id.signer() == cheater_key);
+        println!(
+            "    step {} run_state {} in_epoch {} cheater_present {}",
+            step,
+            run_state,
+            state.coordinator.epoch_state.clients.len(),
+            cheater_index.is_some(),
+        );
+
+        if !slashed_done {
+            if let Some(live_index) = cheater_index {
+                if process_treasurer_run_slash(
+                    &mut endpoint,
+                    &payer,
+                    &main_authority,
+                    &run,
+                    &coordinator_account,
+                    &run_id,
+                    live_index as u64,
+                )
+                .await
+                .is_ok()
+                {
+                    println!("    convicted cheater at live index {} while {}", live_index, run_state);
                     slashed_done = true;
                 }
-                sleep_seconds(COOLDOWN_TIME).await;
-                let _ = process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account).await;
-            }
-            other => {
-                if slashed_done {
-                    println!("    epoch closed, run_state = {}", other);
-                    break;
-                }
-                sleep_seconds(WITNESS_TIME).await;
-                let _ = process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account).await;
             }
         }
+
+        match run_state {
+            RunState::WaitingForMembers => {
+                if slashed_done {
+                    println!("    epoch closed");
+                    break;
+                }
+                sleep_seconds(WAITING_EXTRA as u64).await;
+            }
+            RunState::Warmup => sleep_seconds(WARMUP_TIME).await,
+            RunState::RoundTrain => sleep_seconds(7).await,
+            RunState::RoundWitness => sleep_seconds(WITNESS_TIME).await,
+            RunState::Cooldown => sleep_seconds(COOLDOWN_TIME).await,
+            _ => sleep_seconds(WARMUP_TIME).await,
+        }
+        let _ = process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account).await;
     }
 
     let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)

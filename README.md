@@ -38,6 +38,74 @@ Three layers, each covering the others' gap:
 
 This is economic security with published parameters, never a cryptographic overclaim.
 
+## Architecture
+
+```mermaid
+classDiagram
+    class Participant {
+        +GPU_Resources
+        +post_bond()
+        +submit_gradient()
+    }
+    class Treasurer {
+        +participant_bond_deposit()
+        +request_withdraw()
+        +finalize_withdraw()
+        +vault_management()
+    }
+    class P2P_Mesh {
+        <<Iroh / DisTrO>>
+        +compressed_tensors
+        +sparse_loco_recipe
+        +diloco_loop
+    }
+    class Solana_Blockchain {
+        <<Network Substrate>>
+        +Coordinator_Program
+        +Treasurer_Program
+        +Authorizer_Program
+        +settle_slashing()
+    }
+    class Coordinator {
+        +verification_percent
+        +audit_selection(p_probability)
+        +derive_assignments(seed)
+    }
+    class Audit_System {
+        +deterministic_replay()
+        +tolerance_band_check()
+        +conviction_logic()
+    }
+    class Robust_Aggregation {
+        +centered_clipping()
+        +outlier_excision()
+        +bound_damage()
+    }
+    class Security_Layers {
+        <<Economic and Robustness>>
+        +Robust_Aggregation
+        +Replay_Audits
+        +Bonded_Slashing
+    }
+    class Phase0_Results {
+        +Honest_Loss_2_175
+        +Byzantine_Resilience
+        +Mean_Catch_Time_9_8_rounds
+    }
+
+    Participant "1" -- "1" Treasurer : bonded_participation
+    Participant "N" -- "1" P2P_Mesh : mesh_communication
+    Treasurer --> Solana_Blockchain : settle
+    Treasurer --> Security_Layers : layer_3_sybil_cost
+    Coordinator --* Solana_Blockchain
+    Coordinator --> Audit_System : triggers_p_0_1
+    Audit_System --> Robust_Aggregation : provides_verification
+    Audit_System --> Security_Layers : layer_2
+    Robust_Aggregation --> Security_Layers : layer_1
+    Security_Layers --> Solana_Blockchain : execute_slash
+    Phase0_Results ..> Security_Layers : validates_parameters
+```
+
 ## What lives here
 
 This fork carries the layer upstream left as dead code, wired to the reward engine and covered by the in-process `memnet` test harness (no validator required).
@@ -63,6 +131,14 @@ Programs build with `anchor build --no-idl`. The instruction layers are exercise
 ```
 cargo test -p psyche-solana-tooling
 ```
+
+The whole security economics also runs against live devnet through the toolbox RPC endpoint:
+
+```
+cargo run -p psyche-solana-tooling --bin devnet-conviction-demo --features demo
+```
+
+A verified run: a participant posts a bond of 500, the run authority convicts it mid-epoch through the treasurer, the coordinator writes `slashed = 200` at epoch end, and the bond withdrawal returns 300 while the forfeited 200 stays in the run vault as reward liquidity. The complete cross-program loop, on live chain.
 
 ## Lineage
 
