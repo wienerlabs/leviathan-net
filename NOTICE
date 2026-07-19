@@ -1,0 +1,12 @@
+Leviathan (leviathan-net)
+Copyright 2026 Wiener Labs
+
+This product is a derivative work of the Psyche network (nousnet),
+Copyright the Psyche Foundation and Nous Research, licensed under the
+Apache License, Version 2.0.
+
+Original project: https://github.com/PsycheFoundation/nousnet
+
+Modifications by Wiener Labs add a bonded-participation, replay-audit and
+dispute-driven slashing layer on top of the upstream coordinator, and are
+likewise distributed under the Apache License, Version 2.0.
