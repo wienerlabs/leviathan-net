@@ -4,7 +4,7 @@ pub mod state;
 use anchor_lang::prelude::*;
 use logic::*;
 
-declare_id!("EnU7DRx5az5YWxaxgqEGbXSYtudcfnjXewyBRRZCjJPw");
+declare_id!("9A1kc8Dr9dFJW9t1npAk7EHrADm6TAyFeVLH27CDdvv8");
 
 pub fn find_run(index: u64) -> Pubkey {
     Pubkey::find_program_address(

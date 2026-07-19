@@ -75,19 +75,11 @@ echo -e "\n[+] Starting authorizer deploy"
 pushd architectures/decentralized/solana-authorizer
 
 echo -e "\n[+] - building..."
-anchor build
+anchor build --no-idl
 
 echo -e "\n[+] - deploying..."
 anchor deploy --provider.cluster ${RPC} --provider.wallet ${WALLET_FILE}
 sleep 1
-
-echo -e "\n[+] - init-idl..."
-AUTHORIZER_PUBKEY=$(solana-keygen pubkey ./target/deploy/psyche_solana_authorizer-keypair.json)
-anchor idl init \
-    --provider.cluster ${RPC} \
-    --provider.wallet ${WALLET_FILE} \
-    --filepath target/idl/psyche_solana_authorizer.json \
-    ${AUTHORIZER_PUBKEY}
 
 echo -e "\n[+] Authorizer program deployed successfully!"
 popd
@@ -99,7 +91,7 @@ if [[ "$DEPLOY_TREASURER" == "true" ]]; then
     pushd architectures/decentralized/solana-treasurer
 
     echo -e "\n[+] - building..."
-    anchor build
+    anchor build --no-idl
 
     echo -e "\n[+] - deploying..."
     anchor deploy --provider.cluster ${RPC} --provider.wallet ${WALLET_FILE}
@@ -110,9 +102,10 @@ if [[ "$DEPLOY_TREASURER" == "true" ]]; then
 
     # Create token
     echo -e "\n[+] Creating token"
-    TOKEN_ADDRESS=$(spl-token create-token --decimals 0 --url ${RPC} | grep "Address:" | awk '{print $2}')
-    spl-token create-account ${TOKEN_ADDRESS} --url ${RPC}
-    spl-token mint ${TOKEN_ADDRESS} 1000000 --url ${RPC}
+    WALLET_PUBKEY=$(solana-keygen pubkey ${WALLET_FILE})
+    TOKEN_ADDRESS=$(spl-token create-token --decimals 0 --url ${RPC} --fee-payer ${WALLET_FILE} --mint-authority ${WALLET_PUBKEY} | grep "Address:" | awk '{print $2}')
+    spl-token create-account ${TOKEN_ADDRESS} --url ${RPC} --fee-payer ${WALLET_FILE} --owner ${WALLET_PUBKEY}
+    spl-token mint ${TOKEN_ADDRESS} 1000000 --url ${RPC} --fee-payer ${WALLET_FILE} --mint-authority ${WALLET_FILE} --recipient-owner ${WALLET_PUBKEY}
 
     TREASURER_ARGS="--treasurer-collateral-mint ${TOKEN_ADDRESS}"
 fi
