@@ -26,6 +26,43 @@ pub struct RunTelemetry {
     pub audit_probability: f64,
     pub expected_rounds_to_catch: Option<f64>,
     pub leaderboard: Vec<ClientEntry>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub security: Option<SecurityAssessment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunEconomics {
+    pub reward_per_round: f64,
+    pub bond: f64,
+    pub slash_when_caught: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct SecurityAssessment {
+    pub audit_probability: f64,
+    pub break_even_penalty: Option<f64>,
+    pub effective_penalty: f64,
+    pub expected_fraud_value_per_round: f64,
+    pub economically_secure: bool,
+}
+
+pub fn assess_security(audit_probability: f64, economics: &RunEconomics) -> SecurityAssessment {
+    let p = audit_probability.clamp(0.0, 1.0);
+    let break_even_penalty = if p > 0.0 {
+        Some(economics.reward_per_round * (1.0 - p) / p)
+    } else {
+        None
+    };
+    let effective_penalty = economics.slash_when_caught.min(economics.bond);
+    let expected_fraud_value_per_round =
+        (1.0 - p) * economics.reward_per_round - p * effective_penalty;
+    SecurityAssessment {
+        audit_probability: p,
+        break_even_penalty,
+        effective_penalty,
+        expected_fraud_value_per_round,
+        economically_secure: p > 0.0 && expected_fraud_value_per_round <= 0.0,
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -75,6 +112,7 @@ pub fn compute_telemetry(
         audit_probability,
         expected_rounds_to_catch,
         leaderboard,
+        security: None,
     }
 }
 
@@ -147,5 +185,80 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"run_id\":\"run\""));
         assert!(json.contains("\"total_earned\":5"));
+        assert!(!json.contains("security"));
+    }
+
+    #[test]
+    fn secure_when_penalty_meets_break_even() {
+        let econ = RunEconomics {
+            reward_per_round: 1000.0,
+            bond: 100_000.0,
+            slash_when_caught: 9000.0,
+        };
+        let s = assess_security(0.1, &econ);
+        assert_eq!(s.break_even_penalty, Some(9000.0));
+        assert_eq!(s.effective_penalty, 9000.0);
+        assert!(s.expected_fraud_value_per_round <= 0.0);
+        assert!(s.economically_secure);
+    }
+
+    #[test]
+    fn insecure_when_slash_is_too_small() {
+        let econ = RunEconomics {
+            reward_per_round: 1000.0,
+            bond: 100_000.0,
+            slash_when_caught: 1000.0,
+        };
+        let s = assess_security(0.1, &econ);
+        assert!(s.expected_fraud_value_per_round > 0.0);
+        assert!(!s.economically_secure);
+    }
+
+    #[test]
+    fn bond_caps_the_effective_penalty() {
+        let econ = RunEconomics {
+            reward_per_round: 1000.0,
+            bond: 500.0,
+            slash_when_caught: 1_000_000.0,
+        };
+        let s = assess_security(0.1, &econ);
+        assert_eq!(s.effective_penalty, 500.0);
+        assert!(!s.economically_secure);
+    }
+
+    #[test]
+    fn zero_audit_probability_is_never_secure() {
+        let econ = RunEconomics {
+            reward_per_round: 1000.0,
+            bond: 1_000_000.0,
+            slash_when_caught: 1_000_000.0,
+        };
+        let s = assess_security(0.0, &econ);
+        assert_eq!(s.break_even_penalty, None);
+        assert!(!s.economically_secure);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"economically_secure\":false"));
+    }
+
+    #[test]
+    fn telemetry_carries_security_when_set() {
+        let mut coordinator = Coordinator::zeroed();
+        coordinator.config.verification_percent = 10;
+        let mut t = compute_telemetry(
+            &coordinator,
+            &[client(1, 5, 0)],
+            "run",
+            DEFAULT_LEADERBOARD_SIZE,
+        );
+        t.security = Some(assess_security(
+            t.audit_probability,
+            &RunEconomics {
+                reward_per_round: 1000.0,
+                bond: 100_000.0,
+                slash_when_caught: 9000.0,
+            },
+        ));
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"economically_secure\":true"));
     }
 }

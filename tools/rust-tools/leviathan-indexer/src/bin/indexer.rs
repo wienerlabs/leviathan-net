@@ -3,7 +3,9 @@ use std::str::FromStr;
 use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
+use leviathan_indexer::assess_security;
 use leviathan_indexer::compute_telemetry;
+use leviathan_indexer::RunEconomics;
 use leviathan_indexer::DEFAULT_LEADERBOARD_SIZE;
 use psyche_solana_coordinator::Client;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
@@ -25,6 +27,12 @@ struct Args {
     rpc: String,
     #[arg(long, default_value_t = DEFAULT_LEADERBOARD_SIZE)]
     leaderboard: usize,
+    #[arg(long)]
+    reward_per_round: Option<f64>,
+    #[arg(long)]
+    bond: Option<f64>,
+    #[arg(long)]
+    slash_when_caught: Option<f64>,
 }
 
 #[tokio::main]
@@ -40,7 +48,20 @@ async fn main() -> Result<()> {
         .await?
         .ok_or_else(|| anyhow!("coordinator account {coordinator_account} not found"))?;
     let clients: Vec<Client> = state.clients_state.clients.iter().copied().collect();
-    let telemetry = compute_telemetry(&state.coordinator, &clients, &args.run_id, args.leaderboard);
+    let mut telemetry =
+        compute_telemetry(&state.coordinator, &clients, &args.run_id, args.leaderboard);
+    if let (Some(reward_per_round), Some(bond), Some(slash_when_caught)) =
+        (args.reward_per_round, args.bond, args.slash_when_caught)
+    {
+        telemetry.security = Some(assess_security(
+            telemetry.audit_probability,
+            &RunEconomics {
+                reward_per_round,
+                bond,
+                slash_when_caught,
+            },
+        ));
+    }
     println!("{}", serde_json::to_string_pretty(&telemetry)?);
     Ok(())
 }

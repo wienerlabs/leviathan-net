@@ -34,6 +34,19 @@ The cheater node broadcasts fraudulent gradients (LEVIATHAN_FAKE_DELTA); audit
 its dump against an honest node's with `leviathan-verifier`, and watch the
 telemetry with `leviathan-indexer --features live`.
 
+Pass the run economics to the indexer and it also reports whether the run is
+economically secure at its audit probability, using the break-even penalty
+`reward * (1 - p) / p`:
+
+```
+leviathan-indexer --coordinator-account <pubkey> \
+  --reward-per-round 1000 --bond 500000 --slash-when-caught 9000
+```
+
+The verdict is secure when the effective penalty, capped at the posted bond,
+meets or exceeds the break-even penalty, so a persistent cheater loses money in
+expectation.
+
 ## Scaling to 350M and 1B
 
 The parameter shape is the same; three things change, and all three need real
