@@ -79,8 +79,8 @@ pub mod psyche_solana_treasurer {
         participant_bond_request_withdraw_processor(context, params)
     }
 
-    pub fn participant_bond_finalize_withdraw(
-        context: Context<ParticipantBondFinalizeWithdrawAccounts>,
+    pub fn participant_bond_finalize_withdraw<'info>(
+        context: Context<'_, '_, '_, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
         params: ParticipantBondFinalizeWithdrawParams,
     ) -> Result<()> {
         participant_bond_finalize_withdraw_processor(context, params)
@@ -91,6 +91,13 @@ pub mod psyche_solana_treasurer {
         params: RunSlashParams,
     ) -> Result<()> {
         run_slash_processor(context, params)
+    }
+
+    pub fn run_set_slash_bounty(
+        context: Context<RunSetSlashBountyAccounts>,
+        params: RunSetSlashBountyParams,
+    ) -> Result<()> {
+        run_set_slash_bounty_processor(context, params)
     }
 }
 
@@ -107,4 +114,7 @@ pub enum ProgramError {
 
     #[msg("The bond withdraw delay has not elapsed yet")]
     WithdrawDelayNotElapsed,
+
+    #[msg("A slash bounty is configured but no reporter account was provided")]
+    MissingReporter,
 }

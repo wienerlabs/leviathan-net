@@ -59,8 +59,8 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct ParticipantBondFinalizeWithdrawParams {}
 
-pub fn participant_bond_finalize_withdraw_processor(
-    context: Context<ParticipantBondFinalizeWithdrawAccounts>,
+pub fn participant_bond_finalize_withdraw_processor<'info>(
+    context: Context<'_, '_, '_, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
     _params: ParticipantBondFinalizeWithdrawParams,
 ) -> Result<()> {
     let mut participant_slashed_points = 0;
@@ -108,9 +108,37 @@ pub fn participant_bond_finalize_withdraw_processor(
 
     run.total_bonded_amount -= forfeited_amount + payout_amount;
 
+    let run_index = run.index;
+    let run_bump = run.bump;
+    let bounty_amount = if run.slash_bounty_bps > 0 {
+        (forfeited_amount as u128 * run.slash_bounty_bps as u128 / 10_000) as u64
+    } else {
+        0
+    };
+
+    let index_bytes = run_index.to_le_bytes();
+    let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
+
+    if bounty_amount > 0 {
+        let reporter = context
+            .remaining_accounts
+            .first()
+            .ok_or(error!(ProgramError::MissingReporter))?;
+        transfer(
+            CpiContext::new(
+                context.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: context.accounts.run_collateral.to_account_info(),
+                    to: reporter.to_account_info(),
+                    authority: context.accounts.run.to_account_info(),
+                },
+            )
+            .with_signer(run_signer_seeds),
+            bounty_amount,
+        )?;
+    }
+
     if payout_amount > 0 {
-        let run_signer_seeds: &[&[&[u8]]] =
-            &[&[Run::SEEDS_PREFIX, &run.index.to_le_bytes(), &[run.bump]]];
         transfer(
             CpiContext::new(
                 context.accounts.token_program.to_account_info(),

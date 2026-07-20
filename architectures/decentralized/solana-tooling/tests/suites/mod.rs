@@ -11,6 +11,7 @@ mod memnet_mining_pool_cap_deposits;
 mod memnet_mining_pool_full_cycle;
 mod memnet_mining_pool_live_freeze;
 mod memnet_treasurer_bond;
+mod memnet_treasurer_bounty;
 mod memnet_treasurer_create_claim;
 mod memnet_treasurer_slash_settle;
 mod memnet_treasurer_create_update;

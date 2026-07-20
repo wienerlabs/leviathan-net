@@ -20,6 +20,7 @@ pub struct Run {
     pub total_bonded_amount: u64,
     pub bond_minimum_amount: u64,
     pub bond_withdraw_delay_seconds: i64,
+    pub slash_bounty_bps: u16,
 }
 
 impl Run {

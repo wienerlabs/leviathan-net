@@ -4998,6 +4998,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "leviathan-verifier"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "psyche-modeling",
+ "psyche-network",
+ "psyche-verifier",
+ "tch",
+]
+
+[[package]]
 name = "lexical-core"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7684,6 +7696,16 @@ dependencies = [
  "tracing-opentelemetry 0.29.0",
  "tracing-subscriber",
  "tui-logger",
+]
+
+[[package]]
+name = "psyche-verifier"
+version = "0.2.0"
+dependencies = [
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

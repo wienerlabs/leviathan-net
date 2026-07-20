@@ -97,6 +97,7 @@ pub fn run_create_processor(
     run.total_bonded_amount = 0;
     run.bond_minimum_amount = 0;
     run.bond_withdraw_delay_seconds = 0;
+    run.slash_bounty_bps = 0;
 
     let run_signer_seeds: &[&[&[u8]]] =
         &[&[Run::SEEDS_PREFIX, &run.index.to_le_bytes(), &[run.bump]]];
