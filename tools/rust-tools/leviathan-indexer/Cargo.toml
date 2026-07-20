@@ -1,0 +1,32 @@
+[package]
+name = "leviathan-indexer"
+edition = "2021"
+version.workspace = true
+
+[lib]
+name = "leviathan_indexer"
+
+[[bin]]
+name = "leviathan-indexer"
+path = "src/bin/indexer.rs"
+required-features = ["live"]
+
+[features]
+live = ["dep:tokio", "dep:anyhow", "dep:clap", "dep:solana-sdk", "dep:solana_toolbox_endpoint", "dep:psyche-solana-tooling"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+psyche-core.workspace = true
+psyche-coordinator.workspace = true
+psyche-solana-coordinator = { workspace = true, features = ["no-entrypoint"] }
+
+tokio = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+solana-sdk = { version = "=2.1.4", optional = true }
+solana_toolbox_endpoint = { version = "=0.4.4-solana-2.1.4", optional = true }
+psyche-solana-tooling = { workspace = true, optional = true }
+
+[dev-dependencies]
+bytemuck = { workspace = true }
