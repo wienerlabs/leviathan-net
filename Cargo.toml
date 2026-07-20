@@ -31,6 +31,7 @@ psyche-modeling = { path = "./shared/modeling" }
 psyche-python-extension = { path = "./python" }
 psyche-python-extension-impl = { path = "./python/extension-impl" }
 psyche-tui = { path = "./shared/tui" }
+psyche-verifier = { path = "./shared/verifier" }
 psyche-watcher = { path = "./shared/watcher" }
 psyche-metrics = { path = "./shared/metrics" }
 psyche-event-sourcing = { path = "./shared/event-sourcing" }

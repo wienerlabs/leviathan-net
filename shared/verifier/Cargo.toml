@@ -1,0 +1,15 @@
+[package]
+name = "psyche-verifier"
+edition = "2021"
+version.workspace = true
+
+[lib]
+name = "psyche_verifier"
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
