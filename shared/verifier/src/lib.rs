@@ -7,7 +7,9 @@ const NORM_FLOOR: f32 = 1e-12;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum VerifierError {
-    #[error("submitted and recomputed deltas have different lengths ({submitted} vs {recomputed})")]
+    #[error(
+        "submitted and recomputed deltas have different lengths ({submitted} vs {recomputed})"
+    )]
     LengthMismatch { submitted: usize, recomputed: usize },
     #[error("band must be finite and non-negative, got {0}")]
     InvalidBand(f32),
@@ -62,10 +64,7 @@ pub fn verify_within_band(
     })
 }
 
-pub fn calibrate_band(
-    drift_distances: &[f32],
-    safety_factor: f32,
-) -> Result<f32, VerifierError> {
+pub fn calibrate_band(drift_distances: &[f32], safety_factor: f32) -> Result<f32, VerifierError> {
     if drift_distances.is_empty() {
         return Err(VerifierError::EmptyCalibration);
     }
@@ -140,7 +139,10 @@ pub struct Aggregation {
 }
 
 fn l2_norm(v: &[f32]) -> f32 {
-    v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32
+    v.iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt() as f32
 }
 
 fn median(values: &mut [f32]) -> f32 {
@@ -246,8 +248,14 @@ pub struct Contribution {
 
 pub enum AuditOutcome {
     Judged(AuditReport),
-    ReplayFailed { target_index: u64, error: ReplayError },
-    Malformed { target_index: u64, error: VerifierError },
+    ReplayFailed {
+        target_index: u64,
+        error: ReplayError,
+    },
+    Malformed {
+        target_index: u64,
+        error: VerifierError,
+    },
 }
 
 pub fn audit_round<E: ReplayEngine>(
@@ -258,13 +266,15 @@ pub fn audit_round<E: ReplayEngine>(
     contributions
         .iter()
         .map(|c| match engine.replay(c.target_index) {
-            Ok(recomputed) => match audit_contribution(c.target_index, &c.submitted, &recomputed, band) {
-                Ok(report) => AuditOutcome::Judged(report),
-                Err(error) => AuditOutcome::Malformed {
-                    target_index: c.target_index,
-                    error,
-                },
-            },
+            Ok(recomputed) => {
+                match audit_contribution(c.target_index, &c.submitted, &recomputed, band) {
+                    Ok(report) => AuditOutcome::Judged(report),
+                    Err(error) => AuditOutcome::Malformed {
+                        target_index: c.target_index,
+                        error,
+                    },
+                }
+            }
             Err(error) => AuditOutcome::ReplayFailed {
                 target_index: c.target_index,
                 error,
@@ -311,7 +321,9 @@ mod tests {
     fn with_drift(base: &[f32], drift: f32, seed: u64) -> Vec<f32> {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let base_norm = (base.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()).sqrt();
-        let noise: Vec<f32> = (0..base.len()).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let noise: Vec<f32> = (0..base.len())
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
         let noise_norm = (noise.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()).sqrt();
         let scale = (drift as f64) * base_norm / noise_norm.max(1e-12);
         base.iter()
@@ -333,7 +345,11 @@ mod tests {
         let recomputed = honest_delta(2, 4096);
         let submitted = with_drift(&recomputed, 0.01, 99);
         let verdict = verify_within_band(&submitted, &recomputed, DEFAULT_BAND).unwrap();
-        assert!(verdict.distance < DEFAULT_BAND, "distance {}", verdict.distance);
+        assert!(
+            verdict.distance < DEFAULT_BAND,
+            "distance {}",
+            verdict.distance
+        );
         assert!(!verdict.fraud);
     }
 
@@ -475,7 +491,10 @@ mod tests {
             .map(|j| honest.iter().map(|d| d[j]).sum::<f32>() / honest.len() as f32)
             .collect();
         let drift = relative_l2_distance(&agg.result, &mean).unwrap();
-        assert!(drift < 0.3, "aggregate drifted {drift} from the honest mean");
+        assert!(
+            drift < 0.3,
+            "aggregate drifted {drift} from the honest mean"
+        );
     }
 
     #[test]
@@ -490,12 +509,18 @@ mod tests {
         }
         let agg = robust_aggregate(&deltas, AggregationConfig::default()).unwrap();
         let excised = agg.kept[11..].iter().filter(|k| !**k).count();
-        assert_eq!(excised, 5, "the whole sign-flip coalition should be excised");
+        assert_eq!(
+            excised, 5,
+            "the whole sign-flip coalition should be excised"
+        );
         let honest_mean: Vec<f32> = (0..512)
             .map(|j| (0..11).map(|i| deltas[i][j]).sum::<f32>() / 11.0)
             .collect();
         let toward_honest = relative_l2_distance(&agg.result, &honest_mean).unwrap();
-        assert!(toward_honest < 0.5, "aggregate pulled toward the coalition: {toward_honest}");
+        assert!(
+            toward_honest < 0.5,
+            "aggregate pulled toward the coalition: {toward_honest}"
+        );
     }
 
     #[test]

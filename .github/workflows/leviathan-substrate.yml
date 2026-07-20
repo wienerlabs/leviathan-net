@@ -1,0 +1,69 @@
+name: Leviathan substrate
+
+on:
+  push:
+    paths:
+      - "shared/verifier/**"
+      - "shared/coordinator/**"
+      - "tools/rust-tools/leviathan-indexer/**"
+      - "tools/rust-tools/leviathan-verifier/**"
+      - "architectures/decentralized/solana-treasurer/**"
+      - "architectures/decentralized/solana-coordinator/**"
+      - "architectures/decentralized/solana-authorizer/**"
+      - "architectures/decentralized/solana-tooling/**"
+      - ".github/workflows/leviathan-substrate.yml"
+  pull_request:
+    paths:
+      - "shared/verifier/**"
+      - "shared/coordinator/**"
+      - "tools/rust-tools/leviathan-indexer/**"
+      - "tools/rust-tools/leviathan-verifier/**"
+      - "architectures/decentralized/solana-treasurer/**"
+      - "architectures/decentralized/solana-coordinator/**"
+      - "architectures/decentralized/solana-authorizer/**"
+      - "architectures/decentralized/solana-tooling/**"
+      - ".github/workflows/leviathan-substrate.yml"
+
+concurrency:
+  group: leviathan-substrate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  substrate:
+    name: security core + memnet
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: leviathan-substrate
+
+      - name: Formatting
+        run: >
+          cargo fmt --check
+          -p psyche-verifier
+          -p leviathan-indexer
+
+      - name: Security core and aggregation
+        run: >
+          cargo test --locked
+          -p psyche-verifier
+          -p psyche-coordinator
+          -p leviathan-indexer
+
+      - name: Solana programs in-process (memnet)
+        run: cargo test --locked -p psyche-solana-tooling

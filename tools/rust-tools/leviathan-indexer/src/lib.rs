@@ -100,11 +100,7 @@ mod tests {
         coordinator.config.verification_percent = 10;
         coordinator.progress.epoch = 3;
         coordinator.progress.step = 42;
-        let clients = vec![
-            client(1, 100, 0),
-            client(2, 50, 0),
-            client(3, 0, 200),
-        ];
+        let clients = vec![client(1, 100, 0), client(2, 50, 0), client(3, 0, 200)];
         let t = compute_telemetry(&coordinator, &clients, "run-x", DEFAULT_LEADERBOARD_SIZE);
         assert_eq!(t.run_id, "run-x");
         assert_eq!(t.epoch, 3);
@@ -121,7 +117,9 @@ mod tests {
     #[test]
     fn leaderboard_is_ranked_and_capped() {
         let coordinator = Coordinator::zeroed();
-        let clients: Vec<Client> = (0..20).map(|i| client(i as u8, (i as u64) * 10, 0)).collect();
+        let clients: Vec<Client> = (0..20)
+            .map(|i| client(i as u8, (i as u64) * 10, 0))
+            .collect();
         let t = compute_telemetry(&coordinator, &clients, "run", 5);
         assert_eq!(t.leaderboard.len(), 5);
         assert_eq!(t.leaderboard[0].earned, 190);
@@ -140,7 +138,12 @@ mod tests {
     #[test]
     fn telemetry_serializes_to_json() {
         let coordinator = Coordinator::zeroed();
-        let t = compute_telemetry(&coordinator, &[client(1, 5, 0)], "run", DEFAULT_LEADERBOARD_SIZE);
+        let t = compute_telemetry(
+            &coordinator,
+            &[client(1, 5, 0)],
+            "run",
+            DEFAULT_LEADERBOARD_SIZE,
+        );
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"run_id\":\"run\""));
         assert!(json.contains("\"total_earned\":5"));

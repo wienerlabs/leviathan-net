@@ -12,7 +12,10 @@ use solana_sdk::pubkey::Pubkey;
 use solana_toolbox_endpoint::ToolboxEndpoint;
 
 #[derive(Parser, Debug)]
-#[command(name = "leviathan-indexer", about = "Emit honest run telemetry from a coordinator account")]
+#[command(
+    name = "leviathan-indexer",
+    about = "Emit honest run telemetry from a coordinator account"
+)]
 struct Args {
     #[arg(long)]
     coordinator_account: String,
