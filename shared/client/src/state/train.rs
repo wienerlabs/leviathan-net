@@ -427,6 +427,7 @@ impl TrainingStepMetadata {
                                     }
 
                                     let to_transmit = if quantize { Trainer::quantize_results(&distro_results) } else { distro_results.clone()};
+                                    let to_transmit = inject_fake_delta(to_transmit);
 
                                     let transmittable_distro_result = TransmittableDistroResult {
                                         step,
@@ -773,6 +774,25 @@ enum WriteGradientsError {
         fname: String,
         err: tokio::io::Error,
     },
+}
+
+fn inject_fake_delta(results: Vec<DistroResult>) -> Vec<DistroResult> {
+    let mode = match std::env::var("LEVIATHAN_FAKE_DELTA") {
+        Ok(mode) if !mode.is_empty() => mode,
+        _ => return results,
+    };
+    warn!("LEVIATHAN_FAKE_DELTA={mode}: broadcasting a fraudulent gradient (test only)");
+    results
+        .into_iter()
+        .map(|mut result| {
+            result.sparse_val = match mode.as_str() {
+                "lazy" => result.sparse_val.zeros_like(),
+                "gaussian" => result.sparse_val.randn_like(),
+                _ => result.sparse_val * -5.0,
+            };
+            result
+        })
+        .collect()
 }
 
 async fn write_gradients_to_disk(
