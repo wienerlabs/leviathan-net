@@ -1,0 +1,16 @@
+[package]
+name = "leviathan-verifier"
+edition = "2021"
+version.workspace = true
+
+[[bin]]
+name = "leviathan-verifier"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tch.workspace = true
+psyche-network.workspace = true
+psyche-modeling.workspace = true
+psyche-verifier.workspace = true
