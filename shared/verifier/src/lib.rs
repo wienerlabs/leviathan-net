@@ -119,6 +119,111 @@ pub fn audit_contribution(
     Ok(AuditReport { verdict, proof })
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AggregationConfig {
+    pub excision_multiplier: f32,
+    pub iterations: usize,
+}
+
+impl Default for AggregationConfig {
+    fn default() -> Self {
+        Self {
+            excision_multiplier: 3.0,
+            iterations: 3,
+        }
+    }
+}
+
+pub struct Aggregation {
+    pub result: Vec<f32>,
+    pub kept: Vec<bool>,
+}
+
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32
+}
+
+fn median(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        0.5 * (values[mid - 1] + values[mid])
+    }
+}
+
+pub fn robust_aggregate(
+    deltas: &[Vec<f32>],
+    config: AggregationConfig,
+) -> Result<Aggregation, VerifierError> {
+    if deltas.is_empty() {
+        return Ok(Aggregation {
+            result: Vec::new(),
+            kept: Vec::new(),
+        });
+    }
+    let dim = deltas[0].len();
+    for d in deltas {
+        if d.len() != dim {
+            return Err(VerifierError::LengthMismatch {
+                submitted: d.len(),
+                recomputed: dim,
+            });
+        }
+    }
+
+    let mut center = vec![0.0f32; dim];
+    let mut distances: Vec<f32> = deltas.iter().map(|d| distance_to(d, &center)).collect();
+    let mut sorted = distances.clone();
+    let limit = config.excision_multiplier * median(&mut sorted);
+    let kept: Vec<bool> = distances.iter().map(|d| *d <= limit).collect();
+    let kept_indices: Vec<usize> = if kept.iter().any(|k| *k) {
+        (0..deltas.len()).filter(|i| kept[*i]).collect()
+    } else {
+        (0..deltas.len()).collect()
+    };
+
+    for _ in 0..config.iterations {
+        let mut norms: Vec<f32> = kept_indices
+            .iter()
+            .map(|i| distance_to(&deltas[*i], &center))
+            .collect();
+        distances = norms.clone();
+        let radius = median(&mut norms);
+        let mut accum = vec![0.0f32; dim];
+        for i in &kept_indices {
+            let norm = distance_to(&deltas[*i], &center);
+            let factor = if norm > 1e-12 {
+                (radius / norm).min(1.0)
+            } else {
+                1.0
+            };
+            for j in 0..dim {
+                accum[j] += (deltas[*i][j] - center[j]) * factor;
+            }
+        }
+        let n = kept_indices.len() as f32;
+        for j in 0..dim {
+            center[j] += accum[j] / n;
+        }
+    }
+    let _ = distances;
+
+    Ok(Aggregation {
+        result: center,
+        kept,
+    })
+}
+
+fn distance_to(delta: &[f32], center: &[f32]) -> f32 {
+    let diff: Vec<f32> = delta.iter().zip(center).map(|(d, c)| d - c).collect();
+    l2_norm(&diff)
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplayError {
     #[error("target {0} is not assigned to this verifier")]
@@ -355,6 +460,42 @@ mod tests {
         let proofs = fraud_proofs(&outcomes);
         assert_eq!(proofs.len(), 1);
         assert_eq!(proofs[0].target_index, 2);
+    }
+
+    #[test]
+    fn robust_aggregate_tracks_the_honest_mean() {
+        let honest: Vec<Vec<f32>> = (0..11)
+            .map(|s| {
+                let base = honest_delta(300 + s, 512);
+                with_drift(&base, 0.02, 400 + s)
+            })
+            .collect();
+        let agg = robust_aggregate(&honest, AggregationConfig::default()).unwrap();
+        let mean: Vec<f32> = (0..512)
+            .map(|j| honest.iter().map(|d| d[j]).sum::<f32>() / honest.len() as f32)
+            .collect();
+        let drift = relative_l2_distance(&agg.result, &mean).unwrap();
+        assert!(drift < 0.3, "aggregate drifted {drift} from the honest mean");
+    }
+
+    #[test]
+    fn robust_aggregate_excises_a_sign_flip_coalition() {
+        let base = honest_delta(42, 512);
+        let mut deltas: Vec<Vec<f32>> = Vec::new();
+        for s in 0..11 {
+            deltas.push(with_drift(&base, 0.02, 700 + s));
+        }
+        for _ in 0..5 {
+            deltas.push(base.iter().map(|v| -5.0 * v).collect());
+        }
+        let agg = robust_aggregate(&deltas, AggregationConfig::default()).unwrap();
+        let excised = agg.kept[11..].iter().filter(|k| !**k).count();
+        assert_eq!(excised, 5, "the whole sign-flip coalition should be excised");
+        let honest_mean: Vec<f32> = (0..512)
+            .map(|j| (0..11).map(|i| deltas[i][j]).sum::<f32>() / 11.0)
+            .collect();
+        let toward_honest = relative_l2_distance(&agg.result, &honest_mean).unwrap();
+        assert!(toward_honest < 0.5, "aggregate pulled toward the coalition: {toward_honest}");
     }
 
     #[test]
