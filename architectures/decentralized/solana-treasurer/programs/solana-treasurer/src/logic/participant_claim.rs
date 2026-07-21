@@ -65,6 +65,10 @@ pub fn participant_claim_processor(
     context: Context<ParticipantClaimAccounts>,
     params: ParticipantClaimParams,
 ) -> Result<()> {
+    if context.accounts.participant.bond_amount < context.accounts.run.bond_minimum_amount {
+        return err!(ProgramError::BondBelowMinimum);
+    }
+
     let mut participant_earned_points = 0;
     for client in context
         .accounts

@@ -117,4 +117,7 @@ pub enum ProgramError {
 
     #[msg("A slash bounty is configured but no reporter account was provided")]
     MissingReporter,
+
+    #[msg("Bond is below the run minimum required to claim rewards")]
+    BondBelowMinimum,
 }
