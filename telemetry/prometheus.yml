@@ -15,3 +15,6 @@ scrape_configs:
 
 otlp:
   keep_identifying_resource_attributes: true
+
+rule_files:
+  - /etc/prometheus/leviathan-killswitch.rules.yml

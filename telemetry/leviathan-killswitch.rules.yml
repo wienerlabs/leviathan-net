@@ -1,0 +1,65 @@
+groups:
+  - name: leviathan-killswitch
+    rules:
+      - alert: LeviathanEconomicInsecurity
+        expr: leviathan_run_economically_secure == 0
+        for: 2m
+        labels:
+          severity: critical
+          kill_switch: economic_insecurity
+        annotations:
+          summary: "Run {{ $labels.run_id }} is not economically secure"
+          description: "expected fraud value per round is positive at the published (p, bond, slash, reward)."
+
+      - alert: LeviathanTreasuryDrain
+        expr: |
+          delta(leviathan_run_vault_balance[15m]) < -1 * leviathan_run_expected_claims_15m
+        for: 5m
+        labels:
+          severity: critical
+          kill_switch: treasury_drain
+        annotations:
+          summary: "Unexpected vault drain on {{ $labels.run_id }}"
+          description: "Vault balance fell faster than explained claims/bounties in 15m."
+
+      - alert: LeviathanMeshPartition
+        expr: |
+          (leviathan_run_active_clients / clamp_min(leviathan_run_registered_clients, 1)) < 0.5
+          and leviathan_run_state == 1
+        for: 10m
+        labels:
+          severity: high
+          kill_switch: mesh_partition
+        annotations:
+          summary: "Mesh partition risk on {{ $labels.run_id }}"
+          description: "Active clients below 50% of registered while run is live."
+
+      - alert: LeviathanHonestFalsePositive
+        expr: increase(leviathan_honest_slash_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          kill_switch: honest_fpr
+        annotations:
+          summary: "Honest client slash detected"
+          description: "Zero honest-node slashes is a hard PRD metric."
+
+      - alert: LeviathanIndexerLag
+        expr: leviathan_indexer_slot_lag > 100
+        for: 5m
+        labels:
+          severity: high
+          kill_switch: indexer_lag
+        annotations:
+          summary: "Indexer lagging chain by {{ $value }} slots"
+          description: "Dashboard and automated responses are untrustworthy until caught up."
+
+      - alert: LeviathanUncaughtFraudSuspect
+        expr: increase(leviathan_fraud_proofs_total[1h]) > increase(leviathan_slash_events_total[1h])
+        for: 30m
+        labels:
+          severity: critical
+          kill_switch: uncaught_fraud
+        annotations:
+          summary: "Fraud proofs without matching slash events"
+          description: "Double-sell analogue kill switch: proof observed, conviction missing."
