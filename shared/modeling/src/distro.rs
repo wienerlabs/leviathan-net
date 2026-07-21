@@ -621,6 +621,10 @@ impl Distro {
             return;
         }
 
+        let robust = std::env::var("LEVIATHAN_ROBUST_AGG")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+
         for (index, var) in vars.variables().enumerate() {
             let variable = var.logical_tensor();
             let device = variable.device();
@@ -643,14 +647,37 @@ impl Distro {
                 .collect::<Vec<_>>();
 
             // Decode grad from all nodes
-            let decompressed = CompressDCT::batch_decompress(
-                &indicies,
-                &values,
-                &results[0][index].xshape,
-                results[0][index].totalk,
-                val_kind,
-                device,
-            );
+            let decompressed = if robust {
+                let per: Vec<Tensor> = indicies
+                    .iter()
+                    .zip(values.iter())
+                    .map(|(idx, val)| {
+                        CompressDCT::decompress(
+                            idx,
+                            val,
+                            &results[0][index].xshape,
+                            results[0][index].totalk,
+                            val_kind,
+                            device,
+                        )
+                    })
+                    .collect();
+                let shape = per[0].size();
+                let flat = Tensor::stack(&per, 0)
+                    .reshape([per.len() as i64, -1])
+                    .to_kind(Kind::Float);
+                let center = leviathan_robust_aggregate(&flat, 3.0, 3);
+                center.reshape(shape.as_slice()).to_kind(val_kind)
+            } else {
+                CompressDCT::batch_decompress(
+                    &indicies,
+                    &values,
+                    &results[0][index].xshape,
+                    results[0][index].totalk,
+                    val_kind,
+                    device,
+                )
+            };
 
             // Set the gradients!!!
             var.set_grad(self.transform.decode(&decompressed));
@@ -1451,3 +1478,108 @@ mod tests {
 //         Ok(())
 //     }
 // }
+
+fn leviathan_robust_aggregate_median(mut values: Vec<f32>) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid] as f64
+    } else {
+        (values[mid - 1] as f64 + values[mid] as f64) / 2.0
+    }
+}
+
+pub fn leviathan_robust_aggregate(
+    deltas: &Tensor,
+    excision_multiplier: f64,
+    iterations: usize,
+) -> Tensor {
+    let _no_grad = tch::no_grad_guard();
+    let sizes = deltas.size();
+    let n = sizes[0];
+    let dim = sizes[1];
+    let device = deltas.device();
+    let cpu = Device::Cpu;
+    let mut center = Tensor::zeros([dim], (Kind::Float, device));
+
+    let initial = deltas
+        .pow_tensor_scalar(2)
+        .sum_dim_intlist(1, false, Kind::Float)
+        .sqrt();
+    let initial_cpu = Vec::<f32>::try_from(initial.to_device(cpu)).unwrap();
+    let limit = excision_multiplier * leviathan_robust_aggregate_median(initial_cpu.clone());
+    let mut mask = deltas
+        .pow_tensor_scalar(2)
+        .sum_dim_intlist(1, false, Kind::Float)
+        .sqrt()
+        .le(limit)
+        .to_kind(Kind::Float);
+    if mask.sum(Kind::Float).double_value(&[]) == 0.0 {
+        mask = Tensor::ones([n], (Kind::Float, device));
+    }
+    let mask_cpu = Vec::<f32>::try_from(mask.to_device(cpu)).unwrap();
+
+    for _ in 0..iterations {
+        let diff = deltas - &center;
+        let norms = diff
+            .pow_tensor_scalar(2)
+            .sum_dim_intlist(1, false, Kind::Float)
+            .sqrt();
+        let norms_cpu = Vec::<f32>::try_from(norms.to_device(cpu)).unwrap();
+        let kept: Vec<f32> = norms_cpu
+            .iter()
+            .zip(mask_cpu.iter())
+            .filter(|(_, m)| **m > 0.5)
+            .map(|(value, _)| *value)
+            .collect();
+        let radius = leviathan_robust_aggregate_median(kept);
+        let factor = norms
+            .clamp_min(1e-12)
+            .pow_tensor_scalar(-1.0)
+            .f_mul_scalar(radius)
+            .unwrap()
+            .clamp_max(1.0);
+        let weighted = &diff * (&factor * &mask).unsqueeze(1);
+        let accum = weighted.sum_dim_intlist(0, false, Kind::Float);
+        let n_kept = mask.sum(Kind::Float).double_value(&[]);
+        center = center + accum.f_div_scalar(n_kept).unwrap();
+    }
+    center
+}
+
+#[cfg(test)]
+mod leviathan_robust_tests {
+    use super::*;
+
+    #[test]
+    fn robust_aggregate_down_weights_a_sign_flip_coalition() {
+        tch::manual_seed(0);
+        let dim = 512i64;
+        let cpu = Device::Cpu;
+        let honest_dir = Tensor::ones([dim], (Kind::Float, cpu));
+        let mut rows: Vec<Tensor> = Vec::new();
+        for _ in 0..11 {
+            let noise = Tensor::randn([dim], (Kind::Float, cpu))
+                .f_mul_scalar(0.05)
+                .unwrap();
+            rows.push(&honest_dir + &noise);
+        }
+        for _ in 0..5 {
+            rows.push(honest_dir.f_mul_scalar(-1.0).unwrap());
+        }
+        let deltas = Tensor::stack(&rows, 0);
+
+        let naive = deltas.sum(Kind::Float).double_value(&[]) / (dim as f64 * 16.0);
+        let center = leviathan_robust_aggregate(&deltas, 3.0, 3);
+        let robust = center.sum(Kind::Float).double_value(&[]) / dim as f64;
+
+        assert!(
+            robust > naive + 0.1,
+            "robust {robust} did not pull away from the coalition (naive {naive})"
+        );
+        assert!(robust > 0.5, "robust {robust} still dominated by the coalition");
+    }
+}
