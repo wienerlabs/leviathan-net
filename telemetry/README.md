@@ -9,6 +9,12 @@ docker compose -f telemetry/docker-compose.yml up
 
 from the root of the repository.
 
+Prometheus loads `leviathan-killswitch.rules.yml` for mainnet kill-switch alerts
+(economic insecurity, treasury drain, mesh partition, uncaught fraud, honest FPR,
+indexer lag). Metric names must be exported by the indexer/ops exporters before
+those rules fire in production; the offline evaluator lives in the leviathan repo
+at `scripts/check_killswitches.py`.
+
 Once the telemetry stack is up, start your local training setup as usual, but remember to add the OTLP arguments when
 running the Psyche client:
 

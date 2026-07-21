@@ -21,6 +21,7 @@ services:
       - '9090:9090'
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./leviathan-killswitch.rules.yml:/etc/prometheus/leviathan-killswitch.rules.yml
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
