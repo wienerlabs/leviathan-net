@@ -53,14 +53,17 @@ async fn main() -> Result<()> {
     if let (Some(reward_per_round), Some(bond), Some(slash_when_caught)) =
         (args.reward_per_round, args.bond, args.slash_when_caught)
     {
-        telemetry.security = Some(assess_security(
-            telemetry.audit_probability,
-            &RunEconomics {
-                reward_per_round,
-                bond,
-                slash_when_caught,
-            },
-        ));
+        let economics = RunEconomics {
+            reward_per_round,
+            bond,
+            slash_when_caught,
+        };
+        if !economics.is_well_formed() {
+            return Err(anyhow!(
+                "reward-per-round, bond and slash-when-caught must be finite and non-negative"
+            ));
+        }
+        telemetry.security = Some(assess_security(telemetry.audit_probability, &economics));
     }
     println!("{}", serde_json::to_string_pretty(&telemetry)?);
     Ok(())

@@ -37,6 +37,14 @@ pub struct RunEconomics {
     pub slash_when_caught: f64,
 }
 
+impl RunEconomics {
+    pub fn is_well_formed(&self) -> bool {
+        [self.reward_per_round, self.bond, self.slash_when_caught]
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 pub struct SecurityAssessment {
     pub audit_probability: f64,
@@ -49,7 +57,8 @@ pub struct SecurityAssessment {
 pub fn assess_security(audit_probability: f64, economics: &RunEconomics) -> SecurityAssessment {
     let p = audit_probability.clamp(0.0, 1.0);
     let break_even_penalty = if p > 0.0 {
-        Some(economics.reward_per_round * (1.0 - p) / p)
+        let value = economics.reward_per_round * (1.0 - p) / p;
+        value.is_finite().then_some(value)
     } else {
         None
     };
@@ -260,5 +269,46 @@ mod tests {
         ));
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"economically_secure\":true"));
+    }
+
+    #[test]
+    fn overflow_break_even_serializes_as_absent() {
+        let econ = RunEconomics {
+            reward_per_round: f64::MAX,
+            bond: f64::MAX,
+            slash_when_caught: f64::MAX,
+        };
+        let s = assess_security(1e-300, &econ);
+        assert_eq!(s.break_even_penalty, None);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"break_even_penalty\":null"));
+    }
+
+    #[test]
+    fn non_finite_or_negative_economics_are_rejected() {
+        assert!(RunEconomics {
+            reward_per_round: 1000.0,
+            bond: 500.0,
+            slash_when_caught: 100.0,
+        }
+        .is_well_formed());
+        assert!(!RunEconomics {
+            reward_per_round: f64::INFINITY,
+            bond: 500.0,
+            slash_when_caught: 100.0,
+        }
+        .is_well_formed());
+        assert!(!RunEconomics {
+            reward_per_round: f64::NAN,
+            bond: 500.0,
+            slash_when_caught: 100.0,
+        }
+        .is_well_formed());
+        assert!(!RunEconomics {
+            reward_per_round: 1000.0,
+            bond: -1.0,
+            slash_when_caught: 100.0,
+        }
+        .is_well_formed());
     }
 }
