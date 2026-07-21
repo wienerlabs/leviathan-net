@@ -99,6 +99,12 @@ pub mod psyche_solana_treasurer {
     ) -> Result<()> {
         run_set_slash_bounty_processor(context, params)
     }
+
+    pub fn participant_authorize_join(
+        context: Context<ParticipantAuthorizeJoinAccounts>,
+    ) -> Result<()> {
+        participant_authorize_join_processor(context)
+    }
 }
 
 #[error_code]

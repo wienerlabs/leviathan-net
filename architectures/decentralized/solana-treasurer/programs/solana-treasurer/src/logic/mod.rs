@@ -1,3 +1,4 @@
+pub mod participant_authorize_join;
 pub mod participant_bond_deposit;
 pub mod participant_bond_finalize_withdraw;
 pub mod participant_bond_request_withdraw;
@@ -9,6 +10,7 @@ pub mod run_set_slash_bounty;
 pub mod run_slash;
 pub mod run_update;
 
+pub use participant_authorize_join::*;
 pub use participant_bond_deposit::*;
 pub use participant_bond_finalize_withdraw::*;
 pub use participant_bond_request_withdraw::*;

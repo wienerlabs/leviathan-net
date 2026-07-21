@@ -3,7 +3,10 @@ use anchor_lang::ToAccountMetas;
 use anchor_spl::associated_token;
 use anchor_spl::token;
 use anyhow::Result;
+use psyche_solana_authorizer::find_authorization;
 use psyche_solana_coordinator::find_coordinator_instance;
+use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
+use psyche_solana_treasurer::accounts::ParticipantAuthorizeJoinAccounts;
 use psyche_solana_treasurer::accounts::ParticipantBondDepositAccounts;
 use psyche_solana_treasurer::accounts::ParticipantBondFinalizeWithdrawAccounts;
 use psyche_solana_treasurer::accounts::ParticipantBondRequestWithdrawAccounts;
@@ -16,6 +19,7 @@ use psyche_solana_treasurer::accounts::RunSlashAccounts;
 use psyche_solana_treasurer::accounts::RunUpdateAccounts;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::find_run;
+use psyche_solana_treasurer::instruction::ParticipantAuthorizeJoin;
 use psyche_solana_treasurer::instruction::ParticipantBondDeposit;
 use psyche_solana_treasurer::instruction::ParticipantBondFinalizeWithdraw;
 use psyche_solana_treasurer::instruction::ParticipantBondRequestWithdraw;
@@ -401,4 +405,32 @@ pub async fn process_treasurer_participant_claim(
         .process_instruction_with_signers(payer, instruction, &[user])
         .await?;
     Ok(())
+}
+
+pub async fn process_treasurer_participant_authorize_join(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    user: &Pubkey,
+    run: &Pubkey,
+) -> Result<Pubkey> {
+    let participant = find_participant(run, user);
+    let authorization = find_authorization(run, user, JOIN_RUN_AUTHORIZATION_SCOPE);
+    let accounts = ParticipantAuthorizeJoinAccounts {
+        payer: payer.pubkey(),
+        user: *user,
+        run: *run,
+        participant,
+        authorization,
+        authorizer_program: psyche_solana_authorizer::ID,
+        system_program: system_program::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: ParticipantAuthorizeJoin {}.data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[])
+        .await?;
+    Ok(authorization)
 }
