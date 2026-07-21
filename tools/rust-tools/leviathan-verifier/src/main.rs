@@ -20,10 +20,16 @@ struct Args {
     band: f32,
     #[arg(long, default_value_t = false)]
     cuda: bool,
+    #[arg(long)]
+    json_out: Option<PathBuf>,
 }
 
 fn hex8(bytes: &[u8; 32]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn main() -> Result<()> {
@@ -64,6 +70,24 @@ fn main() -> Result<()> {
         summary.fraud(),
         args.band
     );
+
+    if let Some(path) = &args.json_out {
+        let items: Vec<String> = summary
+            .proofs()
+            .iter()
+            .map(|proof| {
+                format!(
+                    "{{\"index\":{},\"committed_hash\":\"{}\",\"replayed_hash\":\"{}\",\"distance\":{},\"band\":{}}}",
+                    proof.target_index,
+                    hex32(&proof.committed_hash),
+                    hex32(&proof.replayed_hash),
+                    proof.distance,
+                    proof.band
+                )
+            })
+            .collect();
+        std::fs::write(path, format!("[{}]\n", items.join(",")))?;
+    }
 
     if summary.fraud() > 0 {
         std::process::exit(2);

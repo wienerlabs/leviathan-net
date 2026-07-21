@@ -168,6 +168,36 @@ pub async fn process_treasurer_run_slash(
     run_id: &str,
     index: u64,
 ) -> Result<()> {
+    process_treasurer_run_slash_with_hashes(
+        endpoint,
+        payer,
+        authority,
+        run,
+        coordinator_account,
+        run_id,
+        index,
+        0,
+        0,
+        [0x11; 32],
+        [0x22; 32],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_treasurer_run_slash_with_hashes(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    authority: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    index: u64,
+    batch_start: u64,
+    batch_end: u64,
+    committed_hash: [u8; 32],
+    replayed_hash: [u8; 32],
+) -> Result<()> {
     let coordinator_instance = find_coordinator_instance(run_id);
     let accounts = RunSlashAccounts {
         authority: authority.pubkey(),
@@ -181,10 +211,10 @@ pub async fn process_treasurer_run_slash(
         data: RunSlash {
             params: RunSlashParams {
                 index,
-                batch_start: 0,
-                batch_end: 0,
-                committed_hash: [0x11; 32],
-                replayed_hash: [0x22; 32],
+                batch_start,
+                batch_end,
+                committed_hash,
+                replayed_hash,
             },
         }
         .data(),
