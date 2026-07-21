@@ -120,4 +120,7 @@ pub enum ProgramError {
 
     #[msg("Bond is below the run minimum required to claim rewards")]
     BondBelowMinimum,
+
+    #[msg("A run that requires a bond must also set a positive bond withdraw delay")]
+    BondWindowRequired,
 }

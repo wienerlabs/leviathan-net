@@ -30,6 +30,10 @@ pub fn run_bond_config_update_processor(
         return err!(ProgramError::InvalidParameter);
     }
 
+    if params.bond_minimum_amount > 0 && params.bond_withdraw_delay_seconds == 0 {
+        return err!(ProgramError::BondWindowRequired);
+    }
+
     let run = &mut context.accounts.run;
     run.bond_minimum_amount = params.bond_minimum_amount;
     run.bond_withdraw_delay_seconds = params.bond_withdraw_delay_seconds;

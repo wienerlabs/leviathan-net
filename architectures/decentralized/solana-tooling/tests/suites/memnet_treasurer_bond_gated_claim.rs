@@ -93,6 +93,19 @@ pub async fn run() {
         &run,
         RunBondConfigUpdateParams {
             bond_minimum_amount: BOND,
+            bond_withdraw_delay_seconds: 0,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    process_treasurer_run_bond_config_update(
+        &mut endpoint,
+        &payer,
+        &main_authority,
+        &run,
+        RunBondConfigUpdateParams {
+            bond_minimum_amount: BOND,
             bond_withdraw_delay_seconds: WITHDRAW_DELAY,
         },
     )
