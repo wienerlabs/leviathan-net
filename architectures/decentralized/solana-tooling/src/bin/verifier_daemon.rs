@@ -24,6 +24,8 @@ struct Args {
     run_id: String,
     #[arg(long)]
     coordinator_account: String,
+    #[arg(long, env = "SOLANA_RPC_URL")]
+    rpc_url: Option<String>,
     #[arg(long)]
     run: Option<String>,
     #[arg(long)]
@@ -66,7 +68,13 @@ async fn main() -> Result<()> {
             psyche_solana_treasurer::find_run(index)
         }
     };
-    let mut endpoint = ToolboxEndpoint::new_devnet().await;
+    let mut endpoint = match &args.rpc_url {
+        Some(url) => ToolboxEndpoint::new_rpc_with_url_or_moniker_and_commitment(
+            url,
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ),
+        None => ToolboxEndpoint::new_devnet().await,
+    };
 
     let config = AuditConfig {
         run_id: args.run_id.clone(),
