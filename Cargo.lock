@@ -7664,6 +7664,8 @@ dependencies = [
  "anchor-spl",
  "anyhow",
  "bytemuck",
+ "clap",
+ "leviathan-verifier",
  "psyche-coordinator",
  "psyche-core",
  "psyche-solana-authorizer",
@@ -7671,8 +7673,10 @@ dependencies = [
  "psyche-solana-distributor",
  "psyche-solana-mining-pool",
  "psyche-solana-treasurer",
+ "psyche-verifier",
  "solana-sdk",
  "solana_toolbox_endpoint",
+ "tch",
  "tokio",
 ]
 
