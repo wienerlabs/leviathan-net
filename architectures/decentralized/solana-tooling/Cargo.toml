@@ -37,6 +37,11 @@ path = "src/bin/devnet_conviction_demo.rs"
 required-features = ["demo"]
 
 [[bin]]
+name = "devnet-committee-demo"
+path = "src/bin/devnet_committee_demo.rs"
+required-features = ["demo"]
+
+[[bin]]
 name = "leviathan-verifier-daemon"
 path = "src/bin/verifier_daemon.rs"
 required-features = ["daemon"]
