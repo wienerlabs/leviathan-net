@@ -16,7 +16,7 @@ use psyche_coordinator::{ClientState, Coordinator, CoordinatorError, RunState};
 use psyche_core::sha256;
 use psyche_metrics::ClientMetrics;
 
-use psyche_network::{DiscoveryMode, NetworkTUIState, NetworkTui, SecretKey, allowlist};
+use psyche_network::{NetworkTUIState, NetworkTui, SecretKey, allowlist};
 use psyche_tui::{CustomWidget, TabbedWidget, logging::LoggerWidget};
 use psyche_watcher::CoordinatorTui;
 use rand::{Rng, RngCore, SeedableRng};
@@ -107,7 +107,7 @@ pub async fn build_app(
         &p.run_id,
         p.bind_p2p_port,
         p.bind_p2p_interface,
-        DiscoveryMode::N0,
+        p.iroh_discovery,
         p.iroh_relay,
         vec![],
         Some(identity_secret_key.clone()),
