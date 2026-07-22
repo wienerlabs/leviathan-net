@@ -15,6 +15,7 @@ use tch::Device;
 
 use crate::get_accounts::get_coordinator_account_state;
 use crate::process_treasurer_instructions::process_treasurer_run_slash_with_hashes;
+use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 
 pub struct AuditConfig {
     pub run_id: String,
@@ -23,6 +24,7 @@ pub struct AuditConfig {
     pub band: f32,
     pub audit_assigned: bool,
     pub dry_run: bool,
+    pub verdict_mode: bool,
 }
 
 pub fn hex8(bytes: &[u8; 32]) -> String {
@@ -132,38 +134,68 @@ pub async fn audit_pass(
             .iter()
             .position(|client| format!("{}", client.id) == committer);
         let Some(index) = index else {
-            println!("  committer {committer} is not in the current epoch roster, cannot slash yet");
+            println!("  committer {committer} is not in the current epoch roster, cannot act yet");
             continue;
         };
 
+        let action = if config.verdict_mode { "verdict" } else { "slash" };
         if config.dry_run {
-            println!("  [dry-run] would slash epoch index {index} for {committer}");
+            println!("  [dry-run] would submit {action} for {committer} at epoch index {index}");
             new_convictions += 1;
             continue;
         }
 
-        match process_treasurer_run_slash_with_hashes(
-            endpoint,
-            authority,
-            authority,
-            run,
-            coordinator_account,
-            &config.run_id,
-            index as u64,
-            batch_start,
-            batch_end,
-            committed_hash,
-            replayed_hash,
-        )
-        .await
-        {
+        let result = if config.verdict_mode {
+            let target = Pubkey::new_from_array(
+                *coordinator
+                    .epoch_state
+                    .clients
+                    .iter()
+                    .nth(index)
+                    .expect("index was just found by position")
+                    .id
+                    .signer(),
+            );
+            process_treasurer_run_submit_audit_verdict(
+                endpoint,
+                authority,
+                authority,
+                run,
+                coordinator_account,
+                &config.run_id,
+                &target,
+                index as u64,
+                batch_start,
+                batch_end,
+                committed_hash,
+                replayed_hash,
+            )
+            .await
+        } else {
+            process_treasurer_run_slash_with_hashes(
+                endpoint,
+                authority,
+                authority,
+                run,
+                coordinator_account,
+                &config.run_id,
+                index as u64,
+                batch_start,
+                batch_end,
+                committed_hash,
+                replayed_hash,
+            )
+            .await
+        };
+
+        match result {
             Ok(()) => {
-                println!("  convicted {committer} at epoch index {index}: on-chain slash submitted");
+                println!("  {action} submitted for {committer} at epoch index {index}");
                 convicted.insert(committer);
                 new_convictions += 1;
             }
             Err(err) => {
-                println!("  slash submission failed for {committer} at index {index}: {err:#}")
+                println!("  {action} submission failed for {committer} at index {index}: {err:#}")
             }
         }
     }

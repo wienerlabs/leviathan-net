@@ -9,16 +9,16 @@ use psyche_coordinator::model::LLMTrainingDataLocation;
 use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_coordinator::model::LLM;
+use psyche_coordinator::ClientState;
+use psyche_coordinator::Committee;
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
-use psyche_coordinator::SOLANA_MAX_NUM_WITNESSES;
 use psyche_coordinator::WAITING_FOR_MEMBERS_EXTRA_SECONDS;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
 use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
-use psyche_solana_coordinator::instruction::Witness;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
@@ -29,7 +29,6 @@ use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_a
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
@@ -38,15 +37,16 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
-const RUN_ID: &str = "Leviathan verifier daemon slash";
+const RUN_ID: &str = "Leviathan daemon committee";
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
 
 fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("levdaemon-{}-{}", std::process::id(), tag));
+    let dir = std::env::temp_dir().join(format!("levdaemoncomm-{}-{}", std::process::id(), tag));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -66,26 +66,23 @@ pub async fn run() {
 
     let payer = Keypair::new();
     endpoint
-        .request_airdrop(&payer.pubkey(), 5_000_000_000)
+        .request_airdrop(&payer.pubkey(), 20_000_000_000)
         .await
         .unwrap();
 
     let mint_authority = Keypair::new();
     let main_authority = Keypair::new();
-    endpoint
-        .request_airdrop(&main_authority.pubkey(), 1_000_000_000)
-        .await
-        .unwrap();
     let join_authority = Keypair::new();
     let ticker = Keypair::new();
-    let mut clients = vec![];
-    for _ in 0..4 {
-        clients.push(Keypair::new());
-    }
-    let cheater = 0usize;
+    let clients: Vec<Keypair> = (0..6).map(|_| Keypair::new()).collect();
     let warmup_time = 10;
-    let round_witness_time = 10;
-    let cooldown_time = 88;
+
+    for client in &clients {
+        endpoint
+            .request_airdrop(&client.pubkey(), 2_000_000_000)
+            .await
+            .unwrap();
+    }
 
     let collateral_mint = endpoint
         .process_spl_token_mint_new(&payer, &mint_authority.pubkey(), None, 0)
@@ -107,7 +104,7 @@ pub async fn run() {
         &collateral_mint,
         &coordinator_account,
         RunCreateParams {
-            index: 74,
+            index: 91,
             run_id: RUN_ID.to_string(),
             main_authority: main_authority.pubkey(),
             join_authority: join_authority.pubkey(),
@@ -130,7 +127,6 @@ pub async fn run() {
     .await
     .unwrap();
 
-    let mut clients_collateral = vec![];
     for client in &clients {
         let ata = endpoint
             .process_spl_associated_token_account_get_or_init(
@@ -144,26 +140,21 @@ pub async fn run() {
             .process_spl_token_mint_to(&payer, &collateral_mint, &mint_authority, &ata, BOND)
             .await
             .unwrap();
-        clients_collateral.push(ata);
-    }
-
-    for client in &clients {
         process_treasurer_participant_create(&mut endpoint, &payer, client, &run)
             .await
             .unwrap();
+        process_treasurer_participant_bond_deposit(
+            &mut endpoint,
+            &payer,
+            client,
+            &ata,
+            &collateral_mint,
+            &run,
+            BOND,
+        )
+        .await
+        .unwrap();
     }
-
-    process_treasurer_participant_bond_deposit(
-        &mut endpoint,
-        &payer,
-        &clients[cheater],
-        &clients_collateral[cheater],
-        &collateral_mint,
-        &run,
-        BOND,
-    )
-    .await
-    .unwrap();
 
     process_treasurer_run_update(
         &mut endpoint,
@@ -176,15 +167,15 @@ pub async fn run() {
             metadata: None,
             config: Some(CoordinatorConfig {
                 warmup_time,
-                cooldown_time,
+                cooldown_time: 10,
                 max_round_train_time: 15,
-                round_witness_time,
-                min_clients: 1,
-                init_min_clients: 1,
+                round_witness_time: 10,
+                min_clients: clients.len() as u16,
+                init_min_clients: clients.len() as u16,
                 global_batch_size_start: 1,
                 global_batch_size_end: clients.len() as u16,
                 global_batch_size_warmup_tokens: 0,
-                verification_percent: 0,
+                verification_percent: 50,
                 witness_nodes: 0,
                 epoch_time: 30,
                 total_steps: 100,
@@ -276,67 +267,45 @@ pub async fn run() {
     .await
     .unwrap();
 
-    for _ in 0..4 {
-        let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-            .await
-            .unwrap()
-            .unwrap();
-        for client in &clients {
-            let position = state
-                .coordinator
-                .epoch_state
-                .clients
-                .iter()
-                .position(|c| *c.id.signer() == client.pubkey().to_bytes());
-            let Some(position) = position else {
-                continue;
-            };
-            let witness_proof = CommitteeSelection::from_coordinator(&state.coordinator, 0)
-                .unwrap()
-                .get_witness(position as u64);
-            if witness_proof.position >= SOLANA_MAX_NUM_WITNESSES as u64 {
-                continue;
-            }
-            process_coordinator_witness(
-                &mut endpoint,
-                &payer,
-                client,
-                &coordinator_instance,
-                &coordinator_account,
-                &Witness {
-                    proof: witness_proof,
-                    participant_bloom: Default::default(),
-                    broadcast_bloom: Default::default(),
-                    broadcast_merkle: Default::default(),
-                    metadata: Default::default(),
-                },
-            )
-            .await
-            .unwrap();
-        }
-        endpoint
-            .forward_clock_unix_timestamp(round_witness_time)
-            .await
-            .unwrap();
-        process_coordinator_tick(
-            &mut endpoint,
-            &payer,
-            &ticker,
-            &coordinator_instance,
-            &coordinator_account,
-        )
+    let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
         .await
+        .unwrap()
         .unwrap();
-    }
+    let selection = CommitteeSelection::from_coordinator(&state.coordinator, 0).unwrap();
+    let quorum = (2 * selection.get_num_verifier_nodes()).div_ceil(3).max(1);
 
-    let cheater_committer = format!(
+    let mut verifiers: Vec<&Keypair> = vec![];
+    let mut target: Option<Pubkey> = None;
+    for (epoch_index, client) in state.coordinator.epoch_state.clients.iter().enumerate() {
+        let signer = *client.id.signer();
+        let keypair = clients.iter().find(|k| k.pubkey().to_bytes() == signer);
+        match selection.get_committee(epoch_index as u64).committee {
+            Committee::Verifier => {
+                if let Some(keypair) = keypair {
+                    verifiers.push(keypair);
+                }
+            }
+            Committee::Trainer => {
+                if target.is_none() {
+                    if let Some(keypair) = keypair {
+                        target = Some(keypair.pubkey());
+                    }
+                }
+            }
+            Committee::TieBreaker => {}
+        }
+    }
+    let target_key = target.expect("no trainer target found");
+    assert!(verifiers.len() as u64 >= quorum);
+
+    let target_committer = format!(
         "{}",
-        NodeIdentity::new(clients[cheater].pubkey().to_bytes(), Default::default())
+        NodeIdentity::new(target_key.to_bytes(), Default::default())
     );
     let submitted_dir = scratch("submitted");
     let reference_dir = scratch("reference");
-    place_fixture(&reference_dir, "honest.vec-postcard", &cheater_committer);
-    place_fixture(&submitted_dir, "fraud.vec-postcard", &cheater_committer);
+    place_fixture(&reference_dir, "honest.vec-postcard", &target_committer);
+    place_fixture(&submitted_dir, "fraud.vec-postcard", &target_committer);
 
     let config = AuditConfig {
         run_id: RUN_ID.to_string(),
@@ -345,13 +314,45 @@ pub async fn run() {
         band: 0.05,
         audit_assigned: false,
         dry_run: false,
-        verdict_mode: false,
+        verdict_mode: true,
     };
 
+    for verifier in verifiers.iter().take((quorum - 1) as usize) {
+        let mut convicted = HashSet::new();
+        let submitted = audit_pass(
+            &mut endpoint,
+            verifier,
+            &coordinator_account,
+            &run,
+            &config,
+            &mut convicted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(submitted, 1, "each verifier daemon submits one verdict");
+    }
+
+    let mid = get_coordinator_account_state(&mut endpoint, &coordinator_account)
+        .await
+        .unwrap()
+        .unwrap();
+    let target_state_mid = mid
+        .coordinator
+        .epoch_state
+        .clients
+        .iter()
+        .find(|c| *c.id.signer() == target_key.to_bytes())
+        .map(|c| c.state);
+    assert_eq!(
+        target_state_mid,
+        Some(ClientState::Healthy),
+        "no single verifier daemon can convict alone before quorum"
+    );
+
     let mut convicted = HashSet::new();
-    let convictions = audit_pass(
+    audit_pass(
         &mut endpoint,
-        &main_authority,
+        verifiers[(quorum - 1) as usize],
         &coordinator_account,
         &run,
         &config,
@@ -360,33 +361,51 @@ pub async fn run() {
     .await
     .unwrap();
 
-    assert_eq!(convictions, 1);
-    assert!(convicted.contains(&cheater_committer));
-
-    endpoint
-        .forward_clock_unix_timestamp(cooldown_time)
-        .await
-        .unwrap();
-    process_coordinator_tick(
-        &mut endpoint,
-        &payer,
-        &ticker,
-        &coordinator_instance,
-        &coordinator_account,
-    )
-    .await
-    .unwrap();
-
-    let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
+    let after = get_coordinator_account_state(&mut endpoint, &coordinator_account)
         .await
         .unwrap()
         .unwrap();
-    let cheater_state = state
-        .clients_state
+    let target_state_after = after
+        .coordinator
+        .epoch_state
         .clients
         .iter()
-        .find(|c| *c.id.signer() == clients[cheater].pubkey().to_bytes())
-        .unwrap();
-    assert_eq!(cheater_state.slashed, SLASHING_RATE);
-    assert_eq!(cheater_state.earned, 0);
+        .find(|c| *c.id.signer() == target_key.to_bytes())
+        .map(|c| c.state);
+    assert_eq!(
+        target_state_after,
+        Some(ClientState::Ejected),
+        "the quorum verdict ejects the target"
+    );
+
+    let mut target_slashed = 0;
+    for _ in 0..12 {
+        endpoint
+            .forward_clock_unix_timestamp(60)
+            .await
+            .unwrap();
+        let _ = process_coordinator_tick(
+            &mut endpoint,
+            &payer,
+            &ticker,
+            &coordinator_instance,
+            &coordinator_account,
+        )
+        .await;
+        let settled = get_coordinator_account_state(&mut endpoint, &coordinator_account)
+            .await
+            .unwrap()
+            .unwrap();
+        target_slashed = settled
+            .clients_state
+            .clients
+            .iter()
+            .find(|c| *c.id.signer() == target_key.to_bytes())
+            .unwrap()
+            .slashed;
+        if target_slashed > 0 {
+            break;
+        }
+    }
+    assert_eq!(target_slashed, SLASHING_RATE);
 }

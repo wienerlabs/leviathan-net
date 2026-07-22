@@ -44,6 +44,8 @@ struct Args {
     dry_run: bool,
     #[arg(long, default_value_t = false)]
     audit_assigned: bool,
+    #[arg(long, default_value_t = false)]
+    verdict: bool,
 }
 
 #[tokio::main]
@@ -83,6 +85,7 @@ async fn main() -> Result<()> {
         band: args.band,
         audit_assigned: args.audit_assigned,
         dry_run: args.dry_run,
+        verdict_mode: args.verdict,
     };
 
     println!(
@@ -98,6 +101,14 @@ async fn main() -> Result<()> {
             "audit-all"
         },
         config.dry_run
+    );
+    println!(
+        "[verifier-daemon] action={}",
+        if config.verdict_mode {
+            "submit-verdict (bonded committee vote)"
+        } else {
+            "slash (single authority)"
+        }
     );
 
     let mut convicted: HashSet<String> = HashSet::new();
