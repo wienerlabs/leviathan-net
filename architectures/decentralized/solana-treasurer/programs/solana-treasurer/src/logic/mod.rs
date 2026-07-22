@@ -8,6 +8,7 @@ pub mod run_bond_config_update;
 pub mod run_create;
 pub mod run_set_slash_bounty;
 pub mod run_slash;
+pub mod run_submit_audit_verdict;
 pub mod run_update;
 
 pub use participant_authorize_join::*;
@@ -20,4 +21,5 @@ pub use run_bond_config_update::*;
 pub use run_create::*;
 pub use run_set_slash_bounty::*;
 pub use run_slash::*;
+pub use run_submit_audit_verdict::*;
 pub use run_update::*;

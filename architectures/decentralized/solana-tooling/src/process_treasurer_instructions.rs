@@ -38,7 +38,11 @@ use psyche_solana_treasurer::logic::ParticipantCreateParams;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunSetSlashBountyParams;
+use psyche_solana_treasurer::accounts::RunSubmitAuditVerdictAccounts;
+use psyche_solana_treasurer::find_audit_verdict;
+use psyche_solana_treasurer::instruction::RunSubmitAuditVerdict;
 use psyche_solana_treasurer::logic::RunSlashParams;
+use psyche_solana_treasurer::logic::RunSubmitAuditVerdictParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -222,6 +226,56 @@ pub async fn process_treasurer_run_slash_with_hashes(
     };
     endpoint
         .process_instruction_with_signers(payer, instruction, &[authority])
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_treasurer_run_submit_audit_verdict(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    verifier: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    target: &Pubkey,
+    target_index: u64,
+    batch_start: u64,
+    batch_end: u64,
+    committed_hash: [u8; 32],
+    replayed_hash: [u8; 32],
+) -> Result<()> {
+    let coordinator_instance = find_coordinator_instance(run_id);
+    let verifier_participant = find_participant(run, &verifier.pubkey());
+    let audit_verdict = find_audit_verdict(run, target);
+    let accounts = RunSubmitAuditVerdictAccounts {
+        payer: payer.pubkey(),
+        verifier: verifier.pubkey(),
+        verifier_participant,
+        run: *run,
+        coordinator_instance,
+        coordinator_account: *coordinator_account,
+        audit_verdict,
+        coordinator_program: psyche_solana_coordinator::ID,
+        system_program: system_program::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSubmitAuditVerdict {
+            params: RunSubmitAuditVerdictParams {
+                target: *target,
+                target_index,
+                batch_start,
+                batch_end,
+                committed_hash,
+                replayed_hash,
+            },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[verifier])
         .await?;
     Ok(())
 }

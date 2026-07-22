@@ -26,6 +26,18 @@ pub fn find_participant(run: &Pubkey, user: &Pubkey) -> Pubkey {
     .0
 }
 
+pub fn find_audit_verdict(run: &Pubkey, target: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            state::AuditVerdict::SEEDS_PREFIX,
+            run.as_ref(),
+            target.as_ref(),
+        ],
+        &crate::ID,
+    )
+    .0
+}
+
 #[program]
 pub mod psyche_solana_treasurer {
     use super::*;
@@ -105,6 +117,13 @@ pub mod psyche_solana_treasurer {
     ) -> Result<()> {
         participant_authorize_join_processor(context)
     }
+
+    pub fn run_submit_audit_verdict(
+        context: Context<RunSubmitAuditVerdictAccounts>,
+        params: RunSubmitAuditVerdictParams,
+    ) -> Result<()> {
+        run_submit_audit_verdict_processor(context, params)
+    }
 }
 
 #[error_code]
@@ -129,4 +148,22 @@ pub enum ProgramError {
 
     #[msg("A run that requires a bond must also set a positive bond withdraw delay")]
     BondWindowRequired,
+
+    #[msg("The verifier is not a participant in the current epoch")]
+    VerifierNotInEpoch,
+
+    #[msg("The signer is not an assigned verifier for this round")]
+    VerifierNotAssigned,
+
+    #[msg("The target index does not match the provided target key")]
+    TargetMismatch,
+
+    #[msg("This verifier already submitted a verdict for this target this epoch")]
+    DuplicateVerdict,
+
+    #[msg("The verdict has already resolved into a slash this epoch")]
+    VerdictAlreadyResolved,
+
+    #[msg("The verdict voter set is full")]
+    VerdictVotersFull,
 }
