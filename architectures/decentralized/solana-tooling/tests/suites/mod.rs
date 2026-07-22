@@ -18,3 +18,5 @@ mod memnet_treasurer_create_claim;
 mod memnet_treasurer_create_update;
 mod memnet_treasurer_full_epoch;
 mod memnet_treasurer_slash_settle;
+#[cfg(feature = "daemon")]
+mod memnet_verifier_daemon;

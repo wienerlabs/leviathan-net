@@ -36,12 +36,34 @@ name = "devnet-conviction-demo"
 path = "src/bin/devnet_conviction_demo.rs"
 required-features = ["demo"]
 
+[[bin]]
+name = "leviathan-verifier-daemon"
+path = "src/bin/verifier_daemon.rs"
+required-features = ["daemon"]
+
 [features]
 demo = ["dep:tokio"]
+daemon = ["dep:tokio", "dep:clap", "dep:leviathan-verifier", "dep:psyche-verifier", "dep:tch"]
+
+[dependencies.clap]
+workspace = true
+optional = true
 
 [dependencies.tokio]
 version = "1.42.0"
 features = ["rt-multi-thread", "macros", "time"]
+optional = true
+
+[dependencies.leviathan-verifier]
+path = "../../../tools/rust-tools/leviathan-verifier"
+optional = true
+
+[dependencies.psyche-verifier]
+path = "../../../shared/verifier"
+optional = true
+
+[dependencies.tch]
+workspace = true
 optional = true
 
 [dev-dependencies]

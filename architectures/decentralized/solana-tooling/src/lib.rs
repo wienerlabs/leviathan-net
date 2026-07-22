@@ -1,4 +1,6 @@
 pub mod create_memnet_endpoint;
+#[cfg(feature = "daemon")]
+pub mod daemon;
 pub mod distributor;
 pub mod get_accounts;
 pub mod mining_pool;
