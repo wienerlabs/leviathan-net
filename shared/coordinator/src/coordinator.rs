@@ -717,7 +717,7 @@ impl Coordinator {
                 return Err(CoordinatorError::InvalidCommitteeProof);
             }
             match proof.committee {
-                Committee::TieBreaker => todo!(),
+                Committee::TieBreaker => Ok(true),
                 Committee::Verifier => Ok(true),
                 Committee::Trainer => self.trainer_healthy(&client.id),
             }
