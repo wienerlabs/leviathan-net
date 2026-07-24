@@ -33,12 +33,27 @@ through the treasurer's `participant_claim`.
 
 ## Run a node
 
-One command sets up the libtorch toolchain (PyTorch 2.9.1 for the tch fork),
-builds the client, and joins the flagship run:
+If you have nothing set up yet, one line fetches everything, checks your
+prerequisites, and guides you the rest of the way:
 
 ```
-./scripts/leviathan-node.sh --wallet <path/to/devnet-keypair.json>
+curl -fsSL https://raw.githubusercontent.com/wienerlabs/leviathan-net/main/scripts/install.sh | bash
 ```
+
+Set `WALLET=<keypair path>` (and optionally `BOND=<amount>`) before that line to
+go straight from clone to a running, bonded node.
+
+If you already have the repository, one command sets up the libtorch toolchain
+(PyTorch 2.9.1 for the tch fork), builds the client, and joins the flagship run:
+
+```
+./scripts/leviathan-node.sh --wallet <path/to/devnet-keypair.json> [--bond <amount>]
+```
+
+`--bond <amount>` posts collateral through the treasurer before joining, so a
+bonded node is one command. Inspect and manage the bond separately with
+`run-manager bond-status`, `bond-deposit`, `bond-withdraw-request` and
+`bond-withdraw-finalize`.
 
 The wallet needs a little devnet SOL for transaction fees. Override `RUN_ID`,
 `RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed. The first build
