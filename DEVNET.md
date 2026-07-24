@@ -58,6 +58,23 @@ bonded node is one command. Inspect and manage the bond separately with
 The wallet needs a little devnet SOL for transaction fees. Override `RUN_ID`,
 `RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed.
 
+### Dashboard telemetry
+
+`leviathan-indexer --features live` reads a coordinator account and prints run
+telemetry as JSON. It is libtorch-free, so it runs anywhere. Publish it for the
+dashboard:
+
+```
+OUT=telemetry.json ./scripts/publish-telemetry.sh \
+  --coordinator-account <coordinator-pubkey> --run-id <run> --rpc <rpc> \
+  --reward-per-round 0.324 --bond 10.55 --slash-when-caught 10.55
+```
+
+The economics flags add the on-chain economic security verdict. The
+`publish telemetry` GitHub Action runs this every 15 minutes and commits
+`telemetry.json`; point the leviathan-web dashboard's `VITE_TELEMETRY_URL` at the
+raw file to make it live.
+
 ### Configure once
 
 A dedicated RPC is strongly recommended. The shared public endpoint rate-limits

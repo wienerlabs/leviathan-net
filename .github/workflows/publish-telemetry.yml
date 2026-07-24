@@ -1,0 +1,71 @@
+name: publish telemetry
+
+# Reads the flagship coordinator account on a schedule and commits telemetry.json
+# so the leviathan-web dashboard can consume it live. leviathan-indexer is
+# libtorch-free, so this stays cheap. Point the dashboard's VITE_TELEMETRY_URL at
+# the raw file, or mirror it to the site's public/ directory.
+#
+# Required repository configuration:
+#   variable COORDINATOR_ACCOUNT   the run's coordinator account pubkey
+#   variable RUN_ID                the run id (default leviathan-devnet)
+#   secret   TELEMETRY_RPC         a dedicated devnet RPC url
+# Optional economics for the security verdict:
+#   variable REWARD_PER_ROUND, BOND, SLASH_WHEN_CAUGHT
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: publish-telemetry
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Build the indexer
+        run: cargo build -p leviathan-indexer --features live --bin leviathan-indexer
+
+      - name: Read telemetry
+        env:
+          RPC: ${{ secrets.TELEMETRY_RPC }}
+          COORDINATOR_ACCOUNT: ${{ vars.COORDINATOR_ACCOUNT }}
+          RUN_ID: ${{ vars.RUN_ID }}
+          REWARD_PER_ROUND: ${{ vars.REWARD_PER_ROUND }}
+          BOND: ${{ vars.BOND }}
+          SLASH_WHEN_CAUGHT: ${{ vars.SLASH_WHEN_CAUGHT }}
+        run: |
+          if [[ -z "$COORDINATOR_ACCOUNT" || -z "$RPC" ]]; then
+            echo "COORDINATOR_ACCOUNT variable and TELEMETRY_RPC secret are required"
+            exit 1
+          fi
+          args=(--coordinator-account "$COORDINATOR_ACCOUNT" --run-id "${RUN_ID:-leviathan-devnet}" --rpc "$RPC")
+          if [[ -n "$REWARD_PER_ROUND" && -n "$BOND" && -n "$SLASH_WHEN_CAUGHT" ]]; then
+            args+=(--reward-per-round "$REWARD_PER_ROUND" --bond "$BOND" --slash-when-caught "$SLASH_WHEN_CAUGHT")
+          fi
+          OUT=telemetry.json ./scripts/publish-telemetry.sh "${args[@]}"
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- telemetry.json; then
+            echo "telemetry unchanged"
+            exit 0
+          fi
+          git config user.name "leviathan-telemetry"
+          git config user.email "telemetry@wienerlabs.noreply"
+          git add telemetry.json
+          git commit -m "chore(telemetry): refresh run telemetry"
+          git push
