@@ -18,6 +18,16 @@ set -euo pipefail
 #   WALLET          keypair path; if unset the installer stops after setup and prints next steps
 #   BOND            optional bond amount to post before joining
 
+# Saved operator settings, if any, so RPC, wallet, run and bond can be configured
+# once. Explicit env still wins over the file.
+LEVIATHAN_ENV="${LEVIATHAN_ENV:-$HOME/.leviathan/env}"
+if [[ -f "$LEVIATHAN_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$LEVIATHAN_ENV"
+  set +a
+fi
+
 LEVIATHAN_DIR="${LEVIATHAN_DIR:-$HOME/.leviathan/leviathan-net}"
 LEVIATHAN_REPO="${LEVIATHAN_REPO:-https://github.com/wienerlabs/leviathan-net.git}"
 LEVIATHAN_REF="${LEVIATHAN_REF:-main}"

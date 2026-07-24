@@ -14,6 +14,17 @@ set -euo pipefail
 #   TORCH_VENV  (default /tmp/leviathan-torch-venv)
 #   AUTHORIZER  (default 11111111111111111111111111111111, permissionless)
 
+# Load the operator's saved settings first, so a dedicated RPC, wallet and run
+# are configured once instead of on every command. Explicit env and flags still
+# win over the file.
+LEVIATHAN_ENV="${LEVIATHAN_ENV:-$HOME/.leviathan/env}"
+if [[ -f "$LEVIATHAN_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$LEVIATHAN_ENV"
+  set +a
+fi
+
 RUN_ID="${RUN_ID:-leviathan-devnet}"
 RPC="${RPC:-https://api.devnet.solana.com}"
 WS_RPC="${WS_RPC:-wss://api.devnet.solana.com}"

@@ -1,0 +1,27 @@
+# Leviathan operator settings.
+#
+# Copy this to ~/.leviathan/env and fill in your values. leviathan-node.sh and
+# install.sh source it, so you configure a dedicated RPC, wallet and run once
+# instead of passing them on every command. Explicit env and flags still win.
+#
+#   mkdir -p ~/.leviathan && cp scripts/leviathan-env.example ~/.leviathan/env
+#
+# A dedicated devnet RPC is strongly recommended. The shared public endpoint
+# (api.devnet.solana.com) rate-limits under a single node's transaction load,
+# which stalls joins and ticks. Any provider with a devnet endpoint works.
+
+# Dedicated RPC (replace with your provider endpoint):
+# RPC=https://devnet.helius-rpc.com/?api-key=YOUR_KEY
+# WS_RPC=wss://devnet.helius-rpc.com/?api-key=YOUR_KEY
+
+# Which run to join (default leviathan-devnet):
+# RUN_ID=leviathan-devnet
+
+# Your funded devnet keypair:
+# WALLET=/home/you/leviathan-node.json
+
+# Optional bond to post before joining a bonded run:
+# BOND=100
+
+# Join confirmation deadline in seconds (raise on a slow RPC):
+# LEVIATHAN_JOIN_TIMEOUT_SECS=45

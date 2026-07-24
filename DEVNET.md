@@ -56,7 +56,23 @@ bonded node is one command. Inspect and manage the bond separately with
 `bond-withdraw-finalize`.
 
 The wallet needs a little devnet SOL for transaction fees. Override `RUN_ID`,
-`RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed. The first build
+`RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed.
+
+### Configure once
+
+A dedicated RPC is strongly recommended. The shared public endpoint rate-limits
+under a single node's transaction load, which stalls joins and ticks. Save your
+settings once and every command picks them up:
+
+```
+mkdir -p ~/.leviathan && cp scripts/leviathan-env.example ~/.leviathan/env
+# then edit ~/.leviathan/env with your RPC, wallet and run
+```
+
+`leviathan-node.sh` and `install.sh` source `~/.leviathan/env` (override the path
+with `LEVIATHAN_ENV`). Explicit env and flags still win over the file. The
+verifier daemon reads its RPC from `--rpc-url` or `SOLANA_RPC_URL`; `run-manager`
+reads `--rpc` or the `RPC` env, so exporting the same values covers all three. The first build
 links libtorch and takes a few minutes; subsequent runs are instant.
 
 `LEVIATHAN_JOIN_TIMEOUT_SECS` (default 45 in the script, 30 in the client) sets
