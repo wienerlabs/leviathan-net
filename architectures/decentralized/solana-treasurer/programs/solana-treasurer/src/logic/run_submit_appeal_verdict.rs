@@ -12,27 +12,27 @@ use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
-use crate::state::MAX_VERDICT_VOTERS;
+use crate::state::MAX_APPEAL_VOTERS;
 use crate::ProgramError;
 
 #[derive(Accounts)]
-#[instruction(params: RunSubmitAuditVerdictParams)]
-pub struct RunSubmitAuditVerdictAccounts<'info> {
+#[instruction(params: RunSubmitAppealVerdictParams)]
+pub struct RunSubmitAppealVerdictAccounts<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
     #[account()]
-    pub verifier: Signer<'info>,
+    pub appellate: Signer<'info>,
 
     #[account(
         seeds = [
             Participant::SEEDS_PREFIX,
             run.key().as_ref(),
-            verifier.key().as_ref(),
+            appellate.key().as_ref(),
         ],
-        bump = verifier_participant.bump,
+        bump = appellate_participant.bump,
     )]
-    pub verifier_participant: Box<Account<'info, Participant>>,
+    pub appellate_participant: Box<Account<'info, Participant>>,
 
     #[account(
         constraint = run.coordinator_instance == coordinator_instance.key(),
@@ -47,64 +47,56 @@ pub struct RunSubmitAuditVerdictAccounts<'info> {
     pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
 
     #[account(
-        init_if_needed,
-        payer = payer,
-        space = AuditVerdict::space_with_discriminator(),
+        mut,
         seeds = [
             AuditVerdict::SEEDS_PREFIX,
             run.key().as_ref(),
             params.target.as_ref(),
         ],
-        bump,
+        bump = audit_verdict.bump,
     )]
     pub audit_verdict: Box<Account<'info, AuditVerdict>>,
 
     #[account()]
     pub coordinator_program: Program<'info, PsycheSolanaCoordinator>,
-
-    #[account()]
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct RunSubmitAuditVerdictParams {
+pub struct RunSubmitAppealVerdictParams {
     pub target: Pubkey,
     pub target_index: u64,
-    pub batch_start: u64,
-    pub batch_end: u64,
-    pub committed_hash: [u8; 32],
-    pub replayed_hash: [u8; 32],
+    pub overturn: bool,
 }
 
-pub fn run_submit_audit_verdict_processor(
-    context: Context<RunSubmitAuditVerdictAccounts>,
-    params: RunSubmitAuditVerdictParams,
+pub fn run_submit_appeal_verdict_processor(
+    context: Context<RunSubmitAppealVerdictAccounts>,
+    params: RunSubmitAppealVerdictParams,
 ) -> Result<()> {
-    if context.accounts.verifier_participant.bond_amount
+    if context.accounts.appellate_participant.bond_amount
         < context.accounts.run.bond_minimum_amount
     {
         return err!(ProgramError::BondBelowMinimum);
     }
 
-    let verifier_key = context.accounts.verifier.key();
+    let appellate_key = context.accounts.appellate.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
-    let (current_epoch, quorum) = {
+    let quorum = {
         let account = context.accounts.coordinator_account.load()?;
         let coordinator = &account.state.coordinator;
 
-        let verifier_index = coordinator
+        let appellate_index = coordinator
             .epoch_state
             .clients
             .iter()
-            .position(|client| *client.id.signer() == verifier_key.to_bytes())
+            .position(|client| *client.id.signer() == appellate_key.to_bytes())
             .ok_or_else(|| error!(ProgramError::VerifierNotInEpoch))?;
 
         let selection =
             CommitteeSelection::from_coordinator_with_tie_breakers(coordinator, 0, tie_breaker_size)
-                .map_err(|_| error!(ProgramError::VerifierNotAssigned))?;
-        if selection.get_committee(verifier_index as u64).committee != Committee::Verifier {
-            return err!(ProgramError::VerifierNotAssigned);
+                .map_err(|_| error!(ProgramError::NotTieBreaker))?;
+        if selection.get_committee(appellate_index as u64).committee != Committee::TieBreaker {
+            return err!(ProgramError::NotTieBreaker);
         }
 
         let target_client = coordinator
@@ -117,60 +109,57 @@ pub fn run_submit_audit_verdict_processor(
             return err!(ProgramError::TargetMismatch);
         }
 
-        let verifier_nodes = selection.get_num_verifier_nodes();
-        let quorum = (2u64 * verifier_nodes).div_ceil(3).max(1);
-        (coordinator.progress.epoch, quorum)
+        let tie_breaker_nodes = selection.get_num_tie_breaker_nodes();
+        (2u64 * tie_breaker_nodes).div_ceil(3).max(1)
     };
 
     let should_slash;
+    let batch_start;
+    let batch_end;
+    let committed_hash;
+    let replayed_hash;
     {
         let verdict = &mut context.accounts.audit_verdict;
-        if verdict.run == Pubkey::default() {
-            verdict.bump = context.bumps.audit_verdict;
-            verdict.run = context.accounts.run.key();
-            verdict.target = params.target;
-            verdict.reset_for_epoch(current_epoch);
-        } else if verdict.epoch != current_epoch {
-            verdict.reset_for_epoch(current_epoch);
+        if verdict.target != params.target {
+            return err!(ProgramError::TargetMismatch);
+        }
+        if verdict.status != VerdictStatus::Challenged {
+            return err!(ProgramError::VerdictNotChallenged);
+        }
+        if verdict.appeal_voters.iter().any(|voter| voter == &appellate_key) {
+            return err!(ProgramError::DuplicateAppealVerdict);
+        }
+        if verdict.appeal_voters.len() >= MAX_APPEAL_VOTERS {
+            return err!(ProgramError::AppealVotersFull);
         }
 
-        if verdict.status != VerdictStatus::Voting {
-            return err!(ProgramError::VerdictAlreadyResolved);
+        verdict.appeal_voters.push(appellate_key);
+        if params.overturn {
+            verdict.overturn_count += 1;
+        } else {
+            verdict.uphold_count += 1;
         }
-        if verdict.voters.iter().any(|voter| voter == &verifier_key) {
-            return err!(ProgramError::DuplicateVerdict);
-        }
-        if verdict.voters.len() >= MAX_VERDICT_VOTERS {
-            return err!(ProgramError::VerdictVotersFull);
-        }
-
-        verdict.voters.push(verifier_key);
-        verdict.verdict_count += 1;
-        verdict.committed_hash = params.committed_hash;
-        verdict.replayed_hash = params.replayed_hash;
-        verdict.target_index = params.target_index;
-        verdict.batch_start = params.batch_start;
-        verdict.batch_end = params.batch_end;
 
         msg!(
-            "audit_verdict: target_index={} epoch={} count={} quorum={}",
-            params.target_index,
-            current_epoch,
-            verdict.verdict_count,
+            "appeal_verdict: overturn={} uphold={} quorum={}",
+            verdict.overturn_count,
+            verdict.uphold_count,
             quorum
         );
 
-        let quorum_reached = (verdict.verdict_count as u64) >= quorum;
-        if quorum_reached {
-            if context.accounts.run.challenge_window_seconds > 0 {
-                verdict.status = VerdictStatus::SlashPending;
-                verdict.pending_since_unix = Clock::get()?.unix_timestamp;
-                should_slash = false;
-                msg!("audit_verdict: quorum reached, slash pending challenge window");
-            } else {
-                verdict.status = VerdictStatus::Upheld;
-                should_slash = true;
-            }
+        batch_start = verdict.batch_start;
+        batch_end = verdict.batch_end;
+        committed_hash = verdict.committed_hash;
+        replayed_hash = verdict.replayed_hash;
+
+        if (verdict.overturn_count as u64) >= quorum {
+            verdict.status = VerdictStatus::Overturned;
+            should_slash = false;
+            msg!("appeal_verdict: overturned, verifiers forfeit their bonds");
+        } else if (verdict.uphold_count as u64) >= quorum {
+            verdict.status = VerdictStatus::Upheld;
+            should_slash = true;
+            msg!("appeal_verdict: upheld, target slash finalizes");
         } else {
             should_slash = false;
         }
@@ -198,10 +187,10 @@ pub fn run_submit_audit_verdict_processor(
             .with_signer(run_signer_seeds),
             SlashClientParams {
                 index: params.target_index,
-                batch_start: params.batch_start,
-                batch_end: params.batch_end,
-                committed_hash: params.committed_hash,
-                replayed_hash: params.replayed_hash,
+                batch_start,
+                batch_end,
+                committed_hash,
+                replayed_hash,
             },
         )?;
     }

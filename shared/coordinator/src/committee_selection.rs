@@ -141,6 +141,29 @@ impl CommitteeSelection {
         )
     }
 
+    pub fn from_coordinator_with_tie_breakers(
+        coordinator: &Coordinator,
+        offset: isize,
+        tie_breaker_nodes: u16,
+    ) -> Result<Self, CoordinatorError> {
+        let round = match offset {
+            -2 => coordinator.previous_previous_round(),
+            -1 => coordinator.previous_round(),
+            0 => coordinator.current_round(),
+            _ => {
+                return Err(CoordinatorError::NoActiveRound);
+            }
+        }
+        .ok_or(CoordinatorError::NoActiveRound)?;
+        Self::new(
+            tie_breaker_nodes as usize,
+            coordinator.config.witness_nodes as usize,
+            coordinator.config.verification_percent,
+            round.clients_len as usize,
+            round.random_seed,
+        )
+    }
+
     pub fn get_witness(&self, index: u64) -> WitnessProof {
         let position = self.compute_shuffled_index(index, WITNESS_SALT);
         let witness = self.get_witness_from_position(position);

@@ -124,6 +124,41 @@ pub mod psyche_solana_treasurer {
     ) -> Result<()> {
         run_submit_audit_verdict_processor(context, params)
     }
+
+    pub fn run_set_challenge_config(
+        context: Context<RunSetChallengeConfigAccounts>,
+        params: RunSetChallengeConfigParams,
+    ) -> Result<()> {
+        run_set_challenge_config_processor(context, params)
+    }
+
+    pub fn run_open_challenge(
+        context: Context<RunOpenChallengeAccounts>,
+        params: RunOpenChallengeParams,
+    ) -> Result<()> {
+        run_open_challenge_processor(context, params)
+    }
+
+    pub fn run_submit_appeal_verdict(
+        context: Context<RunSubmitAppealVerdictAccounts>,
+        params: RunSubmitAppealVerdictParams,
+    ) -> Result<()> {
+        run_submit_appeal_verdict_processor(context, params)
+    }
+
+    pub fn run_finalize_slash(
+        context: Context<RunFinalizeSlashAccounts>,
+        params: RunFinalizeSlashParams,
+    ) -> Result<()> {
+        run_finalize_slash_processor(context, params)
+    }
+
+    pub fn run_slash_losing_verifier(
+        context: Context<RunSlashLosingVerifierAccounts>,
+        params: RunSlashLosingVerifierParams,
+    ) -> Result<()> {
+        run_slash_losing_verifier_processor(context, params)
+    }
 }
 
 #[error_code]
@@ -169,4 +204,31 @@ pub enum ProgramError {
 
     #[msg("A bounty recipient does not match the corresponding verdict voter")]
     BountyRecipientMismatch,
+
+    #[msg("The verdict is not in a slash-pending state")]
+    VerdictNotPending,
+
+    #[msg("The challenge window has already closed")]
+    ChallengeWindowClosed,
+
+    #[msg("The challenge window is still open")]
+    ChallengeWindowOpen,
+
+    #[msg("The verdict is not under challenge")]
+    VerdictNotChallenged,
+
+    #[msg("The signer is not an assigned tie-breaker for this round")]
+    NotTieBreaker,
+
+    #[msg("This tie-breaker already voted on this appeal")]
+    DuplicateAppealVerdict,
+
+    #[msg("The appeal voter set is full")]
+    AppealVotersFull,
+
+    #[msg("The verdict was not overturned")]
+    VerdictNotOverturned,
+
+    #[msg("All losing verifiers have already been settled")]
+    AllLosersSettled,
 }

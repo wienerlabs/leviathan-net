@@ -21,6 +21,9 @@ pub struct Run {
     pub bond_minimum_amount: u64,
     pub bond_withdraw_delay_seconds: i64,
     pub slash_bounty_bps: u16,
+
+    pub challenge_window_seconds: i64,
+    pub tie_breaker_committee_size: u16,
 }
 
 impl Run {

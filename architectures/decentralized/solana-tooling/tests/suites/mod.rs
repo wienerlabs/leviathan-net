@@ -13,6 +13,7 @@ mod memnet_mining_pool_live_freeze;
 mod memnet_treasurer_bond;
 mod memnet_treasurer_bond_gated_claim;
 mod memnet_treasurer_bond_gated_join;
+mod memnet_treasurer_appeals;
 mod memnet_treasurer_bounty;
 mod memnet_treasurer_committee_slash;
 mod memnet_treasurer_create_claim;

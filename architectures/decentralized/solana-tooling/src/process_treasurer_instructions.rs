@@ -39,10 +39,25 @@ use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunSetSlashBountyParams;
 use psyche_solana_treasurer::accounts::RunSubmitAuditVerdictAccounts;
+use psyche_solana_treasurer::accounts::RunSetChallengeConfigAccounts;
+use psyche_solana_treasurer::accounts::RunOpenChallengeAccounts;
+use psyche_solana_treasurer::accounts::RunSubmitAppealVerdictAccounts;
+use psyche_solana_treasurer::accounts::RunFinalizeSlashAccounts;
+use psyche_solana_treasurer::accounts::RunSlashLosingVerifierAccounts;
 use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::instruction::RunSubmitAuditVerdict;
+use psyche_solana_treasurer::instruction::RunSetChallengeConfig;
+use psyche_solana_treasurer::instruction::RunOpenChallenge;
+use psyche_solana_treasurer::instruction::RunSubmitAppealVerdict;
+use psyche_solana_treasurer::instruction::RunFinalizeSlash;
+use psyche_solana_treasurer::instruction::RunSlashLosingVerifier;
 use psyche_solana_treasurer::logic::RunSlashParams;
 use psyche_solana_treasurer::logic::RunSubmitAuditVerdictParams;
+use psyche_solana_treasurer::logic::RunSetChallengeConfigParams;
+use psyche_solana_treasurer::logic::RunOpenChallengeParams;
+use psyche_solana_treasurer::logic::RunSubmitAppealVerdictParams;
+use psyche_solana_treasurer::logic::RunFinalizeSlashParams;
+use psyche_solana_treasurer::logic::RunSlashLosingVerifierParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -567,4 +582,168 @@ pub async fn process_treasurer_participant_authorize_join(
         .process_instruction_with_signers(payer, instruction, &[])
         .await?;
     Ok(authorization)
+}
+
+pub async fn process_treasurer_run_set_challenge_config(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    main_authority: &Keypair,
+    run: &Pubkey,
+    challenge_window_seconds: i64,
+    tie_breaker_committee_size: u16,
+) -> Result<()> {
+    let accounts = RunSetChallengeConfigAccounts {
+        main_authority: main_authority.pubkey(),
+        run: *run,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSetChallengeConfig {
+            params: RunSetChallengeConfigParams {
+                challenge_window_seconds,
+                tie_breaker_committee_size,
+            },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[main_authority])
+        .await?;
+    Ok(())
+}
+
+pub async fn process_treasurer_run_open_challenge(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    challenger: &Keypair,
+    run: &Pubkey,
+) -> Result<()> {
+    let challenger_participant = find_participant(run, &challenger.pubkey());
+    let audit_verdict = find_audit_verdict(run, &challenger.pubkey());
+    let accounts = RunOpenChallengeAccounts {
+        challenger: challenger.pubkey(),
+        challenger_participant,
+        run: *run,
+        audit_verdict,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunOpenChallenge {
+            params: RunOpenChallengeParams {},
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[challenger])
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_treasurer_run_submit_appeal_verdict(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    appellate: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    target: &Pubkey,
+    target_index: u64,
+    overturn: bool,
+) -> Result<()> {
+    let coordinator_instance = find_coordinator_instance(run_id);
+    let appellate_participant = find_participant(run, &appellate.pubkey());
+    let audit_verdict = find_audit_verdict(run, target);
+    let accounts = RunSubmitAppealVerdictAccounts {
+        payer: payer.pubkey(),
+        appellate: appellate.pubkey(),
+        appellate_participant,
+        run: *run,
+        coordinator_instance,
+        coordinator_account: *coordinator_account,
+        audit_verdict,
+        coordinator_program: psyche_solana_coordinator::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSubmitAppealVerdict {
+            params: RunSubmitAppealVerdictParams {
+                target: *target,
+                target_index,
+                overturn,
+            },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[appellate])
+        .await?;
+    Ok(())
+}
+
+pub async fn process_treasurer_run_finalize_slash(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    target: &Pubkey,
+) -> Result<()> {
+    let coordinator_instance = find_coordinator_instance(run_id);
+    let audit_verdict = find_audit_verdict(run, target);
+    let accounts = RunFinalizeSlashAccounts {
+        payer: payer.pubkey(),
+        run: *run,
+        coordinator_instance,
+        coordinator_account: *coordinator_account,
+        audit_verdict,
+        coordinator_program: psyche_solana_coordinator::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunFinalizeSlash {
+            params: RunFinalizeSlashParams { target: *target },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint.process_instruction(payer, instruction).await?;
+    Ok(())
+}
+
+pub async fn process_treasurer_run_slash_losing_verifier(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    target: &Pubkey,
+    voter_position: u16,
+) -> Result<()> {
+    let coordinator_instance = find_coordinator_instance(run_id);
+    let audit_verdict = find_audit_verdict(run, target);
+    let accounts = RunSlashLosingVerifierAccounts {
+        payer: payer.pubkey(),
+        run: *run,
+        coordinator_instance,
+        coordinator_account: *coordinator_account,
+        audit_verdict,
+        coordinator_program: psyche_solana_coordinator::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSlashLosingVerifier {
+            params: RunSlashLosingVerifierParams {
+                target: *target,
+                voter_position,
+            },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint.process_instruction(payer, instruction).await?;
+    Ok(())
 }

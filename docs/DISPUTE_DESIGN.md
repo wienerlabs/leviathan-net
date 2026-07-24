@@ -1,5 +1,12 @@
 # Losing-side penalty: design
 
+Status: BUILT. Option A (the optimistic challenge with a tie-breaker committee)
+is implemented, treasurer-only, and verified live on devnet. It turned out not to
+need a coordinator redeploy, because the tie-breaker committee already exists in
+the coordinator's `CommitteeSelection` lottery; the treasurer draws it with
+`from_coordinator_with_tie_breakers`. The rest of this document is the design
+record that led there, kept because the trust-model reasoning still matters.
+
 Issue leviathan-net#4, the open half. The committee vote can convict, but nothing
 punishes a verifier that convicts an innocent target. This document frames the
 options, because the choice touches the trust model and is worth locking before
@@ -40,10 +47,24 @@ economics: the tie-breaker is larger and its members bond more, so buying it is
 strictly more expensive than buying the original committee. This is the appeals
 court a court system already uses: you can appeal once, to a bigger bench.
 
-Cost: this is the largest change. It delays finalisation, needs the tie-breaker
-committee wired (the coordinator has a `TieBreaker` variant, currently `todo!()`),
-a challenge-bond account, and a second-level quorum. It touches the coordinator,
-so it needs a fresh SBF build and redeploy.
+Cost as built: this was the largest change, but smaller than feared. It delays
+finalisation and adds a second-level quorum, but it did not touch the coordinator.
+The `TieBreaker` committee is already a first-class arm of the coordinator's
+`CommitteeSelection` lottery; only `start_round_train` never populated a non-zero
+count. Rather than migrate the coordinator's zero-copy state, the treasurer draws
+its own selection with `from_coordinator_with_tie_breakers`, overriding the
+tie-breaker count from a per-run config (`tie_breaker_committee_size`). One
+selection partitions the epoch into disjoint tie-breaker / verifier / trainer sets,
+so a client is never both a verifier and its own appeals judge. The whole appeals
+court is five treasurer instructions (`run_set_challenge_config`,
+`run_open_challenge`, `run_submit_appeal_verdict`, `run_finalize_slash`,
+`run_slash_losing_verifier`) plus a lifecycle on the existing `AuditVerdict`
+account. Only the treasurer was rebuilt and redeployed. The losing side forfeits
+its bond through the same slash-then-settle path the target already used: an
+overturned verdict ejects the convicting verifiers, and their bonds settle at the
+epoch boundary exactly as a cheater's would. Verified live on devnet: two
+verifiers convict, the target appeals, two tie-breakers overturn, both verifiers
+forfeit 200 while the innocent target keeps its full bond.
 
 ### B. Symmetric verifier audit by hash comparison (does not work, recorded so it is not retried)
 
@@ -76,23 +97,30 @@ Cost: none.
 
 | | Trust model | Collusion resistance | Touches coordinator | Ship cost |
 |---|---|---|---|---|
-| A appeals committee | committee, staged | strong (bigger bench) | yes, redeploy | large |
+| A appeals committee (BUILT) | committee, staged | strong (bigger bench) | no, treasurer-only | medium |
 | B hash comparison | none, it cannot adjudicate | n/a, does not work | no | n/a |
 | C defer | unchanged | none, documented | no | none |
 
-## Recommendation
+## Outcome
 
-The honest conclusion is that there is no cheap version. Because the chain cannot
-recompute a gradient, a losing-side penalty needs an appeals committee (A), which
-is a large change: a delayed finalisation, the tie-breaker committee wired into
-the coordinator, a challenge bond, and a second-level quorum, plus a redeploy.
+The honest conclusion held: there is no cheap version, because the chain cannot
+recompute a gradient, so a losing-side penalty needs an appeals committee. What
+changed is the cost estimate. A did not require touching the coordinator; the
+tie-breaker lottery was already there, dormant. So A was built now instead of
+deferred, treasurer-only, with a per-run switch (`challenge_window_seconds` and
+`tie_breaker_committee_size`, both default 0). When they are zero the run behaves
+exactly as before: a verifier quorum slashes immediately, no appeals. When they
+are set, a quorum only opens a challenge window, and the optimistic-finality path
+takes over.
 
-So the recommendation is C now, A as a dedicated effort later. Defer the penalty,
-keep the gap documented and priced (framing an innocent target costs a quorum of
-bonds, and the runbook flags disputed convictions for manual review), and build A
-properly when the tie-breaker committee is being wired anyway. This is not the
-critical path: the genesis run and the token launch are, and neither depends on
-this. A wrongful conviction on devnet is a manual review, not a fund loss.
+The trust model is unchanged from the committee vote: adjudication is a bonded
+committee, not a key, and the appeals bench is drawn by the same lottery but from
+a disjoint, separately sized set, so buying it is a second independent purchase.
+The recursion is bounded by economics, not by another layer of code. Backward
+compatibility is preserved, so the genesis run and token launch remain unblocked
+whether or not a given run turns appeals on.
 
-The decision to lock is only A-later versus A-now. There is no third option that
-is both cheap and trustless.
+The remaining refinements are optional and priced, not blockers: routing an
+overturn's forfeited verifier bonds partly to the challenger as an appeal bounty
+(today they go to the vault), and an explicit challenge bond so a frivolous appeal
+has a cost. Both are additive on top of the shipped lifecycle.
