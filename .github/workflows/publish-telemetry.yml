@@ -1,14 +1,15 @@
 name: publish telemetry
 
-# Reads the flagship coordinator account on a schedule and commits telemetry.json
-# so the leviathan-web dashboard can consume it live. leviathan-indexer is
-# libtorch-free, so this stays cheap. Point the dashboard's VITE_TELEMETRY_URL at
-# the raw file, or mirror it to the site's public/ directory.
+# Reads the flagship coordinator account on a schedule and pushes real telemetry
+# into the leviathan-web dashboard. leviathan-indexer is libtorch-free, so this
+# stays cheap. leviathan-net is private and leviathan-web is public, so the job
+# builds the indexer here and cross-pushes the result to the site's public/.
 #
-# Required repository configuration:
-#   variable COORDINATOR_ACCOUNT   the run's coordinator account pubkey
-#   variable RUN_ID                the run id (default leviathan-devnet)
-#   secret   TELEMETRY_RPC         a dedicated devnet RPC url
+# Required configuration on this repo:
+#   secret   TELEMETRY_RPC        a dedicated devnet RPC url
+#   secret   LEVIATHAN_WEB_TOKEN  a token with contents:write on wienerlabs/leviathan-web
+#   variable COORDINATOR_ACCOUNT  the run's coordinator account pubkey
+#   variable RUN_ID               the run id (default leviathan-devnet)
 # Optional economics for the security verdict:
 #   variable REWARD_PER_ROUND, BOND, SLASH_WHEN_CAUGHT
 
@@ -20,9 +21,6 @@ on:
 concurrency:
   group: publish-telemetry
   cancel-in-progress: true
-
-permissions:
-  contents: write
 
 jobs:
   publish:
@@ -57,15 +55,26 @@ jobs:
             args+=(--reward-per-round "$REWARD_PER_ROUND" --bond "$BOND" --slash-when-caught "$SLASH_WHEN_CAUGHT")
           fi
           OUT=telemetry.json ./scripts/publish-telemetry.sh "${args[@]}"
+          echo "----- telemetry -----"
+          cat telemetry.json
 
-      - name: Commit if changed
+      - name: Push telemetry to leviathan-web
+        env:
+          TOKEN: ${{ secrets.LEVIATHAN_WEB_TOKEN }}
         run: |
-          if git diff --quiet -- telemetry.json; then
+          if [[ -z "$TOKEN" ]]; then
+            echo "LEVIATHAN_WEB_TOKEN secret is required to publish the dashboard telemetry"
+            exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/wienerlabs/leviathan-web.git" web
+          cp telemetry.json web/public/telemetry.json
+          cd web
+          if git diff --quiet -- public/telemetry.json; then
             echo "telemetry unchanged"
             exit 0
           fi
           git config user.name "leviathan-telemetry"
           git config user.email "telemetry@wienerlabs.noreply"
-          git add telemetry.json
-          git commit -m "chore(telemetry): refresh run telemetry"
+          git add public/telemetry.json
+          git commit -m "chore(telemetry): refresh dashboard telemetry"
           git push
