@@ -329,6 +329,14 @@ pub async fn run() {
         .await
         .expect_err("a duplicate verdict must be rejected");
 
+    let unbonded = Keypair::new();
+    process_treasurer_participant_create(&mut endpoint, &payer, &unbonded, &run)
+        .await
+        .unwrap();
+    cast_verdict(&mut endpoint, &payer, &unbonded, &run, &coordinator_account, &target_key, target_index)
+        .await
+        .expect_err("an unbonded verifier must be rejected before it can vote");
+
     cast_verdict(
         &mut endpoint,
         &payer,
