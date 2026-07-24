@@ -23,8 +23,11 @@ use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_a
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_voters;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_slash_bounty;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_update;
@@ -38,6 +41,7 @@ use solana_sdk::signer::Signer;
 const RUN_ID: &str = "Leviathan committee slash";
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
+const BOUNTY_BPS: u16 = 5_000;
 const COMMITTED: [u8; 32] = [0xAA; 32];
 const REPLAYED: [u8; 32] = [0xBB; 32];
 
@@ -101,6 +105,17 @@ pub async fn run() {
     .await
     .unwrap();
 
+    process_treasurer_run_set_slash_bounty(
+        &mut endpoint,
+        &payer,
+        &main_authority,
+        &run,
+        BOUNTY_BPS,
+    )
+    .await
+    .unwrap();
+
+    let mut clients_collateral = vec![];
     for client in &clients {
         let ata = endpoint
             .process_spl_associated_token_account_get_or_init(
@@ -128,6 +143,7 @@ pub async fn run() {
         )
         .await
         .unwrap();
+        clients_collateral.push(ata);
     }
 
     process_treasurer_run_update(
@@ -372,6 +388,76 @@ pub async fn run() {
         }
     }
     assert_eq!(target_slashed, SLASHING_RATE);
+
+    let target_position = clients
+        .iter()
+        .position(|k| k.pubkey() == target_key)
+        .unwrap();
+    let voter_collaterals: Vec<Pubkey> = verifiers
+        .iter()
+        .take(quorum as usize)
+        .map(|(verifier, _)| {
+            let position = clients
+                .iter()
+                .position(|k| k.pubkey() == verifier.pubkey())
+                .unwrap();
+            clients_collateral[position]
+        })
+        .collect();
+
+    process_treasurer_participant_bond_request_withdraw(
+        &mut endpoint,
+        &payer,
+        &clients[target_position],
+        &run,
+        BOND,
+    )
+    .await
+    .unwrap();
+    endpoint
+        .forward_clock_unix_timestamp(100)
+        .await
+        .unwrap();
+    process_treasurer_participant_bond_finalize_withdraw_with_voters(
+        &mut endpoint,
+        &payer,
+        &clients[target_position],
+        &clients_collateral[target_position],
+        &collateral_mint,
+        &run,
+        &coordinator_account,
+        &voter_collaterals,
+    )
+    .await
+    .unwrap();
+
+    let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
+    let share = bounty / voter_collaterals.len() as u64;
+    for voter_collateral in &voter_collaterals {
+        assert_amount(&mut endpoint, voter_collateral, share).await;
+    }
+    assert_amount(
+        &mut endpoint,
+        &clients_collateral[target_position],
+        BOND - SLASHING_RATE,
+    )
+    .await;
+}
+
+async fn assert_amount(
+    endpoint: &mut solana_toolbox_endpoint::ToolboxEndpoint,
+    account: &Pubkey,
+    expected_amount: u64,
+) {
+    assert_eq!(
+        endpoint
+            .get_spl_token_account(account)
+            .await
+            .unwrap()
+            .unwrap()
+            .amount,
+        expected_amount,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

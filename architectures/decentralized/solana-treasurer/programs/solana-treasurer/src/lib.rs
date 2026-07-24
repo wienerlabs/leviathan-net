@@ -92,7 +92,7 @@ pub mod psyche_solana_treasurer {
     }
 
     pub fn participant_bond_finalize_withdraw<'info>(
-        context: Context<'_, '_, '_, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
+        context: Context<'_, '_, 'info, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
         params: ParticipantBondFinalizeWithdrawParams,
     ) -> Result<()> {
         participant_bond_finalize_withdraw_processor(context, params)
@@ -166,4 +166,7 @@ pub enum ProgramError {
 
     #[msg("The verdict voter set is full")]
     VerdictVotersFull,
+
+    #[msg("A bounty recipient does not match the corresponding verdict voter")]
+    BountyRecipientMismatch,
 }

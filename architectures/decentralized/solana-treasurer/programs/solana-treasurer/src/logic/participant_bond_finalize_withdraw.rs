@@ -6,6 +6,7 @@ use anchor_spl::token::transfer;
 use psyche_solana_coordinator::CoordinatorAccount;
 
 use crate::ProgramError;
+use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 
@@ -52,6 +53,16 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
     )]
     pub participant: Box<Account<'info, Participant>>,
 
+    #[account(
+        seeds = [
+            AuditVerdict::SEEDS_PREFIX,
+            run.key().as_ref(),
+            user.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub audit_verdict: Option<Box<Account<'info, AuditVerdict>>>,
+
     #[account()]
     pub token_program: Program<'info, Token>,
 }
@@ -60,7 +71,7 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
 pub struct ParticipantBondFinalizeWithdrawParams {}
 
 pub fn participant_bond_finalize_withdraw_processor<'info>(
-    context: Context<'_, '_, '_, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
+    context: Context<'_, '_, 'info, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
     _params: ParticipantBondFinalizeWithdrawParams,
 ) -> Result<()> {
     let mut participant_slashed_points = 0;
@@ -110,6 +121,7 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
 
     let run_index = run.index;
     let run_bump = run.bump;
+    let collateral_mint = run.collateral_mint;
     let bounty_amount = if run.slash_bounty_bps > 0 {
         (forfeited_amount as u128 * run.slash_bounty_bps as u128 / 10_000) as u64
     } else {
@@ -120,22 +132,62 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
 
     if bounty_amount > 0 {
-        let reporter = context
-            .remaining_accounts
-            .first()
-            .ok_or(error!(ProgramError::MissingReporter))?;
-        transfer(
-            CpiContext::new(
-                context.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: context.accounts.run_collateral.to_account_info(),
-                    to: reporter.to_account_info(),
-                    authority: context.accounts.run.to_account_info(),
-                },
-            )
-            .with_signer(run_signer_seeds),
-            bounty_amount,
-        )?;
+        let voters: Vec<Pubkey> = context
+            .accounts
+            .audit_verdict
+            .as_ref()
+            .map(|verdict| verdict.voters.clone())
+            .unwrap_or_default();
+
+        if voters.is_empty() {
+            let reporter = context
+                .remaining_accounts
+                .first()
+                .ok_or(error!(ProgramError::MissingReporter))?;
+            transfer(
+                CpiContext::new(
+                    context.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: context.accounts.run_collateral.to_account_info(),
+                        to: reporter.to_account_info(),
+                        authority: context.accounts.run.to_account_info(),
+                    },
+                )
+                .with_signer(run_signer_seeds),
+                bounty_amount,
+            )?;
+        } else {
+            if context.remaining_accounts.len() < voters.len() {
+                return err!(ProgramError::MissingReporter);
+            }
+            let share = bounty_amount / voters.len() as u64;
+            for (position, voter) in voters.iter().enumerate() {
+                if share == 0 {
+                    break;
+                }
+                let recipient = &context.remaining_accounts[position];
+                let recipient_token_account =
+                    Account::<TokenAccount>::try_from(recipient)
+                        .map_err(|_| error!(ProgramError::BountyRecipientMismatch))?;
+                if recipient_token_account.owner != *voter
+                    || recipient_token_account.mint != collateral_mint
+                {
+                    return err!(ProgramError::BountyRecipientMismatch);
+                }
+                transfer(
+                    CpiContext::new(
+                        context.accounts.token_program.to_account_info(),
+                        Transfer {
+                            from: context.accounts.run_collateral.to_account_info(),
+                            to: recipient.to_account_info(),
+                            authority: context.accounts.run.to_account_info(),
+                        },
+                    )
+                    .with_signer(run_signer_seeds),
+                    share,
+                )?;
+            }
+        }
     }
 
     if payout_amount > 0 {
