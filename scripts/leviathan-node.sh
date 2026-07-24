@@ -5,7 +5,7 @@ set -euo pipefail
 # One command: sets up the libtorch toolchain, builds the client, and joins.
 #
 # Usage:
-#   ./scripts/leviathan-node.sh --wallet <path/to/keypair.json>
+#   ./scripts/leviathan-node.sh --wallet <path/to/keypair.json> [--bond <amount>]
 #
 # Env overrides:
 #   RUN_ID      (default leviathan-devnet)
@@ -21,11 +21,13 @@ TORCH_VENV="${TORCH_VENV:-/tmp/leviathan-torch-venv}"
 AUTHORIZER="${AUTHORIZER:-11111111111111111111111111111111}"
 JOIN_TIMEOUT="${LEVIATHAN_JOIN_TIMEOUT_SECS:-45}"
 WALLET=""
+BOND_AMOUNT="${BOND_AMOUNT:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wallet) WALLET="$2"; shift 2 ;;
     --run-id) RUN_ID="$2"; shift 2 ;;
+    --bond) BOND_AMOUNT="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -62,7 +64,20 @@ if [[ ! -x "target/debug/psyche-solana-client" ]]; then
   cargo build -p psyche-solana-client
 fi
 
-# 3. join the run and train.
+# 3. post the bond if asked, so this wallet can join bonded runs and claim rewards.
+if [[ -n "$BOND_AMOUNT" ]]; then
+  if [[ ! -x "target/debug/run-manager" ]]; then
+    echo "[node] building run-manager for the bond step"
+    cargo build -p run-manager
+  fi
+  echo "[node] posting a bond of $BOND_AMOUNT on '$RUN_ID'"
+  ./target/debug/run-manager bond-deposit \
+    --rpc "$RPC" --ws-rpc "$WS_RPC" \
+    --wallet-private-key-path "$WALLET" \
+    --run-id "$RUN_ID" --amount "$BOND_AMOUNT"
+fi
+
+# 4. join the run and train.
 # Note: launch the binary directly, never through /usr/bin/env, because macOS SIP
 # strips DYLD_* variables when exec-ing through a protected interpreter, which would
 # hide libtorch from the client.

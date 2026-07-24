@@ -353,6 +353,84 @@ pub fn treasurer_participant_claim(
     )
 }
 
+pub fn treasurer_participant_bond_deposit(
+    treasurer_index: u64,
+    collateral_mint: &Pubkey,
+    user: &Pubkey,
+    collateral_amount: u64,
+) -> Instruction {
+    let user_collateral = associated_token::get_associated_token_address(user, collateral_mint);
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    let run_collateral = associated_token::get_associated_token_address(&run, collateral_mint);
+    let participant = psyche_solana_treasurer::find_participant(&run, user);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::ParticipantBondDepositAccounts {
+            user: *user,
+            user_collateral,
+            run,
+            run_collateral,
+            participant,
+            token_program: token::ID,
+        },
+        psyche_solana_treasurer::instruction::ParticipantBondDeposit {
+            params: psyche_solana_treasurer::logic::ParticipantBondDepositParams {
+                collateral_amount,
+            },
+        },
+    )
+}
+
+pub fn treasurer_participant_bond_request_withdraw(
+    treasurer_index: u64,
+    user: &Pubkey,
+    collateral_amount: u64,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    let participant = psyche_solana_treasurer::find_participant(&run, user);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::ParticipantBondRequestWithdrawAccounts {
+            user: *user,
+            run,
+            participant,
+        },
+        psyche_solana_treasurer::instruction::ParticipantBondRequestWithdraw {
+            params: psyche_solana_treasurer::logic::ParticipantBondRequestWithdrawParams {
+                collateral_amount,
+            },
+        },
+    )
+}
+
+pub fn treasurer_participant_bond_finalize_withdraw(
+    treasurer_index: u64,
+    collateral_mint: &Pubkey,
+    coordinator_account: &Pubkey,
+    user: &Pubkey,
+) -> Instruction {
+    let user_collateral = associated_token::get_associated_token_address(user, collateral_mint);
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    let run_collateral = associated_token::get_associated_token_address(&run, collateral_mint);
+    let participant = psyche_solana_treasurer::find_participant(&run, user);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::ParticipantBondFinalizeWithdrawAccounts {
+            user: *user,
+            user_collateral,
+            run,
+            run_collateral,
+            coordinator_account: *coordinator_account,
+            participant,
+            audit_verdict: None,
+            token_program: token::ID,
+        },
+        psyche_solana_treasurer::instruction::ParticipantBondFinalizeWithdraw {
+            params: psyche_solana_treasurer::logic::ParticipantBondFinalizeWithdrawParams {},
+        },
+    )
+}
+
 pub fn authorizer_authorization_create(
     payer: &Pubkey,
     grantor: &Pubkey,

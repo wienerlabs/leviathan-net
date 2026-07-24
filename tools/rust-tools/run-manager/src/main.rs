@@ -27,7 +27,10 @@ use commands::run::{
     CommandJsonDumpRun, CommandJsonDumpUser, CommandSetFutureEpochRates, CommandSetPaused,
     CommandTick, CommandUpdateConfig, CommandUploadData,
 };
-use commands::treasury::{CommandTreasurerClaimRewards, CommandTreasurerTopUpRewards};
+use commands::treasury::{
+    CommandBondDeposit, CommandBondStatus, CommandBondWithdrawFinalize,
+    CommandBondWithdrawRequest, CommandTreasurerClaimRewards, CommandTreasurerTopUpRewards,
+};
 use run_manager::docker::coordinator_client::CoordinatorClient;
 use run_manager::docker::{
     RunInfo, find_joinable_runs, parse_delegate_authorizer_from_env, parse_wallet_pubkey,
@@ -232,6 +235,40 @@ enum Commands {
         params: CommandTreasurerTopUpRewards,
     },
 
+    // Bond commands for node operators
+    BondDeposit {
+        #[clap(flatten)]
+        cluster: ClusterArgs,
+        #[clap(flatten)]
+        wallet: WalletArgs,
+        #[clap(flatten)]
+        params: CommandBondDeposit,
+    },
+    BondStatus {
+        #[clap(flatten)]
+        cluster: ClusterArgs,
+        #[clap(flatten)]
+        wallet: WalletArgs,
+        #[clap(flatten)]
+        params: CommandBondStatus,
+    },
+    BondWithdrawRequest {
+        #[clap(flatten)]
+        cluster: ClusterArgs,
+        #[clap(flatten)]
+        wallet: WalletArgs,
+        #[clap(flatten)]
+        params: CommandBondWithdrawRequest,
+    },
+    BondWithdrawFinalize {
+        #[clap(flatten)]
+        cluster: ClusterArgs,
+        #[clap(flatten)]
+        wallet: WalletArgs,
+        #[clap(flatten)]
+        params: CommandBondWithdrawFinalize,
+    },
+
     // Can join command
     CanJoin {
         #[clap(flatten)]
@@ -411,6 +448,26 @@ async fn async_main() -> Result<()> {
             params,
         } => params.execute(create_backend(cluster, wallet)?).await,
         Commands::TreasurerTopUpRewards {
+            cluster,
+            wallet,
+            params,
+        } => params.execute(create_backend(cluster, wallet)?).await,
+        Commands::BondDeposit {
+            cluster,
+            wallet,
+            params,
+        } => params.execute(create_backend(cluster, wallet)?).await,
+        Commands::BondStatus {
+            cluster,
+            wallet,
+            params,
+        } => params.execute(create_backend(cluster, wallet)?).await,
+        Commands::BondWithdrawRequest {
+            cluster,
+            wallet,
+            params,
+        } => params.execute(create_backend(cluster, wallet)?).await,
+        Commands::BondWithdrawFinalize {
             cluster,
             wallet,
             params,
