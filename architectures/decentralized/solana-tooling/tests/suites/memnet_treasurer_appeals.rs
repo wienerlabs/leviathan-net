@@ -25,10 +25,12 @@ use psyche_solana_tooling::process_coordinator_instructions::process_coordinator
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_appeal;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_slash_bounty;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_finalize_slash;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_open_challenge;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_challenge_config;
@@ -46,6 +48,7 @@ use solana_toolbox_endpoint::ToolboxEndpoint;
 
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
+const BOUNTY_BPS: u16 = 5_000;
 const CHALLENGE_WINDOW: i64 = 50;
 const TIE_BREAKER_SIZE: u16 = 2;
 const EPOCH_TIME: u64 = 300;
@@ -138,6 +141,16 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
         &run,
         CHALLENGE_WINDOW,
         TIE_BREAKER_SIZE,
+    )
+    .await
+    .unwrap();
+
+    process_treasurer_run_set_slash_bounty(
+        &mut endpoint,
+        &payer,
+        &main_authority,
+        &run,
+        BOUNTY_BPS,
     )
     .await
     .unwrap();
@@ -525,6 +538,61 @@ pub async fn overturn_penalises_the_verifiers() {
         0,
         "the wrongly accused target keeps its bond",
     );
+
+    let loser_key = verifier_keys[0];
+    let loser_client_idx = h
+        .clients
+        .iter()
+        .position(|k| k.pubkey() == loser_key)
+        .unwrap();
+    let loser = h.clients[loser_client_idx].insecure_clone();
+    let loser_ata = h.clients_collateral[loser_client_idx];
+    let tie_breaker_collaterals: Vec<Pubkey> = h
+        .tie_breakers
+        .iter()
+        .take(h.tie_breaker_quorum as usize)
+        .map(|(client_idx, _)| h.clients_collateral[*client_idx])
+        .collect();
+    process_treasurer_participant_bond_request_withdraw(
+        &mut h.endpoint,
+        &h.payer,
+        &loser,
+        &h.run,
+        BOND,
+    )
+    .await
+    .unwrap();
+    h.endpoint
+        .forward_clock_unix_timestamp(100)
+        .await
+        .unwrap();
+    process_treasurer_participant_bond_finalize_withdraw_with_appeal(
+        &mut h.endpoint,
+        &h.payer,
+        &loser,
+        &loser_ata,
+        &h.collateral_mint,
+        &h.run,
+        &h.coordinator_account,
+        &target_key,
+        &tie_breaker_collaterals,
+    )
+    .await
+    .unwrap();
+    let appeal_bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
+    let appeal_share = appeal_bounty / tie_breaker_collaterals.len() as u64;
+    for tie_breaker_collateral in &tie_breaker_collaterals {
+        assert_eq!(
+            h.endpoint
+                .get_spl_token_account(tie_breaker_collateral)
+                .await
+                .unwrap()
+                .unwrap()
+                .amount,
+            appeal_share,
+            "each tie-breaker earns a share of the overturned verifier's forfeited bond",
+        );
+    }
 
     let target_ata = h.clients_collateral[h.target_client_idx];
     process_treasurer_participant_bond_request_withdraw(

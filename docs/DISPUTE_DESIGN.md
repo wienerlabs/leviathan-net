@@ -120,7 +120,18 @@ The recursion is bounded by economics, not by another layer of code. Backward
 compatibility is preserved, so the genesis run and token launch remain unblocked
 whether or not a given run turns appeals on.
 
-The remaining refinements are optional and priced, not blockers: routing an
-overturn's forfeited verifier bonds partly to the challenger as an appeal bounty
-(today they go to the vault), and an explicit challenge bond so a frivolous appeal
-has a cost. Both are additive on top of the shipped lifecycle.
+The appeal bounty is now built too. Without it the appeals court had the same
+economic hole the committee-economics sim found for verifiers: a tie-breaker pays
+the cost of a re-audit but earns nothing, so a rational tie-breaker never votes,
+and a bench nobody staffs is not a bench. So the overturn path now pays the
+tie-breakers out of the forfeited verifier bonds, reusing the same
+`slash_bounty_bps` knob and the same split-and-verify settlement the target-cheater
+path already used: when an overturned verifier withdraws, its forfeited bond's
+bounty share is split among the tie-breakers who overturned it (each recipient's
+token account owner checked against the recorded appeal voter). memnet confirms a
+tie-breaker earns its share while the cleared target still recovers its full bond.
+
+One refinement remains, optional and priced: an explicit challenge bond so a
+frivolous appeal has a cost of its own. It is additive on top of the shipped
+lifecycle and needs an economic parameter, so it is a deliberate choice rather
+than a gap.

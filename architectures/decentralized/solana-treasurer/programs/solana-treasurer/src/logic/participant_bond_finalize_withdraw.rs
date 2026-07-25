@@ -9,6 +9,7 @@ use crate::ProgramError;
 use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
+use crate::state::VerdictStatus;
 
 #[derive(Accounts)]
 #[instruction(params: ParticipantBondFinalizeWithdrawParams)]
@@ -64,6 +65,9 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
     pub audit_verdict: Option<Box<Account<'info, AuditVerdict>>>,
 
     #[account()]
+    pub appeal_verdict: Option<Box<Account<'info, AuditVerdict>>>,
+
+    #[account()]
     pub token_program: Program<'info, Token>,
 }
 
@@ -74,6 +78,9 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     context: Context<'_, '_, 'info, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
     _params: ParticipantBondFinalizeWithdrawParams,
 ) -> Result<()> {
+    let user_key = context.accounts.user.key();
+    let run_key = context.accounts.run.key();
+
     let mut participant_slashed_points = 0;
     for client in context
         .accounts
@@ -132,12 +139,24 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
 
     if bounty_amount > 0 {
-        let voters: Vec<Pubkey> = context
-            .accounts
-            .audit_verdict
-            .as_ref()
-            .map(|verdict| verdict.voters.clone())
-            .unwrap_or_default();
+        let voters: Vec<Pubkey> = if let Some(verdict) =
+            context.accounts.audit_verdict.as_ref()
+        {
+            verdict.voters.clone()
+        } else if let Some(appeal) = context.accounts.appeal_verdict.as_ref() {
+            if appeal.run != run_key {
+                return err!(ProgramError::InvalidParameter);
+            }
+            if appeal.status != VerdictStatus::Overturned {
+                return err!(ProgramError::VerdictNotOverturned);
+            }
+            if !appeal.voters.iter().any(|voter| voter == &user_key) {
+                return err!(ProgramError::InvalidParameter);
+            }
+            appeal.appeal_voters.clone()
+        } else {
+            Vec::new()
+        };
 
         if voters.is_empty() {
             let reporter = context

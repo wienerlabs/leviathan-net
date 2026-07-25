@@ -344,6 +344,7 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw_with_reporter(
         coordinator_account: *coordinator_account,
         participant,
         audit_verdict: None,
+        appeal_verdict: None,
         token_program: token::ID,
     };
     let mut metas = accounts.to_account_metas(None);
@@ -451,6 +452,7 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw(
         coordinator_account: *coordinator_account,
         participant,
         audit_verdict: None,
+        appeal_verdict: None,
         token_program: token::ID,
     };
     let instruction = Instruction {
@@ -492,12 +494,63 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw_with_voters(
         coordinator_account: *coordinator_account,
         participant,
         audit_verdict: Some(audit_verdict),
+        appeal_verdict: None,
         token_program: token::ID,
     };
     let mut metas = accounts.to_account_metas(None);
     for voter_collateral in voter_collaterals {
         metas.push(solana_sdk::instruction::AccountMeta::new(
             *voter_collateral,
+            false,
+        ));
+    }
+    let instruction = Instruction {
+        accounts: metas,
+        data: ParticipantBondFinalizeWithdraw {
+            params: ParticipantBondFinalizeWithdrawParams {},
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[user])
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_treasurer_participant_bond_finalize_withdraw_with_appeal(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    user: &Keypair,
+    user_collateral: &Pubkey,
+    collateral_mint: &Pubkey,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+    tie_breaker_collaterals: &[Pubkey],
+) -> Result<()> {
+    let run_collateral = ToolboxEndpoint::find_spl_associated_token_account(
+        run,
+        collateral_mint,
+    );
+    let participant = find_participant(run, &user.pubkey());
+    let appeal_verdict = find_audit_verdict(run, target);
+    let accounts = ParticipantBondFinalizeWithdrawAccounts {
+        user: user.pubkey(),
+        user_collateral: *user_collateral,
+        run: *run,
+        run_collateral,
+        coordinator_account: *coordinator_account,
+        participant,
+        audit_verdict: None,
+        appeal_verdict: Some(appeal_verdict),
+        token_program: token::ID,
+    };
+    let mut metas = accounts.to_account_metas(None);
+    for tie_breaker_collateral in tie_breaker_collaterals {
+        metas.push(solana_sdk::instruction::AccountMeta::new(
+            *tie_breaker_collateral,
             false,
         ));
     }

@@ -423,6 +423,7 @@ pub fn treasurer_participant_bond_finalize_withdraw(
             coordinator_account: *coordinator_account,
             participant,
             audit_verdict: None,
+            appeal_verdict: None,
             token_program: token::ID,
         },
         psyche_solana_treasurer::instruction::ParticipantBondFinalizeWithdraw {
