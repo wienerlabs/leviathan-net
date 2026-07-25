@@ -5021,10 +5021,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "psyche-core",
+ "psyche-data-provider",
  "psyche-modeling",
  "psyche-network",
  "psyche-verifier",
  "tch",
+ "tokio-util 0.7.18",
 ]
 
 [[package]]

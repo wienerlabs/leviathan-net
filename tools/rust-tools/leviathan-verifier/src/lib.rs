@@ -12,6 +12,11 @@ use psyche_network::distro_results_from_reader;
 use psyche_verifier::audit_contribution;
 use psyche_verifier::FraudProof;
 
+pub mod replay;
+
+pub use replay::ReplayAssignment;
+pub use replay::TrainerReplayEngine;
+
 pub fn contribution_key(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     if !name.ends_with(".vec-postcard") {
@@ -34,14 +39,21 @@ pub fn index_dir(dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
 
 pub fn decompress_dump(path: &Path, device: tch::Device) -> Result<Vec<f32>> {
     let bytes = fs::read(path)?;
-    let mut dense: Vec<f32> = Vec::new();
+    let mut results = Vec::new();
     for serialized in distro_results_from_reader(Cursor::new(bytes)) {
-        let mut result: DistroResult = (&serialized?).try_into()?;
-        result.sparse_idx = result.sparse_idx.to_device(device);
-        result.sparse_val = result.sparse_val.to_device(device);
+        results.push((&serialized?).try_into()?);
+    }
+    decompress_results(&results, device)
+}
+
+pub fn decompress_results(results: &[DistroResult], device: tch::Device) -> Result<Vec<f32>> {
+    let mut dense: Vec<f32> = Vec::new();
+    for result in results {
+        let sparse_idx = result.sparse_idx.to_device(device);
+        let sparse_val = result.sparse_val.to_device(device);
         let decompressed = CompressDCT::decompress(
-            &result.sparse_idx,
-            &result.sparse_val,
+            &sparse_idx,
+            &sparse_val,
             &result.xshape,
             result.totalk,
             tch::Kind::Float,
