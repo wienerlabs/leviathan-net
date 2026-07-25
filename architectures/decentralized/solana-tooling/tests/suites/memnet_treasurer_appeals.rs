@@ -26,6 +26,7 @@ use psyche_solana_tooling::process_coordinator_instructions::process_coordinator
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_appeal;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_voters;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
@@ -668,6 +669,53 @@ pub async fn upheld_appeal_slashes_the_target() {
             h.slashed_of(&key).await,
             0,
             "verifiers on the winning side keep their bonds",
+        );
+    }
+
+    let target_ata = h.clients_collateral[h.target_client_idx];
+    let tie_breaker_collaterals: Vec<Pubkey> = h
+        .tie_breakers
+        .iter()
+        .take(h.tie_breaker_quorum as usize)
+        .map(|(client_idx, _)| h.clients_collateral[*client_idx])
+        .collect();
+    process_treasurer_participant_bond_request_withdraw(
+        &mut h.endpoint,
+        &h.payer,
+        &target,
+        &h.run,
+        BOND,
+    )
+    .await
+    .unwrap();
+    h.endpoint
+        .forward_clock_unix_timestamp(100)
+        .await
+        .unwrap();
+    process_treasurer_participant_bond_finalize_withdraw_with_voters(
+        &mut h.endpoint,
+        &h.payer,
+        &target,
+        &target_ata,
+        &h.collateral_mint,
+        &h.run,
+        &h.coordinator_account,
+        &tie_breaker_collaterals,
+    )
+    .await
+    .unwrap();
+    let appeal_bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
+    let appeal_share = appeal_bounty / tie_breaker_collaterals.len() as u64;
+    for tie_breaker_collateral in &tie_breaker_collaterals {
+        assert_eq!(
+            h.endpoint
+                .get_spl_token_account(tie_breaker_collateral)
+                .await
+                .unwrap()
+                .unwrap()
+                .amount,
+            appeal_share,
+            "an upheld appeal pays the tie-breakers out of the target's forfeited bond",
         );
     }
 }

@@ -120,18 +120,31 @@ The recursion is bounded by economics, not by another layer of code. Backward
 compatibility is preserved, so the genesis run and token launch remain unblocked
 whether or not a given run turns appeals on.
 
-The appeal bounty is now built too. Without it the appeals court had the same
-economic hole the committee-economics sim found for verifiers: a tie-breaker pays
-the cost of a re-audit but earns nothing, so a rational tie-breaker never votes,
-and a bench nobody staffs is not a bench. So the overturn path now pays the
-tie-breakers out of the forfeited verifier bonds, reusing the same
-`slash_bounty_bps` knob and the same split-and-verify settlement the target-cheater
-path already used: when an overturned verifier withdraws, its forfeited bond's
-bounty share is split among the tie-breakers who overturned it (each recipient's
-token account owner checked against the recorded appeal voter). memnet confirms a
-tie-breaker earns its share while the cleared target still recovers its full bond.
+The appeal bounty is now built too, and built to be symmetric. Without a reward
+the appeals court had the same economic hole the committee-economics sim found for
+verifiers: a tie-breaker pays the cost of a re-audit but earns nothing, so a
+rational tie-breaker never votes, and a bench nobody staffs is not a bench.
+
+The subtlety is that a one-sided bounty is worse than none. If tie-breakers were
+paid only when they overturn, a rational tie-breaker would vote to overturn just to
+get paid, which is exactly the bias that frees guilty targets. So the bounty pays
+the tie-breakers on both outcomes, each funded by the side that lost: an overturn
+pays them out of the convicting verifiers' forfeited bonds, an upheld appeal pays
+them out of the target's forfeited bond. Because a tie-breaker earns either way,
+the bounty does not push its vote in either direction, so it votes its honest read
+and the Schelling point stays put. It reuses the existing `slash_bounty_bps` knob
+and the same split-and-verify settlement the target-cheater path already used: at
+settlement the forfeited bond's bounty share is split among the recorded appeal
+voters, each recipient's token account owner checked against a recorded voter, and
+the tokens come from the vault where the forfeited bond already sits. memnet
+confirms both directions: a tie-breaker earns its share whether the verdict is
+overturned or upheld, while a cleared target still recovers its full bond and a
+convicted one still forfeits.
 
 One refinement remains, optional and priced: an explicit challenge bond so a
 frivolous appeal has a cost of its own. It is additive on top of the shipped
 lifecycle and needs an economic parameter, so it is a deliberate choice rather
-than a gap.
+than a gap. A second, smaller call left open: on an upheld appeal the target's
+bounty goes to the tie-breakers who did the decisive re-audit rather than the
+original verifiers; splitting it between them is a one-line change if the verifier
+incentive on appealed convictions ever needs propping up.

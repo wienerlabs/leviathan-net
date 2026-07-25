@@ -142,7 +142,13 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
         let voters: Vec<Pubkey> = if let Some(verdict) =
             context.accounts.audit_verdict.as_ref()
         {
-            verdict.voters.clone()
+            if verdict.status == VerdictStatus::Upheld
+                && !verdict.appeal_voters.is_empty()
+            {
+                verdict.appeal_voters.clone()
+            } else {
+                verdict.voters.clone()
+            }
         } else if let Some(appeal) = context.accounts.appeal_verdict.as_ref() {
             if appeal.run != run_key {
                 return err!(ProgramError::InvalidParameter);
