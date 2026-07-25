@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use leviathan_verifier::audit_with_replay;
 use leviathan_verifier::decompress_results;
+use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_core::Barrier;
@@ -16,7 +18,11 @@ use psyche_modeling::Batch;
 use psyche_modeling::BatchData;
 use psyche_modeling::BatchDataCPU;
 use psyche_modeling::CausalLM;
+use psyche_modeling::CompressDCT;
+use psyche_modeling::DistroResult;
 use psyche_modeling::LocalTrainer;
+use psyche_network::distro_results_to_bytes;
+use psyche_network::SerializedDistroResult;
 use psyche_modeling::ParallelModels;
 use psyche_modeling::Trainer;
 use psyche_verifier::audit_round;
@@ -40,6 +46,24 @@ fn distro_optimizer() -> OptimizerDefinition {
         quantize_1bit: false,
         weight_decay: None,
     }
+}
+
+fn write_dump(dir: &std::path::Path, key: &str, dense: &[f32]) {
+    let rows = 6;
+    let x = tch::Tensor::from_slice(dense)
+        .reshape([rows, (dense.len() / rows as usize) as i64])
+        .to_kind(Kind::Float);
+    let (sparse_idx, sparse_val, xshape, totalk) = CompressDCT::compress(&x, 8);
+    let result = DistroResult {
+        sparse_idx,
+        sparse_val,
+        xshape,
+        totalk,
+        stats: None,
+    };
+    let serialized: SerializedDistroResult = (&result).try_into().unwrap();
+    let bytes = distro_results_to_bytes(&[serialized]).unwrap();
+    std::fs::write(dir.join(format!("result-node0-{key}.vec-postcard")), bytes).unwrap();
 }
 
 fn sample_batch() -> Vec<BatchDataCPU> {
@@ -172,6 +196,45 @@ fn recomputed_reference_catches_a_forged_contribution() {
         AuditOutcome::ReplayFailed { error, .. } => panic!("replay failed: {error}"),
         AuditOutcome::Malformed { error, .. } => panic!("malformed: {error}"),
     }
+}
+
+#[test]
+fn a_dump_directory_is_audited_against_a_recomputed_reference() {
+    let dir = std::env::temp_dir().join(format!("levreplay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (_, honest) = train_once(build_trainer(), sample_batch());
+    write_dump(&dir, "step1-batchB[0, 0]", &honest);
+
+    let engine = engine_with_assignment(build_trainer());
+    let summary =
+        audit_with_replay(&dir, &engine, DEFAULT_BAND, Device::Cpu).expect("the audit must run");
+    assert_eq!(summary.audited(), 1, "the dump must be judged, not skipped");
+    assert_eq!(
+        summary.fraud(),
+        0,
+        "an honest dump must clear a reference this verifier recomputed itself"
+    );
+
+    let forged: Vec<f32> = honest.iter().map(|v| -5.0 * v).collect();
+    let fraud_dir = dir.join("fraud");
+    std::fs::create_dir_all(&fraud_dir).unwrap();
+    write_dump(&fraud_dir, "step1-batchB[0, 0]", &forged);
+
+    let engine = engine_with_assignment(build_trainer());
+    let summary = audit_with_replay(&fraud_dir, &engine, DEFAULT_BAND, Device::Cpu)
+        .expect("the audit must run");
+    assert_eq!(summary.fraud(), 1, "a forged dump must be convicted");
+    assert_eq!(summary.proofs().len(), 1, "a conviction must carry a proof");
+}
+
+#[test]
+fn assignment_keys_carry_the_step_and_batch_the_target_trained() {
+    let (step, batch) = parse_assignment_key("step7-batchB[12, 19]").expect("a real dump name");
+    assert_eq!(step, 7);
+    assert_eq!(batch, BatchId(ClosedInterval::new(12, 19)));
+    assert!(parse_assignment_key("not-a-dump-name").is_none());
 }
 
 #[test]

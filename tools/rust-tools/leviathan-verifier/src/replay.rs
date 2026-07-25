@@ -1,7 +1,19 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
+use anyhow::Context;
+use anyhow::Result;
+use psyche_core::Barrier;
 use psyche_core::BatchId;
+use psyche_core::CancellableBarrier;
+use psyche_core::ConstantLR;
+use psyche_core::LearningRateSchedule;
+use psyche_core::OptimizerDefinition;
+use psyche_modeling::auto_model_for_causal_lm_from_pretrained;
+use psyche_modeling::CausalLM;
+use psyche_modeling::LocalTrainer;
+use psyche_modeling::ParallelModels;
 use psyche_modeling::Batch;
 use psyche_modeling::BatchData;
 use psyche_modeling::BatchDataCPU;
@@ -18,6 +30,63 @@ pub struct ReplayAssignment {
     pub step: u32,
     pub batch_id: BatchId,
     pub data: Vec<BatchDataCPU>,
+}
+
+pub fn parse_assignment_key(key: &str) -> Option<(u32, BatchId)> {
+    let (step_part, batch_part) = key.split_once("-batchB")?;
+    let step: u32 = step_part.strip_prefix("step")?.parse().ok()?;
+    let bounds = batch_part.trim_start_matches('[').trim_end_matches(']');
+    let (start, end) = bounds.split_once(',')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    Some((step, BatchId(psyche_core::ClosedInterval::new(start, end))))
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayTrainerConfig {
+    pub repo_files: Vec<std::path::PathBuf>,
+    pub sequence_length: usize,
+    pub micro_batch_size: usize,
+    pub learning_rate: f64,
+    pub compression_decay: f32,
+    pub compression_topk: u16,
+    pub compression_chunk: u16,
+    pub clip_grad_norm: Option<f32>,
+    pub quantize_1bit: bool,
+    pub device: tch::Device,
+}
+
+pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
+    let model: Box<dyn CausalLM> = auto_model_for_causal_lm_from_pretrained(
+        config.repo_files.clone(),
+        Some(tch::Kind::Float),
+        None,
+        Some(config.device),
+        None,
+        Some(config.sequence_length),
+    )
+    .context("cannot load the replay model")?;
+    model.prepare_for_training();
+    Ok(LocalTrainer::new(
+        ParallelModels {
+            models: vec![model],
+            barrier: Arc::new(CancellableBarrier::new(1)) as Arc<dyn Barrier>,
+            data_parallel: None,
+        },
+        LearningRateSchedule::Constant(ConstantLR::new(config.learning_rate, 0, 0.0)),
+        OptimizerDefinition::Distro {
+            clip_grad_norm: config.clip_grad_norm,
+            compression_decay: config.compression_decay,
+            compression_topk: config.compression_topk,
+            compression_chunk: config.compression_chunk,
+            quantize_1bit: config.quantize_1bit,
+            weight_decay: None,
+        },
+        config.micro_batch_size,
+        None,
+        false,
+    )
+    .into())
 }
 
 pub struct TrainerReplayEngine {

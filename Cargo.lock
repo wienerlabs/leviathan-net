@@ -5027,6 +5027,7 @@ dependencies = [
  "psyche-network",
  "psyche-verifier",
  "tch",
+ "tokio",
  "tokio-util 0.7.18",
 ]
 

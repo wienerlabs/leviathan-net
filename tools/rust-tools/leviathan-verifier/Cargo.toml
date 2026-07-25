@@ -11,11 +11,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 tch.workspace = true
+tokio.workspace = true
 tokio-util.workspace = true
 psyche-core.workspace = true
+psyche-data-provider.workspace = true
 psyche-network.workspace = true
 psyche-modeling.workspace = true
 psyche-verifier.workspace = true
-
-[dev-dependencies]
-psyche-data-provider.workspace = true

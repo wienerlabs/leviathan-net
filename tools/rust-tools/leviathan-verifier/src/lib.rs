@@ -14,7 +14,10 @@ use psyche_verifier::FraudProof;
 
 pub mod replay;
 
+pub use replay::build_replay_trainer;
+pub use replay::parse_assignment_key;
 pub use replay::ReplayAssignment;
+pub use replay::ReplayTrainerConfig;
 pub use replay::TrainerReplayEngine;
 
 pub fn contribution_key(path: &Path) -> Option<String> {
@@ -106,6 +109,49 @@ impl AuditSummary {
             })
             .collect()
     }
+}
+
+pub fn audit_with_replay<E: psyche_verifier::ReplayEngine>(
+    submitted: &Path,
+    engine: &E,
+    band: f32,
+    device: tch::Device,
+) -> Result<AuditSummary> {
+    let submitted_index = index_dir(submitted)?;
+    let mut outcomes = Vec::new();
+    for (target_index, (key, submitted_path)) in submitted_index.iter().enumerate() {
+        let target_index = target_index as u64;
+        let submitted_delta = decompress_dump(submitted_path, device)?;
+        let reference_delta = match engine.replay(target_index) {
+            Ok(delta) => delta,
+            Err(_) => {
+                outcomes.push(ContributionOutcome::NoReference { key: key.clone() });
+                continue;
+            }
+        };
+        if submitted_delta.len() != reference_delta.len() {
+            outcomes.push(ContributionOutcome::LengthMismatch {
+                key: key.clone(),
+                submitted: submitted_delta.len(),
+                reference: reference_delta.len(),
+            });
+            continue;
+        }
+        let report =
+            audit_contribution(target_index, &submitted_delta, &reference_delta, band)?;
+        if report.verdict.fraud {
+            outcomes.push(ContributionOutcome::Fraud {
+                key: key.clone(),
+                proof: report.proof.unwrap(),
+            });
+        } else {
+            outcomes.push(ContributionOutcome::Ok {
+                key: key.clone(),
+                distance: report.verdict.distance,
+            });
+        }
+    }
+    Ok(AuditSummary { outcomes })
 }
 
 pub fn audit_dirs(
