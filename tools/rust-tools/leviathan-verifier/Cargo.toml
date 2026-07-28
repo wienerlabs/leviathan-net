@@ -7,6 +7,14 @@ version.workspace = true
 name = "leviathan-verifier"
 path = "src/main.rs"
 
+[[bin]]
+name = "nano-dataset"
+path = "src/bin/nano_dataset.rs"
+
+[[bin]]
+name = "nano-contribute"
+path = "src/bin/nano_contribute.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

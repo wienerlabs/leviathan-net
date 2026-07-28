@@ -49,6 +49,45 @@ pub fn decompress_dump(path: &Path, device: tch::Device) -> Result<Vec<f32>> {
     decompress_results(&results, device)
 }
 
+/// Writes a tokenized dataset a small model can actually be trained on. Real
+/// corpora are tokenized for a full vocabulary, so feeding one to a tiny model
+/// indexes past its embedding table; this keeps every token inside vocab_size so
+/// the dataset and the model agree. Tokens come from a fixed linear congruential
+/// sequence, so the same seed always produces the same corpus and a replay can
+/// be reproduced exactly.
+pub fn write_token_dataset(
+    path: &Path,
+    vocab_size: u16,
+    sequence_length: usize,
+    sequences: usize,
+    seed: u64,
+) -> Result<()> {
+    if vocab_size == 0 {
+        return Err(anyhow!("a dataset needs a non-empty vocabulary"));
+    }
+    let mut state = seed | 1;
+    let total_tokens = sequence_length * (sequences + 1);
+    let mut bytes = Vec::with_capacity(total_tokens * 2);
+    for _ in 0..total_tokens {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let token = ((state >> 33) % vocab_size as u64) as u16;
+        bytes.extend_from_slice(&token.to_le_bytes());
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+pub fn write_results_dump(path: &Path, results: &[DistroResult]) -> Result<()> {
+    let serialized: Vec<psyche_network::SerializedDistroResult> = results
+        .iter()
+        .map(|result| result.try_into())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    fs::write(path, psyche_network::distro_results_to_bytes(&serialized)?)?;
+    Ok(())
+}
+
 pub fn write_dense_dump(path: &Path, dense: &[f32], rows: i64) -> Result<()> {
     if rows <= 0 || dense.len() as i64 % rows != 0 {
         return Err(anyhow!(

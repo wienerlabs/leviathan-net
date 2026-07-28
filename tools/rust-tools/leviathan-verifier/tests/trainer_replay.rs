@@ -3,6 +3,7 @@ use std::sync::Arc;
 use leviathan_verifier::audit_with_replay;
 use leviathan_verifier::decompress_results;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::write_token_dataset;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_core::Barrier;
@@ -12,7 +13,11 @@ use psyche_core::ClosedInterval;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
 use psyche_core::OptimizerDefinition;
+use psyche_core::Shuffle;
+use psyche_core::TokenSize;
 use psyche_data_provider::download_model_repo_sync;
+use psyche_data_provider::LocalDataProvider;
+use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::auto_model_for_causal_lm_from_pretrained;
 use psyche_modeling::Batch;
 use psyche_modeling::BatchData;
@@ -227,6 +232,60 @@ fn a_dump_directory_is_audited_against_a_recomputed_reference() {
         .expect("the audit must run");
     assert_eq!(summary.fraud(), 1, "a forged dump must be convicted");
     assert_eq!(summary.proofs().len(), 1, "a conviction must carry a proof");
+}
+
+#[tokio::test]
+async fn a_verifier_replays_the_exact_batch_its_target_pulled_from_the_dataset() {
+    let dir = std::env::temp_dir().join(format!("levdataset-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    write_token_dataset(&data_dir.join("nano.ds"), 30, SEQUENCE_LENGTH, 8, 42).unwrap();
+
+    let batch_id = BatchId(ClosedInterval::new(0, 0));
+    let mut provider = LocalDataProvider::new_from_directory(
+        &data_dir,
+        TokenSize::TwoBytes,
+        SEQUENCE_LENGTH,
+        Shuffle::DontShuffle,
+    )
+    .expect("a nano-sized dataset must load");
+    let data: Vec<BatchDataCPU> = provider
+        .get_samples(batch_id)
+        .await
+        .expect("the batch must be servable")
+        .into_iter()
+        .map(|x| BatchDataCPU {
+            input_ids: x.input_ids,
+            labels: x.labels,
+            position_ids: x.position_ids,
+            sequence_lengths: x.sequence_lengths,
+        })
+        .collect();
+    assert!(!data.is_empty(), "the batch must carry real tokens");
+
+    let (_, honest) = train_once(build_trainer(), data.clone());
+    write_dump(&dir, "step1-batchB[0, 0]", &honest);
+
+    let engine = TrainerReplayEngine::new(
+        build_trainer(),
+        vec![ReplayAssignment {
+            target_index: 0,
+            step: STEP,
+            batch_id,
+            data,
+        }],
+        Device::Cpu,
+    );
+    let summary =
+        audit_with_replay(&dir, &engine, DEFAULT_BAND, Device::Cpu).expect("the audit must run");
+    assert_eq!(summary.audited(), 1);
+    assert_eq!(
+        summary.fraud(),
+        0,
+        "a contribution trained on the dataset must clear a reference replayed from that same dataset"
+    );
 }
 
 #[test]

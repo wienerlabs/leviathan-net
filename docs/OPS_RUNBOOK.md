@@ -50,6 +50,29 @@ which stalls joins and ticks. Configure a dedicated endpoint once in
 `~/.leviathan/env` (see [DEVNET.md](../DEVNET.md)); the node script, the daemon
 (`SOLANA_RPC_URL`) and run-manager (`RPC`) all read it.
 
+## Checking the verifier before you trust it
+
+Run this before a genesis run, after any change to the replay path, and whenever
+a conviction looks wrong:
+
+```
+./scripts/replay-smoke.sh
+```
+
+It builds a dataset sized for the model, produces one honest contribution,
+audits it with no honest reference dumps in the loop, then forges that same
+contribution and audits again. Passing means the verifier clears honest work and
+convicts a forgery using a reference it recomputed itself. Failing means do not
+run a bonded run: either the verifier convicts honest nodes or it cannot see a
+cheat, and both cost real money.
+
+Two failure modes it exists to catch, both of which look like success from the
+outside. If the replay is configured with a zero learning rate, every recomputed
+delta is identically zero, so a forgery of zero also compares equal and the audit
+silently passes everything. And if the dataset was tokenized for a different
+vocabulary than the model, the replay cannot run at all, which shows up as
+skipped contributions rather than a loud error.
+
 ## Signals to watch
 
 The economic security verdict and the kill-switch signals come out of the
