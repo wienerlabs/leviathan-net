@@ -6,8 +6,22 @@ use std::time::Duration;
 use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
+use leviathan_verifier::build_replay_trainer;
+use leviathan_verifier::index_dir;
+use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::ReplayAssignment;
+use leviathan_verifier::ReplayTrainerConfig;
+use leviathan_verifier::TrainerReplayEngine;
+use psyche_core::Shuffle;
+use psyche_core::TokenSize;
+use psyche_data_provider::download_model_repo_sync;
+use psyche_data_provider::LocalDataProvider;
+use psyche_data_provider::TokenizedDataProvider;
+use psyche_modeling::BatchDataCPU;
 use psyche_solana_tooling::daemon::audit_pass;
+use psyche_solana_tooling::daemon::parse_committer;
 use psyche_solana_tooling::daemon::AuditConfig;
+use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_verifier::DEFAULT_BAND;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::read_keypair_file;
@@ -32,8 +46,26 @@ struct Args {
     authority: PathBuf,
     #[arg(long)]
     submitted_dir: PathBuf,
+
+    /// Honest dumps to audit against. Omit it and pass --replay-model to have
+    /// this verifier recompute the reference itself.
     #[arg(long)]
-    reference_dir: PathBuf,
+    reference_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    replay_model: Option<String>,
+    #[arg(long)]
+    replay_data_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 64)]
+    replay_sequence_length: usize,
+    #[arg(long, default_value_t = 4.0e-4)]
+    replay_lr: f64,
+    #[arg(long, default_value_t = 0.999)]
+    replay_compression_decay: f32,
+    #[arg(long, default_value_t = 8)]
+    replay_compression_topk: u16,
+    #[arg(long, default_value_t = 64)]
+    replay_compression_chunk: u16,
     #[arg(long, default_value_t = DEFAULT_BAND)]
     band: f32,
     #[arg(long, default_value_t = 8)]
@@ -46,6 +78,93 @@ struct Args {
     audit_assigned: bool,
     #[arg(long, default_value_t = false)]
     verdict: bool,
+}
+
+async fn build_replay_engine(
+    args: &Args,
+    endpoint: &mut ToolboxEndpoint,
+    coordinator_account: &Pubkey,
+) -> Result<TrainerReplayEngine> {
+    let model = args
+        .replay_model
+        .as_ref()
+        .ok_or_else(|| anyhow!("a replay model is required to recompute references"))?;
+    let data_dir = args
+        .replay_data_dir
+        .as_ref()
+        .ok_or_else(|| anyhow!("--replay-data-dir is required alongside --replay-model"))?;
+
+    let state = get_coordinator_account_state(endpoint, coordinator_account)
+        .await?
+        .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
+
+    let repo_files = download_model_repo_sync(&model.to_string(), None, None, None, true)?;
+    let trainer = build_replay_trainer(&ReplayTrainerConfig {
+        repo_files,
+        sequence_length: args.replay_sequence_length,
+        micro_batch_size: 1,
+        learning_rate: args.replay_lr,
+        compression_decay: args.replay_compression_decay,
+        compression_topk: args.replay_compression_topk,
+        compression_chunk: args.replay_compression_chunk,
+        clip_grad_norm: Some(1.0),
+        quantize_1bit: false,
+        device: tch::Device::Cpu,
+    })?;
+
+    let mut provider = LocalDataProvider::new_from_directory(
+        data_dir,
+        TokenSize::TwoBytes,
+        args.replay_sequence_length,
+        Shuffle::DontShuffle,
+    )?;
+
+    let mut assignments = Vec::new();
+    for (key, path) in index_dir(&args.submitted_dir)? {
+        let Some(committer) = parse_committer(&path) else {
+            continue;
+        };
+        let Some(index) = state
+            .coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|client| format!("{}", client.id) == committer)
+        else {
+            println!("[verifier-daemon] {committer} is not in the epoch roster, nothing to replay");
+            continue;
+        };
+        let Some((step, batch_id)) = parse_assignment_key(&key) else {
+            continue;
+        };
+        let data: Vec<BatchDataCPU> = provider
+            .get_samples(batch_id)
+            .await?
+            .into_iter()
+            .map(|x| BatchDataCPU {
+                input_ids: x.input_ids,
+                labels: x.labels,
+                position_ids: x.position_ids,
+                sequence_lengths: x.sequence_lengths,
+            })
+            .collect();
+        assignments.push(ReplayAssignment {
+            target_index: index as u64,
+            step,
+            batch_id,
+            data,
+        });
+    }
+
+    println!(
+        "[verifier-daemon] replay engine ready over {} assignment(s)",
+        assignments.len()
+    );
+    Ok(TrainerReplayEngine::new(
+        trainer,
+        assignments,
+        tch::Device::Cpu,
+    ))
 }
 
 #[tokio::main]
@@ -111,6 +230,11 @@ async fn main() -> Result<()> {
         }
     );
 
+    let replay = match args.replay_model {
+        Some(_) => Some(build_replay_engine(&args, &mut endpoint, &coordinator_account).await?),
+        None => None,
+    };
+
     let mut convicted: HashSet<String> = HashSet::new();
     loop {
         match audit_pass(
@@ -119,6 +243,7 @@ async fn main() -> Result<()> {
             &coordinator_account,
             &run,
             &config,
+            replay.as_ref().map(|e| e as &(dyn psyche_verifier::ReplayEngine + Sync)),
             &mut convicted,
         )
         .await

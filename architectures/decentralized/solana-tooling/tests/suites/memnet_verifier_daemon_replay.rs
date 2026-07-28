@@ -13,10 +13,24 @@ use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::SOLANA_MAX_NUM_WITNESSES;
 use psyche_coordinator::WAITING_FOR_MEMBERS_EXTRA_SECONDS;
+use leviathan_verifier::build_replay_trainer;
+use leviathan_verifier::decompress_results;
+use leviathan_verifier::write_dense_dump;
+use leviathan_verifier::ReplayAssignment;
+use leviathan_verifier::ReplayTrainerConfig;
+use leviathan_verifier::TrainerReplayEngine;
+use psyche_core::BatchId;
+use psyche_core::ClosedInterval;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
 use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
+use psyche_data_provider::download_model_repo_sync;
+use psyche_modeling::Batch;
+use psyche_modeling::BatchData;
+use psyche_modeling::BatchDataCPU;
+use psyche_modeling::Trainer;
+use tokio_util::sync::CancellationToken;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::instruction::Witness;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
@@ -41,23 +55,69 @@ use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
-const RUN_ID: &str = "Leviathan verifier daemon slash";
+const RUN_ID: &str = "Leviathan daemon replay slash";
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
 
 fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("levdaemon-{}-{}", std::process::id(), tag));
+    let dir = std::env::temp_dir().join(format!("levdaemonreplay-{}-{}", std::process::id(), tag));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-fn place_fixture(dir: &PathBuf, fixture: &str, committer: &str) {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/daemon")
-        .join(fixture);
-    let name = format!("result-{committer}-step1-batchB[0, 1].vec-postcard");
-    fs::copy(source, dir.join(name)).unwrap();
+const NANO_MODEL: &str = "pefontana/Nano-Llama";
+const NANO_SEQUENCE_LENGTH: usize = 64;
+
+fn nano_batch() -> Vec<BatchDataCPU> {
+    let input_ids: Vec<i32> = (0..NANO_SEQUENCE_LENGTH as i32).map(|i| i % 29).collect();
+    vec![BatchDataCPU {
+        input_ids,
+        labels: None,
+        position_ids: None,
+        sequence_lengths: None,
+    }]
+}
+
+fn nano_trainer() -> Trainer {
+    let repo_files = download_model_repo_sync(&NANO_MODEL.to_string(), None, None, None, true)
+        .expect("the nano model must be in the local hub cache");
+    build_replay_trainer(&ReplayTrainerConfig {
+        repo_files,
+        sequence_length: NANO_SEQUENCE_LENGTH,
+        micro_batch_size: 1,
+        learning_rate: 4.0e-4,
+        compression_decay: 0.999,
+        compression_topk: 8,
+        compression_chunk: 64,
+        clip_grad_norm: Some(1.0),
+        quantize_1bit: false,
+        device: tch::Device::Cpu,
+    })
+    .expect("the replay trainer must build")
+}
+
+fn nano_train_once(trainer: Trainer) -> (Trainer, Vec<f32>) {
+    let output = trainer
+        .train(
+            1,
+            Batch {
+                id: BatchId(ClosedInterval::new(0, 1)),
+                data: BatchData::CPU(nano_batch()),
+            },
+            None,
+            true,
+            vec![],
+            Some(vec![]),
+            CancellationToken::new(),
+        )
+        .expect("the nano model must train a batch");
+    let results = output
+        .distro_results
+        .clone()
+        .expect("a DisTrO run must produce results");
+    let dense = decompress_results(&results, tch::Device::Cpu).expect("results must decompress");
+    (output.trainer, dense)
 }
 
 #[tokio::test]
@@ -333,15 +393,45 @@ pub async fn run() {
         "{}",
         NodeIdentity::new(clients[cheater].pubkey().to_bytes(), Default::default())
     );
+    let roster = get_coordinator_account_state(&mut endpoint, &coordinator_account)
+        .await
+        .unwrap()
+        .unwrap();
+    let cheater_index = roster
+        .coordinator
+        .epoch_state
+        .clients
+        .iter()
+        .position(|client| format!("{}", client.id) == cheater_committer)
+        .expect("the cheater must be in the epoch roster") as u64;
+
+    let (_, honest) = nano_train_once(nano_trainer());
+    let forged: Vec<f32> = honest.iter().map(|v| -5.0 * v).collect();
     let submitted_dir = scratch("submitted");
-    let reference_dir = scratch("reference");
-    place_fixture(&reference_dir, "honest.vec-postcard", &cheater_committer);
-    place_fixture(&submitted_dir, "fraud.vec-postcard", &cheater_committer);
+    write_dense_dump(
+        &submitted_dir.join(format!(
+            "result-{cheater_committer}-step1-batchB[0, 1].vec-postcard"
+        )),
+        &forged,
+        6,
+    )
+    .unwrap();
+
+    let engine = TrainerReplayEngine::new(
+        nano_trainer(),
+        vec![ReplayAssignment {
+            target_index: cheater_index,
+            step: 1,
+            batch_id: BatchId(ClosedInterval::new(0, 1)),
+            data: nano_batch(),
+        }],
+        tch::Device::Cpu,
+    );
 
     let config = AuditConfig {
         run_id: RUN_ID.to_string(),
         submitted_dir,
-        reference_dir: Some(reference_dir),
+        reference_dir: None,
         band: 0.05,
         audit_assigned: false,
         dry_run: false,
@@ -355,7 +445,7 @@ pub async fn run() {
         &coordinator_account,
         &run,
         &config,
-        None,
+        Some(&engine),
         &mut convicted,
     )
     .await

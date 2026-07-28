@@ -49,6 +49,31 @@ pub fn decompress_dump(path: &Path, device: tch::Device) -> Result<Vec<f32>> {
     decompress_results(&results, device)
 }
 
+pub fn write_dense_dump(path: &Path, dense: &[f32], rows: i64) -> Result<()> {
+    if rows <= 0 || dense.len() as i64 % rows != 0 {
+        return Err(anyhow!(
+            "{} values do not reshape into {} rows",
+            dense.len(),
+            rows
+        ));
+    }
+    let x = tch::Tensor::from_slice(dense)
+        .reshape([rows, dense.len() as i64 / rows])
+        .to_kind(tch::Kind::Float);
+    let (sparse_idx, sparse_val, xshape, totalk) = CompressDCT::compress(&x, 8);
+    let result = DistroResult {
+        sparse_idx,
+        sparse_val,
+        xshape,
+        totalk,
+        stats: None,
+    };
+    let serialized: psyche_network::SerializedDistroResult = (&result).try_into()?;
+    let bytes = psyche_network::distro_results_to_bytes(&[serialized])?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 pub fn decompress_results(results: &[DistroResult], device: tch::Device) -> Result<Vec<f32>> {
     let mut dense: Vec<f32> = Vec::new();
     for result in results {

@@ -20,7 +20,10 @@ use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_ve
 pub struct AuditConfig {
     pub run_id: String,
     pub submitted_dir: PathBuf,
-    pub reference_dir: PathBuf,
+    /// Honest dumps to compare against. Leave it out and pass a replay engine to
+    /// audit_pass instead, so this verifier establishes the reference itself
+    /// rather than trusting dumps someone else produced.
+    pub reference_dir: Option<PathBuf>,
     pub band: f32,
     pub audit_assigned: bool,
     pub dry_run: bool,
@@ -54,6 +57,7 @@ pub async fn audit_pass(
     coordinator_account: &Pubkey,
     run: &Pubkey,
     config: &AuditConfig,
+    replay: Option<&(dyn psyche_verifier::ReplayEngine + Sync)>,
     convicted: &mut HashSet<String>,
 ) -> Result<usize> {
     let state = get_coordinator_account_state(endpoint, coordinator_account)
@@ -82,14 +86,19 @@ pub async fn audit_pass(
     };
 
     let submitted = index_dir(&config.submitted_dir)?;
-    let reference = index_dir(&config.reference_dir)?;
+    let reference = match &config.reference_dir {
+        Some(dir) => Some(index_dir(dir)?),
+        None => None,
+    };
+    if reference.is_none() && replay.is_none() {
+        return Err(anyhow!(
+            "the daemon needs either a reference directory or a replay engine to audit against"
+        ));
+    }
     let device = Device::Cpu;
     let mut new_convictions = 0usize;
 
     for (key, submitted_path) in &submitted {
-        let Some(reference_path) = reference.get(key) else {
-            continue;
-        };
         let Some(committer) = parse_committer(submitted_path) else {
             continue;
         };
@@ -101,8 +110,40 @@ pub async fn audit_pass(
             }
         }
 
+        let roster_index = coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|client| format!("{}", client.id) == committer);
+
+        let reference_delta = match (&reference, replay) {
+            (Some(reference), _) => {
+                let Some(reference_path) = reference.get(key) else {
+                    continue;
+                };
+                decompress_dump(reference_path, device)?
+            }
+            (None, Some(engine)) => {
+                let Some(index) = roster_index else {
+                    println!(
+                        "[verifier-daemon] skip  {key} committer {committer} is not in the epoch roster, nothing to replay against"
+                    );
+                    continue;
+                };
+                match engine.replay(index as u64) {
+                    Ok(delta) => delta,
+                    Err(err) => {
+                        println!(
+                            "[verifier-daemon] skip  {key} committer {committer} cannot be replayed: {err}"
+                        );
+                        continue;
+                    }
+                }
+            }
+            (None, None) => unreachable!("checked above"),
+        };
+
         let submitted_delta = decompress_dump(submitted_path, device)?;
-        let reference_delta = decompress_dump(reference_path, device)?;
         let verdict = verify_within_band(&submitted_delta, &reference_delta, config.band)?;
 
         if !verdict.fraud {
@@ -128,12 +169,7 @@ pub async fn audit_pass(
             continue;
         }
 
-        let index = coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .position(|client| format!("{}", client.id) == committer);
-        let Some(index) = index else {
+        let Some(index) = roster_index else {
             println!("  committer {committer} is not in the current epoch roster, cannot act yet");
             continue;
         };

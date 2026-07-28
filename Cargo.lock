@@ -7672,6 +7672,8 @@ dependencies = [
  "leviathan-verifier",
  "psyche-coordinator",
  "psyche-core",
+ "psyche-data-provider",
+ "psyche-modeling",
  "psyche-solana-authorizer",
  "psyche-solana-coordinator",
  "psyche-solana-distributor",
@@ -7682,6 +7684,7 @@ dependencies = [
  "solana_toolbox_endpoint",
  "tch",
  "tokio",
+ "tokio-util 0.7.18",
 ]
 
 [[package]]

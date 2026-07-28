@@ -53,7 +53,15 @@ required-features = ["daemon"]
 
 [features]
 demo = ["dep:tokio"]
-daemon = ["dep:tokio", "dep:clap", "dep:leviathan-verifier", "dep:psyche-verifier", "dep:tch"]
+daemon = [
+    "dep:tokio",
+    "dep:clap",
+    "dep:leviathan-verifier",
+    "dep:psyche-verifier",
+    "dep:psyche-data-provider",
+    "dep:psyche-modeling",
+    "dep:tch",
+]
 
 [dependencies.clap]
 workspace = true
@@ -72,10 +80,19 @@ optional = true
 path = "../../../shared/verifier"
 optional = true
 
+[dependencies.psyche-data-provider]
+path = "../../../shared/data-provider"
+optional = true
+
+[dependencies.psyche-modeling]
+path = "../../../shared/modeling"
+optional = true
+
 [dependencies.tch]
 workspace = true
 optional = true
 
 [dev-dependencies]
 tokio = "1.42.0"
+tokio-util = { workspace = true }
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }

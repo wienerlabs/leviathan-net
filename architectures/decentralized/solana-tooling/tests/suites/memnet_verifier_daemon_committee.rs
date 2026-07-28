@@ -310,7 +310,7 @@ pub async fn run() {
     let config = AuditConfig {
         run_id: RUN_ID.to_string(),
         submitted_dir,
-        reference_dir,
+        reference_dir: Some(reference_dir),
         band: 0.05,
         audit_assigned: false,
         dry_run: false,
@@ -325,6 +325,7 @@ pub async fn run() {
             &coordinator_account,
             &run,
             &config,
+            None,
             &mut convicted,
         )
         .await
@@ -356,6 +357,7 @@ pub async fn run() {
         &coordinator_account,
         &run,
         &config,
+        None,
         &mut convicted,
     )
     .await
