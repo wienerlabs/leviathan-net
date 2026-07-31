@@ -29,7 +29,13 @@ use ts_rs::TS;
 
 pub use crate::instance_state::RunMetadata;
 
+// The cluster a build targets is chosen here, not by patching this file at
+// deploy time. A mainnet build carries a different program id, so a binary
+// meant for devnet can never be pointed at mainnet by mistake.
+#[cfg(not(feature = "mainnet"))]
 declare_id!("JD9rHTiqBFgHjViWZc7gFZX74LvKKysbLbqFRaFvtmmN");
+#[cfg(feature = "mainnet")]
+declare_id!("9Sid2EWErkyMBKoqy9vzruRq6qJV2TUy9grp6NiieWN7");
 
 pub const SOLANA_MAX_NUM_PENDING_CLIENTS: usize = SOLANA_MAX_NUM_CLIENTS;
 

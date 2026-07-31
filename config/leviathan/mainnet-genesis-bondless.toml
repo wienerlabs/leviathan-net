@@ -1,0 +1,80 @@
+# Mainnet genesis, stage one: bonds off.
+#
+# The protocol runs on mainnet and does everything it does on devnet. Verifiers
+# are drawn, contributions are replay audited, a committee convicts, a slash
+# ejects the target and the appeals court can reverse it. The one thing that is
+# switched off is money at risk: bond_minimum_amount stays at zero until the
+# external audit (leviathan#4) clears, so nothing a bug could steal is ever
+# posted.
+#
+# What that buys: the network is live on mainnet, training a real model, with
+# real verification pressure, and every claim about it is checkable on chain.
+# What it costs: the economic security argument does not hold yet, because a
+# cheater who is ejected loses nothing. Say so plainly wherever this run is
+# described. An ejected client still forfeits its earned rewards for the epoch,
+# so cheating is not free, it is just not bonded.
+#
+# Stage two, after the audit, is a single run_bond_config_update that sets a
+# real bond and a real withdraw delay. No redeploy, no migration.
+
+[config]
+warmup_time = 30
+cooldown_time = 10
+epoch_time = 300
+max_round_train_time = 60
+round_witness_time = 15
+# Two is the floor for a useful run: one trainer and one verifier. Raise as
+# Nosana capacity lands (leviathan#14).
+min_clients = 2
+init_min_clients = 2
+# The audit rate. At 10 percent a cheater is caught in about ten rounds on
+# average. This is the number the whole security argument rests on, so it must
+# never be left at zero: an audit rate of zero means no verifier is ever drawn
+# and the run is unverified no matter what else is configured.
+verification_percent = 10
+witness_nodes = 1
+global_batch_size_start = 8
+global_batch_size_end = 8
+global_batch_size_warmup_tokens = 0
+total_steps = 25000
+waiting_for_members_extra_time = 3
+
+[model.LLM]
+architecture = "HfLlama"
+data_type = "Pretraining"
+max_seq_len = 64
+cold_start_warmup_steps = 0
+
+[model.LLM.checkpoint.Hub]
+repo_id = "pefontana/Nano-Llama"
+revision = "cf48eac4944f6e954a3d9c9c30e8c865e64e7d03"
+
+# The dataset and the model must agree on a vocabulary. Nano-Llama has 30
+# tokens, so a corpus tokenized for a larger vocabulary indexes past its
+# embedding table and the replay verifier cannot recompute anything. Generate a
+# matching corpus with `nano-dataset --vocab-size 30` and host it, or point this
+# at the tiny CI dataset below, which is already sized for this model.
+[model.LLM.data_location.Http]
+token_size_in_bytes = "TwoBytes"
+shuffle = "DontShuffle"
+
+[model.LLM.data_location.Http.location]
+SingleUrl = "https://huggingface.co/pefontana/Nano-Llama/resolve/main/tiny-ci-dataset/000_tiny-test.ds"
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 4.0e-4
+warmup_steps = 250
+warmup_init_lr = 0.0
+total_steps = 25000
+final_lr = 4.0e-5
+
+# These must match what the verifier replays with, or every honest contribution
+# looks like fraud. A learning rate of zero is the trap: the optimizer
+# accumulates grad * lr, so a zero rate makes every delta identically zero and
+# the audit silently passes everything, including a forgery of zero.
+[model.LLM.optimizer.Distro]
+clip_grad_norm = 1.0
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 8
+quantize_1bit = true

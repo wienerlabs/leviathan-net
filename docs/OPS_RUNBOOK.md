@@ -138,6 +138,67 @@ Build the program first with `cargo build-sbf --manifest-path <program>/Cargo.to
 a frame-size warning on a new instruction means it may not fit the BPF stack.
 Never re-run the create-run deploy path, which mints a new id.
 
+## Going to mainnet
+
+Mainnet arrives in two stages, because the audit gates money and nothing else.
+
+**Stage one, bonds off.** Deploy the programs and run a real training run with
+`bond_minimum_amount` at zero (`config/leviathan/mainnet-genesis-bondless.toml`).
+Everything works: verifiers are drawn, contributions are replay audited, a
+committee convicts, an ejected client forfeits its epoch rewards, and the
+appeals court can reverse a wrongful conviction. What is absent is a bond, so a
+bug in the slashing path cannot take anyone's principal. Describe the run this
+way in public. A cheater still loses its earnings, so cheating is not free, but
+the economic security argument in `docs/COMMITTEE_ECONOMICS.md` does not hold
+until bonds are on.
+
+**Stage two, bonds on.** After the external audit clears (leviathan#4), a single
+`run_bond_config_update` sets a real bond and a real withdraw delay. No
+redeploy, no migration, no new program ids.
+
+### Deploying
+
+The programs carry a different id on mainnet, selected at build time by the
+`mainnet` Cargo feature rather than by editing source before a deploy. The
+feature propagates to every program a program calls, so a mainnet treasurer can
+never CPI into a devnet coordinator. `cargo test -p psyche-solana-treasurer
+--test program_id --features mainnet` asserts exactly that, and the deploy
+script refuses to run if it fails.
+
+Rehearse first. This deploys the real mainnet binaries, with the real mainnet
+ids, to devnet:
+
+```
+CLUSTER=devnet ./scripts/deploy-mainnet.sh
+```
+
+Then the real thing, which asks for a typed confirmation:
+
+```
+CLUSTER=mainnet ./scripts/deploy-mainnet.sh
+```
+
+Both hand upgrade authority to the multisig at the end and verify on chain that
+it landed. After this, upgrading a program takes a multisig proposal, which is
+the point: a single compromised key cannot replace the code holding the bonds.
+
+Program keypairs live outside the repo, in
+`~/.config/solana/leviathan-mainnet-keys`. The devnet keys ended up in git
+history, which was acceptable for devnet and is not for mainnet. Back these up
+somewhere that survives the loss of this machine, because losing them means the
+programs can never be upgraded again.
+
+### Before the first mainnet run
+
+- `./scripts/replay-smoke.sh` passes. A verifier that cannot tell honest work
+  from a forgery is worse than no verifier.
+- `verification_percent` is above zero. At zero no verifier is ever drawn and
+  the run is unverified regardless of everything else.
+- The dataset and the model share a vocabulary. A mismatch turns every audit
+  into a silent skip rather than a loud error.
+- The learning rate is real. A zero rate makes every delta identically zero, so
+  the audit passes everything including a forgery.
+
 ## What is not yet operational
 
 - Alerting rules wired to a live prometheus (the rules exist, the scrape target

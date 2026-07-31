@@ -16,6 +16,9 @@ no-idl = []
 no-log-ix-name = []
 idl-build = ["anchor-lang/idl-build"]
 anchor-debug = []
+# Builds the program with its mainnet id. It propagates to every program this
+# one calls, so a mainnet build can never CPI into a devnet deployment.
+mainnet = []
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = [

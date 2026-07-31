@@ -4,7 +4,13 @@ pub mod state;
 use anchor_lang::prelude::*;
 use logic::*;
 
+// The cluster a build targets is chosen here, not by patching this file at
+// deploy time. A mainnet build carries a different program id, so a binary
+// meant for devnet can never be pointed at mainnet by mistake.
+#[cfg(not(feature = "mainnet"))]
 declare_id!("2Kg5ERG6ubuzyPmQ24axsws7V2ja2EvWp5CHMKFCrTxv");
+#[cfg(feature = "mainnet")]
+declare_id!("2QXAd9g31vKFGSyxZC2wcjJdCZ4bjCdzrXA95H6Ft2eU");
 
 pub fn find_authorization(
     grantor: &Pubkey,
