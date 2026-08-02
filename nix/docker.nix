@@ -123,6 +123,7 @@ let
       config = {
         Env = [
           "NVIDIA_DRIVER_CAPABILITIES=all"
+          "NVIDIA_VISIBLE_DEVICES=all"
           "LD_LIBRARY_PATH=/lib:/usr/lib"
           "LOGNAME=root"
           "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor"
