@@ -58,6 +58,23 @@ bonded node is one command. Inspect and manage the bond separately with
 The wallet needs a little devnet SOL for transaction fees. Override `RUN_ID`,
 `RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed.
 
+### Run a node from the container image
+
+`nousresearch/psyche-client` runs the same client on a rented GPU host. The
+entrypoint takes its configuration from the environment:
+
+| variable | value | why |
+|---|---|---|
+| `RPC` / `WS_RPC` | your devnet endpoints | required; the entrypoint exits without them |
+| `RUN_ID` | `leviathan-devnet` | required; the run to join |
+| `RAW_WALLET_PRIVATE_KEY` | base58 key or a JSON byte array | the client reads the wallet from the environment, so no keypair file has to be mounted |
+| `IROH_RELAY` | `n0` | **required off our own infrastructure.** The default `psyche` relays refused the TLS handshake from all three networks we tried, and a node that cannot reach a relay never submits its join: it sits at `role=NotInRound` with no error line |
+| `NVIDIA_VISIBLE_DEVICES` | `all` | only needed on images built before this was added to the image itself |
+
+The wallet still needs devnet SOL, and the run only advances while a client is
+connected, so bring several nodes up together inside the same
+`WaitingForMembers` window rather than one at a time.
+
 ### Dashboard telemetry
 
 `leviathan-indexer --features live` reads a coordinator account and prints run
