@@ -88,6 +88,20 @@ pub fn run_slash_losing_verifier_processor(
         }
     };
 
+    // A loser that is not in the epoch, or not in a slashable state, has not
+    // been settled - it has just stepped out of reach for the moment. Advancing
+    // past it was permanent: one round off the roster and the crank logged
+    // `slashable=false`, moved on, and the bond stayed put. The deterrent the
+    // whole appeals design rests on was optional for anyone paying attention
+    // (wienerlabs/leviathan#15, finding 8).
+    let (Some(index), true) = (loser_index, slashable) else {
+        msg!(
+            "slash_losing_verifier: loser={} not slashable right now, position kept",
+            loser
+        );
+        return err!(ProgramError::LoserNotSlashableYet);
+    };
+
     let (batch_start, batch_end, committed_hash, replayed_hash) = {
         let verdict = &mut context.accounts.audit_verdict;
         verdict.settled_count += 1;
@@ -99,13 +113,9 @@ pub fn run_slash_losing_verifier_processor(
         )
     };
 
-    msg!(
-        "slash_losing_verifier: loser={} slashable={}",
-        loser,
-        slashable
-    );
+    msg!("slash_losing_verifier: loser={} settled", loser);
 
-    if let (Some(index), true) = (loser_index, slashable) {
+    {
         let run = &context.accounts.run;
         let run_signer_seeds: &[&[&[u8]]] =
             &[&[Run::SEEDS_PREFIX, &run.index.to_le_bytes(), &[run.bump]]];

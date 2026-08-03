@@ -49,6 +49,7 @@ pub fn participant_create_processor(
     participant.bond_withdraw_pending_amount = 0;
     participant.bond_withdraw_requested_at = 0;
     participant.bond_settled_slashed_points = 0;
+    participant.bond_withdraw_delay_snapshot = 0;
 
     Ok(())
 }

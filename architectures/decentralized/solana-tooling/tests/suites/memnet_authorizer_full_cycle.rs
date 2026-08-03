@@ -323,3 +323,87 @@ pub async fn run() {
             .is_none()
     );
 }
+
+/// The delegate set is bounded now: a grantee extends its own authorization
+/// without the grantor signing, and every key it adds passes `is_valid_for`, so
+/// one sponsorship must not become an unlimited supply of committee seats
+/// (wienerlabs/leviathan#15, finding 19).
+///
+/// The keys go in batches of twenty because a transaction holds 1232 bytes and
+/// a pubkey is 32, not because the program asks for it.
+#[tokio::test]
+pub async fn delegates_are_capped() {
+    use psyche_solana_authorizer::state::Authorization;
+
+    let mut endpoint = create_memnet_endpoint().await;
+    let payer = Keypair::new();
+    endpoint
+        .request_airdrop(&payer.pubkey(), 5_000_000_000)
+        .await
+        .unwrap();
+
+    let grantor = Keypair::new();
+    let grantee = Keypair::new();
+    let scope = b"CoordinatorJoinRun".to_vec();
+    let authorization = process_authorizer_authorization_create(
+        &mut endpoint,
+        &payer,
+        &grantor,
+        &grantee.pubkey(),
+        &scope,
+    )
+    .await
+    .unwrap();
+
+    let keys: Vec<Pubkey> = (0..Authorization::MAX_DELEGATES + 1)
+        .map(|_| Pubkey::new_unique())
+        .collect();
+
+    // Fill the set exactly, twenty at a time.
+    let mut added = 0usize;
+    while added < Authorization::MAX_DELEGATES {
+        let batch = (Authorization::MAX_DELEGATES - added).min(20);
+        process_authorizer_authorization_grantee_update(
+            &mut endpoint,
+            &payer,
+            &grantee,
+            &authorization,
+            AuthorizationGranteeUpdateParams {
+                delegates_clear: added == 0,
+                delegates_added: keys[added..added + batch].to_vec(),
+            },
+        )
+        .await
+        .expect("filling the set up to the cap is allowed");
+        added += batch;
+    }
+
+    // One more is refused, which is the whole point.
+    process_authorizer_authorization_grantee_update(
+        &mut endpoint,
+        &payer,
+        &grantee,
+        &authorization,
+        AuthorizationGranteeUpdateParams {
+            delegates_clear: false,
+            delegates_added: vec![keys[Authorization::MAX_DELEGATES]],
+        },
+    )
+    .await
+    .expect_err("the set cannot be grown past the cap");
+
+    // And clearing first frees the room again, so the cap bounds the set rather
+    // than the lifetime total.
+    process_authorizer_authorization_grantee_update(
+        &mut endpoint,
+        &payer,
+        &grantee,
+        &authorization,
+        AuthorizationGranteeUpdateParams {
+            delegates_clear: true,
+            delegates_added: vec![keys[Authorization::MAX_DELEGATES]],
+        },
+    )
+    .await
+    .expect("clearing makes room");
+}

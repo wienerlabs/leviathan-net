@@ -129,6 +129,15 @@ pub fn run_submit_appeal_verdict_processor(
         if verdict.appeal_voters.iter().any(|voter| voter == &appellate_key) {
             return err!(ProgramError::DuplicateAppealVerdict);
         }
+        // Within one round the tie-breaker and verifier seats are disjoint by
+        // construction, but the appeal is judged under whatever round is current
+        // when its votes land, which is a different draw from the one that cast
+        // the verdict. A verifier drawn as a tie-breaker later is not neutral:
+        // an overturn forfeits its bond through `run_slash_losing_verifier`, so
+        // it votes Uphold every time (wienerlabs/leviathan#15, finding 7).
+        if verdict.voters.iter().any(|voter| voter == &appellate_key) {
+            return err!(ProgramError::AppellateVotedOnVerdict);
+        }
         if verdict.appeal_voters.len() >= MAX_APPEAL_VOTERS {
             return err!(ProgramError::AppealVotersFull);
         }

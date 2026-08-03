@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 
+use crate::ProgramError;
 use crate::state::Authorization;
 
 #[derive(Accounts)]
@@ -44,6 +45,16 @@ pub fn authorization_grantee_update_processor(
     if params.delegates_clear {
         authorization.delegates.clear();
     }
+
+    // Bounded, because this is the grantee extending its own authorization
+    // without the grantor's signature, and each key it adds passes
+    // `is_valid_for` (wienerlabs/leviathan#15, finding 19).
+    if authorization.delegates.len() + params.delegates_added.len()
+        > Authorization::MAX_DELEGATES
+    {
+        return err!(ProgramError::TooManyDelegates);
+    }
+
     authorization.delegates.extend(params.delegates_added);
     Ok(())
 }

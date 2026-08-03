@@ -14,6 +14,7 @@ use solana_sdk::signature::Keypair;
 use tch::Device;
 
 use crate::get_accounts::get_coordinator_account_state;
+use crate::get_accounts::get_run;
 use crate::process_treasurer_instructions::process_treasurer_run_slash_with_hashes;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 
@@ -60,13 +61,22 @@ pub async fn audit_pass(
     replay: Option<&(dyn psyche_verifier::ReplayEngine + Sync)>,
     convicted: &mut HashSet<String>,
 ) -> Result<usize> {
+    // The tie-breaker count comes from the run, because that is what the
+    // treasurer gates votes with. Deriving it any other way picks a different
+    // verifier set and every verdict is refused as `VerifierNotAssigned`
+    // (wienerlabs/leviathan#15, finding 4).
+    let tie_breaker_committee_size = get_run(endpoint, run)
+        .await?
+        .ok_or_else(|| anyhow!("run {} not found", run))?
+        .tie_breaker_committee_size;
+
     let state = get_coordinator_account_state(endpoint, coordinator_account)
         .await?
         .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
     let coordinator = &state.coordinator;
 
     let assigned: Option<HashSet<(String, u64, u64)>> = if config.audit_assigned {
-        match select_audits_for_current_round(coordinator) {
+        match select_audits_for_current_round(coordinator, tie_breaker_committee_size) {
             Ok(audits) => Some(
                 audits
                     .iter()
@@ -110,11 +120,13 @@ pub async fn audit_pass(
             }
         }
 
-        let roster_index = coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .position(|client| format!("{}", client.id) == committer);
+        // Matched on the whole 32-byte signer. `Display` is eight characters
+        // meant for a human reading a log line; using it here made two clients
+        // sharing a prefix indistinguishable, and tied the conviction path to
+        // how identities happen to be printed (finding 20).
+        let roster_index = coordinator.epoch_state.clients.iter().position(|client| {
+            bs58::encode(client.id.signer()).into_string() == committer
+        });
 
         let reference_delta = match (&reference, replay) {
             (Some(reference), _) => {

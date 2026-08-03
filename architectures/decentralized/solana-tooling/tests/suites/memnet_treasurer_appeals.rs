@@ -52,6 +52,10 @@ const SLASHING_RATE: u64 = 200;
 const BOUNTY_BPS: u16 = 5_000;
 const CHALLENGE_WINDOW: i64 = 50;
 const TIE_BREAKER_SIZE: u16 = 2;
+/// Long enough that these tests never hit it: they exercise the appeal itself,
+/// not the deadline that stops a challenge holding a conviction for ever
+/// (wienerlabs/leviathan#15, finding 10).
+const APPEAL_WINDOW: i64 = 10_000;
 const EPOCH_TIME: u64 = 300;
 const COMMITTED: [u8; 32] = [0xAA; 32];
 const REPLAYED: [u8; 32] = [0xBB; 32];
@@ -142,6 +146,7 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
         &run,
         CHALLENGE_WINDOW,
         TIE_BREAKER_SIZE,
+        APPEAL_WINDOW,
     )
     .await
     .unwrap();
@@ -724,6 +729,7 @@ pub async fn upheld_appeal_slashes_the_target() {
 pub async fn unchallenged_verdict_finalises_after_the_window() {
     let mut h = setup("Leviathan appeals finalise", 92).await;
     let target_key = h.target_key;
+    let target_index = h.target_index;
 
     h.reach_verifier_quorum().await;
 
@@ -740,6 +746,7 @@ pub async fn unchallenged_verdict_finalises_after_the_window() {
         &h.coordinator_account,
         &h.run_id,
         &target_key,
+        target_index,
     )
     .await
     .expect_err("finalising before the window elapses must be rejected");
@@ -756,6 +763,7 @@ pub async fn unchallenged_verdict_finalises_after_the_window() {
         &h.coordinator_account,
         &h.run_id,
         &target_key,
+        target_index,
     )
     .await
     .unwrap();

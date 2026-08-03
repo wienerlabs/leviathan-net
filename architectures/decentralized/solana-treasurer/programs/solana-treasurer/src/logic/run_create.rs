@@ -101,6 +101,7 @@ pub fn run_create_processor(
 
     run.challenge_window_seconds = 0;
     run.tie_breaker_committee_size = 0;
+    run.appeal_window_seconds = 0;
 
     let run_signer_seeds: &[&[&[u8]]] =
         &[&[Run::SEEDS_PREFIX, &run.index.to_le_bytes(), &[run.bump]]];

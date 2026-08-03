@@ -61,7 +61,7 @@ impl From<&Kind> for SerializableKind {
     }
 }
 
-fn kind_to_u8(kind: &Kind) -> u8 {
+pub(crate) fn kind_to_u8(kind: &Kind) -> u8 {
     match kind {
         Kind::Uint8 => 0,
         Kind::Int8 => 1,

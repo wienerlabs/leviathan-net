@@ -62,6 +62,12 @@ pub fn run_open_challenge_processor(
     }
 
     verdict.status = VerdictStatus::Challenged;
+    // Stamped so the appeal has a deadline of its own. Opening a challenge costs
+    // the target nothing beyond the bond it already posted, so without one it is
+    // strictly dominant for a guilty target: it cannot make their position worse
+    // and it parked a correct conviction for good
+    // (wienerlabs/leviathan#15, finding 10).
+    verdict.challenged_since_unix = now;
     verdict.challenger = context.accounts.challenger.key();
     verdict.overturn_count = 0;
     verdict.uphold_count = 0;

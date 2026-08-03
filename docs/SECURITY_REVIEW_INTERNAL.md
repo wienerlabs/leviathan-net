@@ -1,0 +1,1284 @@
+# Internal security review of the on-chain programs
+
+Scope and method for wienerlabs/leviathan#15. This is the internal pass that
+precedes the external audit (#4). It does not close #4 and does not clear
+mainnet bonds.
+
+Reviewed in two passes. The first covered `psyche-solana-treasurer` in full,
+`CommitteeSelection`, and the coordinator's slash path. The second closed the
+gaps that pass left open, at the request of the reviewer's own coverage note:
+`psyche-verifier` and `leviathan-verifier`, `psyche-solana-authorizer`,
+`data_selection` and `commitment`, the coordinator instructions off the slash
+path, `psyche-solana-distributor` and `psyche-solana-mining-pool` at depth, and
+the verifier daemon. The third covered the off-chain client and the p2p network
+layer: message handling, blob download, and the deserialisation of tensors that
+arrive from peers. Findings 18 to 24 come from the second pass and 25 to 29 from
+the third; both are marked in their sections.
+
+The third pass needs libtorch to run its tests. Set it up the way
+`scripts/leviathan-node.sh` does (`LIBTORCH_USE_PYTORCH=1` against a venv with
+torch 2.9.1) and run `cargo test -p psyche-network`. Every finding below that is marked *reproduced* has a test in
+this repository that fails on the honest expectation and passes on the current
+behaviour; run them with `cargo test -p psyche-solana-tooling` and
+`cargo test -p psyche-coordinator`.
+
+## Summary
+
+| # | Finding | Severity | Bounty class | Reproduced | Fixed |
+|---|---|---|---|---|---|
+| 25 | Heap out-of-bounds read from a peer-chosen tensor shape | Critical | — | yes | yes |
+| 1 | Epoch-end accounting silently drops a conviction | Critical | B | yes | yes |
+| 2 | Bounty recipient is unvalidated when the verdict is omitted | Critical | B | yes | yes |
+| 3 | Votes from different rounds are pooled into one quorum | High | — | yes | yes |
+| 26 | The commitment hash does not cover how the bytes are read | High | — | yes | yes |
+| 4 | Daemon and chain disagree on who is a verifier | High | A (enables) | yes | yes |
+| 15 | An unvalidated warmup witness index panics every later witness | High | — | yes | yes |
+| 5 | `run_finalize_slash` trusts a stale client index | High | — | no | yes |
+| 6 | `reset_for_epoch` destroys an appeal and an unfinished settlement | Medium-High | — | no | yes |
+| 7 | The appeal bench may contain the verifiers it is judging | Medium | — | no | yes |
+| 8 | A losing verifier escapes forfeit by leaving the epoch | Medium | — | no | yes |
+| 9 | No evidence consensus; the last voter overwrites the record | Medium | — | no | yes |
+| 10 | A challenged verdict has no deadline | Medium | — | no | yes |
+| 11 | Quorum can be one | Low | — | no | yes |
+| 12 | The voter cap can sit below quorum at scale | Low | — | no | yes |
+| 13 | Borsh accounts are sized with `std::mem::size_of` | Low | — | no | yes |
+| 14 | Slashing points and collateral units are coupled by convention | Info | — | no | yes |
+| 18 | A NaN submission is judged honest by the band check | High | A | yes | yes |
+| 19 | A grantee extends the join gate without the grantor | Medium | — | yes | yes |
+| 20 | The audit pipeline joins clients on a truncated display string | Medium | — | no | yes |
+| 27 | The one-bit deserialisation branch panics where the other errors | Medium | — | yes | yes |
+| 28 | `xshape` is an unbounded allocation size taken from one peer | Medium | — | no | yes |
+| 17 | The withdraw delay is read at finalise time, so it can be revoked | Low | — | no | yes |
+| 21 | Data assignment asserts that no round reserves tie-breakers | Low | — | yes | yes |
+| 22 | Merkle leaf and node are separated only by preimage length | Low | — | yes | yes |
+| 23 | `update_client_version` unwraps on a caller-supplied length | Low | — | no | yes |
+| 24 | `lender_claim` adds two u64 before widening | Low | — | no | yes |
+| 16 | The disclosure channel SECURITY.md names does not exist | Process | — | n/a | setting |
+
+Sections below run in numeric order; the table is sorted by severity, so the
+numbers are identifiers rather than a reading order.
+
+**Every finding here is fixed.** The fixes are in the same branch as this
+report, each commit naming the findings it closes, and every test that
+documented a defect now holds the behaviour that replaced it. Finding 16 is a
+repository setting rather than code and is the one thing still outstanding.
+
+Three of the fixes change formats and cannot be rolled out piecemeal:
+
+- The commitment hash (26) now covers the fields that say how a payload's bytes
+  are read. An old sender's hash will not match a new receiver's recomputation,
+  so every node in a run moves together; the payload is dropped rather than
+  misread in the meantime.
+- `AuditVerdict`, `Run` and `Participant` gain fields (3, 10, 13, 17), so
+  accounts written by the old program are not readable by the new one. Devnet
+  is redeployed, not upgraded in place.
+- Gradient dumps are named with the whole signer (20), so a daemon and the
+  clients it audits have to be upgraded together or the daemon audits nothing.
+
+The airdrop merkle tree is domain-tagged (22), which changes every leaf hash, so
+any published root has to be regenerated.
+
+Findings 1 and 2 are Class B under `docs/REDTEAM_BOUNTY.md` — "recover bonded
+collateral after conviction ... or finalise a withdraw that should have
+forfeited" — and neither needs privileged keys.
+
+The single most important structural observation is this: **every conviction
+path in the treasurer ends in the same two lines of coordinator code.**
+`run_submit_audit_verdict`, `run_submit_appeal_verdict`, `run_finalize_slash`,
+`run_slash_losing_verifier` and the admin `run_slash` all CPI into
+`slash_client`, which calls `Coordinator::eject` — and `eject` only sets a state
+flag. No money moves there. The money moves once per epoch, in a single merge
+walk in `instance_state.rs`. That walk had not been reviewed, and it is where
+finding 1 lives. The committee machinery above it can be perfectly correct and
+still not take a single token.
+
+---
+
+## 1. Epoch-end accounting silently drops a conviction (Critical, Class B)
+
+**File:** `architectures/decentralized/solana-coordinator/programs/solana-coordinator/src/instance_state.rs:133-169`
+**Test:** `memnet_treasurer_slash_accounting_order::exiting_out_of_join_order_voids_the_slash`
+
+At `TickResult::EpochEnd` the program walks the permanent client records and
+charges the slashing rate to everyone who left as `Ejected`:
+
+```rust
+let finished_clients = &self.coordinator.epoch_state.clients;      // 133
+let exited_clients = &self.coordinator.epoch_state.exited_clients; // 134
+let mut exited_client_index = 0;                                   // 138
+for client in self.clients_state.clients.iter_mut() {              // 140
+    ...
+    if exited_client_index < exited_clients.len()
+        && client.id == exited_clients[exited_client_index].id     // 156
+    { ...; exited_client_index += 1; }                             // 167
+}
+```
+
+This is a forward-only merge walk: one cursor, advanced only on a match. It is
+correct only if `exited_clients` is in the same relative order as
+`clients_state.clients`. It is not.
+
+- `clients_state.clients` is append-only in **join order** (`instance_state.rs:366`,
+  and a rejoining client reuses its slot at `:337`).
+- `exited_clients` is filled by `move_clients_to_exited`
+  (`shared/coordinator/src/coordinator.rs:1193-1197`) in **exit order**: a fresh
+  batch is appended at the end of *every round* (`coordinator.rs:1043`), at
+  warmup (`:1011`), at the members gate (`:954`) and at cooldown (`:1101`).
+
+So whenever two clients exit in different rounds and the earlier-joined one
+exits second, the cursor is already past the earlier-joined client when its
+entry finally appears. It never goes back. That client is never charged.
+
+**Failure scenario.** Clients A, B, C join in that order, all bonded 500, with
+`slashing_rate_per_client = 200`.
+
+1. C is convicted and ejected in round *r*. The round closes; `exited = [C]`.
+2. A is convicted and ejected in round *r+k*. The round closes; `exited = [C, A]`.
+3. At epoch end the walk visits A first: `exited[0]` is C, no match, cursor stays
+   at 0. It visits B: no match. It visits C: match, C is charged 200, cursor → 1.
+   The loop ends with `exited[1] = A` never examined.
+4. `A.slashed` is still 0. `participant_bond_finalize_withdraw` computes
+   `forfeited_amount = min(0 - 0, bond) = 0` and pays A its full 500 back.
+
+The test asserts exactly this: C forfeits 200, A forfeits nothing, and A then
+withdraws 500 out of the vault after a conviction that is recorded on chain.
+
+**Why an attacker does not need luck.** Two identities are enough. Join the
+attacker's main node first and a throwaway second. Drop the throwaway early in
+the epoch so it lands in `exited_clients` first. From then on the main node can
+be convicted at any point later in the epoch and will never forfeit. The cost is
+one extra client slot.
+
+It also fires with no attacker at all: a node that joined late and went offline
+early is a completely ordinary event, and it voids the conviction of anyone who
+joined before it.
+
+**Fix.** Do not walk the two lists in lockstep. Match by identity — index
+`clients_state.clients` by `NodeIdentity`, or iterate `exited_clients` in the
+outer loop and look the permanent record up. The same applies to the
+`finished_clients` cursor at `:141-153`; it happens to be safe today only
+because `epoch_state.clients` is built from `get_active_clients_ids()`, which
+preserves join order, and `retain` is stable. That is an invariant nobody
+stated and nothing tests.
+
+## 2. Bounty recipient is unvalidated when the verdict is omitted (Critical, Class B)
+
+**File:** `architectures/decentralized/solana-treasurer/programs/solana-treasurer/src/logic/participant_bond_finalize_withdraw.rs:167-183`
+**Test:** `memnet_treasurer_bounty_recipient::the_slashed_client_can_name_itself_as_the_bounty_recipient`
+
+The bounty is split two ways. With voters, every recipient is unpacked and
+checked against both the recorded voter and the collateral mint (`:194-201`).
+Without voters, it is not checked at all:
+
+```rust
+if voters.is_empty() {
+    let reporter = context.remaining_accounts.first()
+        .ok_or(error!(ProgramError::MissingReporter))?;
+    transfer(..., to: reporter.to_account_info(), ...)?;   // no owner check
+}
+```
+
+`remaining_accounts` is supplied by the signer — who is the participant being
+slashed. SPL's `transfer` will reject a non-token account and a mint mismatch,
+so those two are covered by the token program. **The owner is not checked by
+anyone.**
+
+The reachability is the part that matters and it is broader than it looks.
+`audit_verdict` is an `Option` account (`:57-65`). Anchor evaluates none of an
+optional account's constraints — including its `seeds` — when the client
+declines to pass it. So reaching the unchecked branch does not require that no
+verdict exists; it only requires that the withdrawing participant **omit** the
+verdict account. A target convicted by a full verifier quorum can leave the
+`audit_verdict` slot empty and take the whole bounty itself, denying the
+verifiers the payment the design promises them.
+
+**Failure scenario.** Bond 500, `slashing_rate_per_client = 200`,
+`slash_bounty_bps = 5000`. The participant is convicted and forfeits 200. At
+`participant_bond_finalize_withdraw` it passes its own ATA as
+`remaining_accounts[0]`. 100 tokens — the bounty half of its own forfeiture —
+are transferred straight back to it. Net loss 100 instead of 200; the run's
+`slash_bounty_bps` is silently halved for anyone who reads the code.
+
+The test is `memnet_treasurer_bounty` with one argument changed.
+
+**Fix.** Two parts, and both are needed:
+
+1. In the empty branch, apply the same three checks the voter branch applies,
+   and additionally reject `reporter.owner == user.key()`.
+2. Stop letting the account be omitted. Derive the `AuditVerdict` PDA and
+   require it whenever one exists — an `Option` that the beneficiary chooses is
+   not a constraint. If the optionality is needed for runs that never audit,
+   gate it on something the participant does not control.
+
+## 3. Votes from different rounds are pooled into one quorum (High)
+
+**File:** `.../logic/run_submit_audit_verdict.rs:103-122` and `:140-163`
+**Test:** `memnet_treasurer_cross_round_quorum::votes_from_different_committees_are_pooled_into_one_quorum`
+
+The committee is drawn per **round**: `from_coordinator_with_tie_breakers(coordinator, 0, ...)`
+resolves offset 0 to `current_round()`, whose `random_seed` is replaced on every
+`start_round_train` (`coordinator.rs:1167`). The verdict it writes into resets
+per **epoch** (`:133-135`), and an epoch is many rounds by construction —
+`Coordinator::check_config` rejects `max_round_train_time >= epoch_time`
+(`coordinator.rs:1256`).
+
+Nothing records which round a vote came from. `verdict.voters` accumulates
+across rounds and is compared against `quorum`, computed from whichever round
+happens to be current when the last vote lands.
+
+**Failure scenario.** The security argument for the audit committee is sampling:
+to convict, an attacker must hold ⅔ of the seats in a single draw. With
+`verification_percent = 10` on a 100-node run that is 6 of 9 seats, which a 10%
+sybil holder reaches with probability ≈10⁻⁶ in any given round. Under the
+current code the same attacker instead waits: each round redraws, roughly 0.9 of
+their nodes is seated per round, and after ~7 rounds they have accumulated 6
+*distinct* verifier votes against the same honest target. Rounds are minutes.
+The requirement collapses from "⅔ of one committee" to "⅔ of the union over the
+epoch", which is not a security assumption at all.
+
+The test convicts an honest node with two verifiers that were never seated on
+the same committee, and asserts both that the two votes landed in different
+rounds and that the second voter was absent from the first round's verifier set.
+
+**Fix.** Record the round height on the verdict at the first vote and reject any
+vote from a different round, resetting per round rather than per epoch. If a
+quorum genuinely cannot be gathered inside one round, that is an argument for a
+longer round or a smaller quorum — not for pooling draws.
+
+## 4. Daemon and chain disagree on who is a verifier (High)
+
+**Files:** `shared/coordinator/src/audit_selection.rs:59` versus
+`.../logic/run_submit_audit_verdict.rs:104` and `run_submit_appeal_verdict.rs:96`
+**Test:** `psyche_coordinator::committee_selection::tests::reserving_tie_breakers_moves_the_verifier_set`
+
+Two constructors are live at once and they do not agree:
+
+- The verifier daemon picks its work with `select_audits_for_current_round`
+  (`solana-tooling/src/daemon.rs:69`), which calls `from_coordinator`. That
+  passes `round.tie_breaker_tasks` — hardcoded `0` at every call site of
+  `start_round_train` (`coordinator.rs:500`, `:1009`, `:1084`).
+- The treasurer gates the vote with `from_coordinator_with_tie_breakers`,
+  passing the run's `tie_breaker_committee_size`.
+
+Reserving tie-breakers changes the verifier count
+(`total × pct/100` versus `(total − tb) × pct/100`) **and** shifts the verifier
+position window from `[0, v)` to `[tb, tb + v)`. The two views name different
+nodes.
+
+**Failure scenario.** A run turns appeals on, which is what
+`tie_breaker_committee_size > 0` means. The daemon tells node X to replay and
+report; X submits and the chain answers `VerifierNotAssigned`. Meanwhile the
+nodes the chain *would* accept were never told to audit anything. Quorum is
+rarely or never reached, so nothing is convicted — which makes Class A
+("undetected fraud past the band") trivially achievable for as long as the
+appeals court is enabled.
+
+`docs/DISPUTE_DESIGN.md` states the appeals design is backward compatible
+because both knobs default to 0. That is true, and it is also why this has not
+been seen: the feature has never been switched on against a live daemon.
+
+**Fix.** One source of truth. Have `select_audits_for_current_round` take the
+tie-breaker count from the same place the treasurer does, or write
+`tie_breaker_committee_size` into `round.tie_breaker_tasks` at
+`start_round_train` so `from_coordinator` is correct by construction. The second
+is preferable: it removes the second constructor rather than keeping two in
+sync.
+
+## 5. `run_finalize_slash` trusts a stale client index (High)
+
+**File:** `.../logic/run_finalize_slash.rs:73` and `:83-93`
+
+`run_finalize_slash` reads `target_index` off the verdict — recorded when the
+audit vote was cast — and then requires that `epoch_state.clients[target_index]`
+still be the target:
+
+```rust
+target_index = verdict.target_index;                       // 73
+...
+let target_client = ...clients.iter().nth(target_index)?;  // 87
+if *target_client.id.signer() != verdict.target.to_bytes() { TargetMismatch }
+```
+
+But `epoch_state.clients` is compacted at the end of every round
+(`coordinator.rs:1043`), and every client above a departing one shifts down. The
+instruction takes no fresh index and there is no other way to finalise. Once the
+index drifts the verdict is stuck in `SlashPending` permanently.
+
+**Failure scenario.** A quorum convicts a target in round *r*; because
+`challenge_window_seconds > 0` the verdict goes to `SlashPending`. The challenge
+window is by design longer than a round — it has to be, or nobody could react —
+so at least one round boundary passes before it can be finalised. Any client
+below the target that drops offline in that window shifts the target's index.
+`run_finalize_slash` then fails with `TargetMismatch` forever, and the
+conviction never lands.
+
+The only recovery is a fresh quorum in a *later epoch*, which triggers
+`reset_for_epoch` and restarts the whole audit — see finding 6 for what that
+costs.
+
+Note that this is the *only* place a stored index is trusted across time.
+`run_submit_audit_verdict`, `run_submit_appeal_verdict` and
+`run_slash_losing_verifier` all resolve the target freshly, and are sound in
+this respect.
+
+**Fix.** Take `target_index` as an instruction parameter, exactly as
+`run_submit_appeal_verdict` does (`:106-110`), and validate it against
+`verdict.target`. The stored index should be treated as a log entry, not as an
+input.
+
+## 6. `reset_for_epoch` destroys an appeal and an unfinished settlement (Medium-High)
+
+**Files:** `.../logic/run_submit_audit_verdict.rs:133-135`,
+`.../state/audit_verdict.rs:67-83`
+
+There is one `AuditVerdict` PDA per `(run, target)`, reused forever. Any
+verifier submitting a verdict in a new epoch triggers:
+
+```rust
+} else if verdict.epoch != current_epoch {
+    verdict.reset_for_epoch(current_epoch);
+}
+```
+
+`reset_for_epoch` clears `status`, `challenger`, `voters`, `appeal_voters`,
+`overturn_count`, `uphold_count` and `settled_count`.
+
+**Failure scenario A — the settlement is erased.** A verdict is `Overturned`;
+the losing verifiers are supposed to forfeit, one per `run_slash_losing_verifier`
+transaction, indexed by `settled_count`. The crank is permissionless and
+sequential, so it takes as many transactions as there were voters. Before it
+finishes, any one of those same losing verifiers submits a fresh verdict against
+the same target in the next epoch. `reset_for_epoch` wipes `voters` and
+`settled_count`, and the crank now fails with `VerdictNotOverturned`. Every
+verifier the crank had not yet reached escapes their forfeit, for the price of
+one transaction, paid by one of the people escaping.
+
+**Failure scenario B — the appeal is erased.** A target opens a challenge; the
+tie-breaker bench is mid-vote. The epoch rolls. One new audit verdict resets the
+account, and the challenge, the challenger and every appeal vote cast so far are
+gone.
+
+**Fix.** Do not reuse the account across disputes. Either seed the PDA with the
+epoch as well as the target, or refuse `reset_for_epoch` unless the previous
+verdict reached a terminal state *and* `settled_count == voters.len()`.
+
+## 7. The appeal bench may contain the verifiers it is judging (Medium)
+
+**File:** `.../logic/run_submit_appeal_verdict.rs:95-100`
+
+Within one round, TieBreaker and Verifier positions are disjoint by construction
+(`committee_selection.rs:187-195`), so the question as asked in the issue — can
+the tie-breaker set overlap the verifier set — is **sound in-round**.
+
+Across rounds it is not, and nothing pins the round. The appeal is judged under
+whatever draw is current when the appeal votes land, which is a different draw
+from the one that produced `verdict.voters`. The code never checks
+`appeal_voters ∩ voters = ∅`.
+
+**Failure scenario.** Verifier V votes to slash in round *r*. The target
+challenges. In round *r+k* V is drawn as a TieBreaker and votes on the appeal of
+its own verdict. V is not neutral: if the appeal is overturned,
+`run_slash_losing_verifier` forfeits V's bond. V will vote Uphold every time.
+`docs/DISPUTE_DESIGN.md` argues the bench is safe because it is "a disjoint,
+separately sized set" and because a tie-breaker "earns either way" so the bounty
+does not bias the vote. Neither argument survives a tie-breaker who is also a
+defendant.
+
+**Fix.** Reject an appeal vote from any key present in `verdict.voters`. It is
+one `contains` call and it makes the disjointness claim true rather than
+approximately true.
+
+## 8. A losing verifier escapes forfeit by leaving the epoch (Medium)
+
+**File:** `.../logic/run_slash_losing_verifier.rs:72-108`
+
+The crank walks `voters` by index. That walk itself is sound — `settled_count`
+must equal `voter_position` (`:66`), it cannot exceed `voters.len()` (`:63`), so
+it cannot be replayed, skipped or run off the end. But:
+
+```rust
+verdict.settled_count += 1;                                // 93, unconditional
+...
+if let (Some(index), true) = (loser_index, slashable) {    // 108
+    slash_client(...)
+}
+```
+
+`settled_count` advances whether or not the loser was actually slashed, and
+`slashable` is only true for `Healthy` or `Dropped` (`:83-84`). A voter that is
+absent from `epoch_state.clients` — which happens at the first round boundary
+after they stop participating — is skipped permanently. There is no retry.
+
+**Failure scenario.** A verifier sees an overturn coming and stops
+participating. One round later it is out of `epoch_state.clients`, the crank
+reaches its position, logs `slashable=false`, increments past it, and it keeps
+its bond. The deterrent that the whole appeals design rests on — "if you convict
+wrongly, you pay" — is optional for anyone paying attention.
+
+**Fix.** Do not advance `settled_count` on a miss. Record the loser as
+outstanding and settle against the bond directly (the treasurer holds it; it
+does not need the coordinator's client list to know who owes what).
+
+## 9. No evidence consensus; the last voter overwrites the record (Medium)
+
+**File:** `.../logic/run_submit_audit_verdict.rs:149-153`
+
+Every vote overwrites `committed_hash`, `replayed_hash`, `target_index`,
+`batch_start` and `batch_end`. Voters are counted, never compared. The quorum is
+a count of signatures, not of agreement about what happened.
+
+Being precise about the impact, because it is narrower than it first looks: the
+slash CPI ignores the hashes entirely — `slash_client` logs them and calls
+`slash(index)` → `eject(index)`. So a fabricated hash does **not** by itself
+cause a wrong slash; the quorum is still required. What it corrupts is the only
+on-chain evidence an appeal bench or an observer has, and the
+`batch_start`/`batch_end` range that `run_slash_losing_verifier` later carries.
+A verifier who votes last can therefore make a correct conviction look like it
+rests on evidence that does not check out, which is a clean way to manufacture a
+successful appeal.
+
+**Fix.** First voter writes the evidence; subsequent voters must match it or be
+rejected. Disagreement is information — it means at least one verifier is wrong
+— and it should be visible, not overwritten.
+
+## 10. A challenged verdict has no deadline (Medium)
+
+**Files:** `.../logic/run_open_challenge.rs:55-68`, `run_finalize_slash.rs:65`
+
+`run_finalize_slash` only accepts `SlashPending`. Once `run_open_challenge` sets
+`Challenged`, the only exits are an overturn quorum or an uphold quorum among
+the tie-breakers. There is no timeout, so a bench that never reaches quorum —
+apathy, offline nodes, or `tie_breaker_committee_size` set larger than the live
+client count — leaves the conviction unresolved indefinitely.
+
+Combined with the fact that opening a challenge costs nothing beyond an already
+posted bond, challenging is strictly dominant for a guilty target: it cannot
+make their position worse and it may stall the slash forever.
+
+`docs/DISPUTE_DESIGN.md` explicitly prices the missing challenge bond as a known
+optional refinement, so the *cost* half of this is a documented deliberate
+choice and not a finding. The *deadlock* half is not covered there and is: a
+free action that can permanently block a conviction is worse than a free action
+that merely delays one.
+
+**Fix.** Give `Challenged` a deadline. If the bench has not reached quorum by
+then, fall through to the verdict the verifiers already reached.
+
+## 11. Quorum can be one (Low)
+
+**File:** `.../logic/run_submit_audit_verdict.rs:121`
+
+`(2 * verifier_nodes).div_ceil(3).max(1)` gives quorum 1 when there is a single
+verifier seat, and `verifier_nodes = (total − tb) × pct / 100` rounds *down*, so
+small runs land there routinely. On the shape of run currently deployed — a
+handful of clients, `verification_percent` in the low tens — the committee is 0
+or 1 seats. At 0 nobody can audit at all; at 1 a single verifier unilaterally
+ejects any client it names.
+
+Nothing validates that a run's configuration produces a committee capable of
+meaning anything. The answer to the issue's question "can anyone lose a bond
+without a quorum agreeing" is: not through a bug, but yes through a
+configuration the program accepts without comment.
+
+**Fix.** Reject a slash when `verifier_nodes` is below a floor, and surface the
+computed committee size at `run_update` time.
+
+## 12. The voter cap can sit below quorum at scale (Low)
+
+**Files:** `.../state/audit_verdict.rs:3`, `.../logic/run_submit_audit_verdict.rs:143`
+
+`MAX_VERDICT_VOTERS` is 64 and votes are refused at that count. Quorum is
+`⌈2n/3⌉`, so above 96 verifier seats quorum exceeds the cap and can never be
+reached. At `verification_percent = 10` that is about 960 clients — inside the
+target scale, not beyond it.
+
+The account sizing itself is correct: `space_with_discriminator()` matches the
+Borsh layout field for field (4316 bytes), and both vectors are pre-allocated,
+so no reallocation is involved.
+
+**Fix.** Derive the cap from the maximum committee the coordinator can produce,
+or refuse a configuration whose quorum exceeds it.
+
+## 13. Borsh accounts are sized with `std::mem::size_of` (Low)
+
+**Files:** `.../state/run.rs:32`, `.../state/participant.rs:20`
+
+```rust
+pub fn space_with_discriminator() -> usize { 8 + std::mem::size_of::<Run>() }
+```
+
+`size_of` reports the Rust layout, including alignment padding; Borsh serialises
+packed. Today both over-allocate (`Run` 232 versus 229 needed), so nothing is
+broken. But it is not a correct way to size a Borsh account, and it is silently
+wrong in a way that only shows up once a field is added. `AuditVerdict` gets
+this right by counting fields explicitly; the other two should match it.
+
+## 14. Slashing points and collateral units are coupled by convention (Info)
+
+`participant_bond_finalize_withdraw:113-118` subtracts `client.slashed` —
+accumulated in units of `epoch_slashing_rate_per_client` — directly from
+`participant.bond_amount`, which is in collateral base units. The two are only
+the same thing because the operator sets them to be. `memnet_treasurer_bounty`
+encodes the assumption (`BOND = 500`, `SLASHING_RATE = 200`, expecting
+`BOND - SLASHING_RATE` back) but nothing on chain enforces it. A mint with a
+different decimal count than the operator assumed changes what a conviction
+costs, in either direction.
+
+Worth a comment in `RunUpdateParams` at minimum.
+
+## 15. An unvalidated warmup witness index panics every later witness (High)
+
+**File:** `shared/coordinator/src/coordinator.rs:486-490`
+**Test:** `psyche-coordinator --test warmup_witness_index` (three cases)
+
+The round-witness path validates the caller's proof before storing it:
+`verify_witness_for_client` → `verify_client` → `clients.get(index)`
+(`committee_selection.rs:222-224`), a bounds-checked lookup. The warmup path
+deliberately skips that check, and says so:
+
+```rust
+// Everyone can send a witness in the warmup phase so we don't need to check for the committee
+let round = self.current_round().unwrap();
+for witness in round.witnesses.iter() {
+    if self.epoch_state.clients[witness.proof.index as usize].id == *from {   // 488
+```
+
+The skipped check would have bounded `proof.index`; the duplicate loop then
+reads the unvalidated value back out of storage and indexes with it.
+`FixedVec`'s `Index` impl is `self.get(index).expect("Index out of bounds")`
+(`shared/core/src/fixed_vec.rs:185-187`), so the read panics, and a panic aborts
+the transaction.
+
+**Failure scenario.** Any joined client calls `warmup_witness` with
+`proof.index = u64::MAX`. Nothing rejects it and it is stored. From that moment
+every other client's `warmup_witness` transaction in that round panics at line
+488 before it can do anything. Warmup advances to training only when
+`round.witnesses.len() == witness_nodes` or on the timeout in `tick_warmup`
+(`coordinator.rs:1008`), so the run is pushed onto the timeout path with a
+single witness recorded, every epoch, at the cost of one transaction per warmup
+by one participant.
+
+The caller must be a registered client (`instance_state.rs:244` calls
+`find_signer`), so this is not open to the world — but it is open to every
+participant, including one that joined only to disrupt.
+
+**Fix.** Bounds check `proof.index` against `epoch_state.clients.len()` on the
+way in. Storing an index nobody validated and dereferencing it later is the
+pattern to remove, not the specific value. Consider making `FixedVec`'s `Index`
+impl unavailable in on-chain code so that a `get` with an explicit `None` arm is
+the only way to read.
+
+## 17. The withdraw delay is read at finalise time, so it can be revoked (Low)
+
+**Files:** `.../logic/participant_bond_finalize_withdraw.rs:107-111`,
+`.../logic/run_bond_config_update.rs:37-39`
+
+The unlock time is computed from the delay as it stands *now*, not as it stood
+when the withdrawal was requested:
+
+```rust
+let unlock_unix_timestamp =
+    participant.bond_withdraw_requested_at + run.bond_withdraw_delay_seconds;
+```
+
+`run_bond_config_update` can lower `bond_withdraw_delay_seconds` at any time
+(only `< 0` is rejected, and `0` is allowed whenever `bond_minimum_amount` is
+also 0). Setting it to zero makes every pending withdrawal in the run instantly
+claimable, including those of participants who are mid-dispute.
+
+This is authority-gated, so it sits inside the trust model `docs/GAPS.md`
+already describes. It is recorded because of what the delay is *for*: the whole
+point of a withdraw window is that a cheater cannot exit between committing
+fraud and being convicted. A window the run authority can close retroactively
+does not provide that, and a participant reading `bond_withdraw_delay_seconds`
+at request time has no guarantee it will still hold.
+
+The same instruction can raise `bond_minimum_amount` mid-run, which
+retroactively disqualifies existing participants from claiming
+(`participant_claim.rs:68`), from joining (`participant_authorize_join.rs:52`)
+and from voting (`run_submit_audit_verdict.rs:83`).
+
+**Fix.** Snapshot the delay onto the `Participant` at
+`participant_bond_request_withdraw` and use the stored value at finalise. Two
+fields, no behavioural change for anyone acting in good faith.
+
+## 18. A NaN submission is judged honest by the band check (High, Class A)
+
+*Second pass.*
+
+**File:** `shared/verifier/src/lib.rs:63` (and `:47-48`)
+**Test:** `psyche-verifier --test non_finite_submissions` (five cases)
+
+Fraud is decided by one comparison:
+
+```rust
+Ok(BandVerdict { distance, band, fraud: distance > band })
+```
+
+`distance` comes from `relative_l2_distance`, which sums `(s - r)^2` over the
+submitted and recomputed deltas. If any submitted value is NaN the sum is NaN,
+the square root is NaN, and the quotient is NaN. Every ordered IEEE-754
+comparison against NaN is false, so `distance > band` is **false** and the
+verdict is `fraud: false`.
+
+The submitted delta is the one input a cheating node fully controls.
+
+**Failure scenario.** A node submits an all-zero delta - the laziest possible
+forgery, and one the test suite already proves is caught - with a single element
+set to NaN. `relative_l2_distance` returns NaN, `verify_within_band` clears it,
+`audit_contribution` produces `proof: None`, and the daemon prints its "ok ...
+within band" line and moves on. There is no fraud proof to take to the chain,
+so no verdict, no quorum, no slash. Not caught late: never caught, because the
+check structurally cannot see it.
+
+That is Class A under `docs/REDTEAM_BOUNTY.md` - work that is not the honest
+replay, receiving reward without conviction - and it holds for every round, not
+just beyond `2/p`.
+
+Infinity is handled correctly (`inf > band` is true), which is exactly why this
+survives a casual "does it reject garbage" check. The tests cover both, so the
+distinction stays visible.
+
+Two smaller consequences of the same root cause, both covered by the tests:
+
+- `calibrate_band` folds with `f32::max`, which returns the other operand when
+  one side is NaN. A NaN drift sample is silently dropped rather than widening
+  the band or raising `EmptyCalibration`.
+- What the NaN does *not* do is poison the model: `robust_aggregate` builds its
+  keep-mask with `distance <= limit`, false for NaN, so the delta is excised and
+  the aggregate stays finite. The failure is confined to the layer that decides
+  guilt, which is the layer that matters here.
+
+**Fix.** Reject non-finite input where it enters. `relative_l2_distance` should
+return an error for a submitted delta that is not entirely finite, and
+`verify_within_band` should treat a non-finite distance as fraud rather than as
+a comparison. A cheater who submits values that are not numbers has already
+failed to submit the honest replay; that should be the easiest verdict in the
+system, not the one it cannot reach.
+
+## 19. A grantee extends the join gate without the grantor (Medium)
+
+*Second pass.*
+
+**Files:** `.../solana-authorizer/src/logic/authorization_grantee_update.rs:16, 44-47`,
+`.../solana-authorizer/src/state/authorization.rs:49-51`
+**Test:** `psyche-solana-authorizer --test delegate_expansion` (four cases)
+
+`join_run` admits a signer when `Authorization::is_valid_for` holds, which ends
+in:
+
+```rust
+self.grantee == Pubkey::default() || self.grantee.eq(grantee) || self.delegates.contains(grantee)
+```
+
+`authorization_grantee_update` is gated on `authorization.grantee ==
+grantee.key()` - the **grantee** signs, not the grantor - and appends
+`params.delegates_added` with no cap and no grantor approval.
+
+So the join authority approves one key and gets however many identities that key
+chooses to create. For a single operator running several nodes this is a
+sensible feature. For the committee lottery it is the sybil gate, and the two
+readings should not be conflated: finding 3 is priced in sybil fraction, finding
+1 needs one throwaway identity, and `global_batch_size_end` caps seats. All
+three assume the identity count is bounded by something. It is bounded by one
+signature, once.
+
+Revocation is all-or-nothing: clearing `active` removes the delegates and the
+original grantee together, so there is no way to drop one bad delegate without
+also ejecting the participant who was legitimately sponsored.
+
+The related question - can an attacker mint their own authorization - is **no**,
+and the tests record that too. `grantor` is written from a `Signer` at creation
+and compared by value against `coordinator_instance.join_authority`, and `scope`
+must match exactly. That is why `join_run` can safely omit a seeds constraint on
+the account: every field it relies on is content-checked and unforgeable.
+
+**Fix.** Decide which of the two things this is. If delegation is meant to be
+operator convenience, cap it and let the grantor set the cap. If the join gate
+is meant to bound identities, delegation has to require the grantor's signature.
+
+## 20. The audit pipeline joins clients on a truncated display string (Medium)
+
+*Second pass.*
+
+**Files:** `solana-tooling/src/daemon.rs:113-117` and `:37-42`,
+`shared/client/src/state/train.rs:808-811`
+
+The client writes each gradient dump as `result-{identity}-step{n}-batch{...}`,
+where `{identity}` is `NodeIdentity`'s `Display`. The daemon parses that segment
+back out of the filename and matches it against the roster:
+
+```rust
+let roster_index = coordinator.epoch_state.clients.iter()
+    .position(|client| format!("{}", client.id) == committer);
+```
+
+Three things follow, in increasing order of how much they should worry anyone:
+
+1. **`Display` is truncated.** It is eight characters, not the 32-byte signer.
+   `position` returns the first match, so two clients sharing a prefix are not
+   distinguished - the audit would be attributed to whichever appears first in
+   the roster.
+2. **Any change to `Display` silently breaks the join.** Dumps written before
+   wienerlabs/leviathan-net#15 carry hex; a daemon built after it looks up
+   base58. Nothing errors: the daemon prints "is not in the epoch roster,
+   nothing to replay against" and skips, so a version-skewed audit pass reports
+   clean while auditing nothing. A silent skip in the component that decides
+   guilt is the wrong failure mode.
+3. **The key is an operator-facing display string.** `Display` exists to be read
+   by humans in log lines. Using it as the identity join in the conviction path
+   means any future change to how identities are printed is a protocol change.
+
+**Fix.** Join on the full signer. Put the 32 bytes in the filename, base58 and
+untruncated, or carry the identity beside the path instead of inside it.
+`Display` should stay free to change.
+
+## 21. Data assignment asserts that no round reserves tie-breakers (Low, blocks finding 4's fix)
+
+*Second pass.*
+
+**File:** `shared/coordinator/src/data_selection.rs:22`
+**Test:** `psyche-coordinator --test tie_breaker_data_assignment` (two cases)
+
+```rust
+if matches!(committee, Committee::TieBreaker) {
+    assert_eq!(round.tie_breaker_tasks, 0);
+}
+```
+
+Dormant today, because `start_round_train` is called with `tie_breaker_tasks = 0`
+at all three of its call sites (`coordinator.rs:500`, `:1009`, `:1084`), so
+`from_coordinator` never yields a TieBreaker seat.
+
+It is recorded here because of what it blocks. The recommended fix for finding 4
+is to write the run's `tie_breaker_committee_size` into `round.tie_breaker_tasks`
+so the daemon and the chain derive one committee from one field. That change
+makes this assert fire on the first round. Whoever takes finding 4 needs to
+teach `assign_data_for_state` to skip tie-breakers in the same commit.
+
+`assign_data_for_state` is not reachable from any on-chain program - it is used
+by the daemon, the event-sourcing timeline and the client - so this is a process
+abort, not a program abort.
+
+## 22. Merkle leaf and node are separated only by preimage length (Low, latent)
+
+*Second pass.*
+
+**File:** `.../solana-distributor/src/state/merkle_hash.rs:14-28`
+**Test:** the `tests` module in that file (three cases)
+
+The airdrop tree sorts pairs and hashes them with no domain tag:
+
+```rust
+pub fn from_pair(a: &MerkleHash, b: &MerkleHash) -> MerkleHash {
+    MerkleHash { bytes: if a.bytes <= b.bytes { hashv(&[&a.bytes, &b.bytes]) } else { hashv(&[&b.bytes, &a.bytes]) }.to_bytes() }
+}
+```
+
+An internal node is therefore exactly `from_parts` applied to 64 bytes, which
+the test asserts directly. The usual consequence - present an internal node as a
+leaf and claim it - is blocked, but only because an allocation preimage is
+`claimer(32) + nonce(8) + start(8) + duration(4) + end(8)` = **60 bytes**, and
+60 is not 64.
+
+That is a four-byte margin holding up the whole tree, and nothing in the code
+says so. Add a `u32` to `Allocation` and the airdrop becomes drainable by anyone
+who can read the tree.
+
+`is_valid_proof` also accepts a proof of any length including zero, which
+degenerates to `leaf == root`. Safe today - reaching the root needs a preimage
+attack - and worth knowing the length is unchecked.
+
+**Fix.** Prefix a domain byte: `0x00` for leaves, `0x01` for nodes. One byte,
+and the margin stops being accidental.
+
+## 23. `update_client_version` unwraps on a caller-supplied length (Low)
+
+*Second pass.*
+
+**File:** `.../solana-coordinator/src/lib.rs:215`
+
+```rust
+account.state.client_version = FixedString::<96>::try_from(new_version.as_str()).unwrap();
+```
+
+A version string over 96 bytes makes `try_from` return `Err` and the `.unwrap()`
+panic. Owner-gated, so the only person who can trigger it is the run authority
+and the only cost is a failed transaction - but it is an `unwrap` on caller data
+in on-chain code, and `init_coordinator` sets the same field with
+`FixedString::from_str_truncated`. Two paths, two behaviours, for one field.
+
+**Fix.** Use the same constructor in both places, or return
+`ProgramError::InvalidParameter` rather than aborting.
+
+## 24. `lender_claim` adds two u64 before widening (Low)
+
+*Second pass.*
+
+**File:** `.../solana-mining-pool/src/logic/lender_claim.rs:79-80`
+
+```rust
+let total_repayed_redeemable_amount =
+    pool.total_claimed_redeemable_amount + context.accounts.pool_redeemable.amount;
+```
+
+Both operands are `u64` and the sum is computed in `u64` before anything widens
+to `u128`. `overflow-checks = true` is set for the release profile, so this
+aborts rather than wraps - but `pool_redeemable.amount` is a live token balance
+that anyone may increase by transferring in, so the input is not fully under the
+program's control. With a redeemable mint whose supply approaches `u64::MAX`,
+claims can be bricked by donation.
+
+Note for the record, because it was raised elsewhere: the `.unwrap()` two lines
+below on the `u128 → u64` conversion **cannot fail**. `lender.deposited` only
+grows alongside `pool.total_deposited` in `lender_deposit`, and nothing anywhere
+decrements either - `pool_extract` touches only
+`total_extracted_collateral_amount`. So `deposited <= total_deposited`
+invariantly, the quotient is at most `total_repayed`, and the conversion is
+always in range.
+
+**Fix.** Widen first: `u128::from(a) + u128::from(b)`.
+
+## 25. Heap out-of-bounds read from a peer-chosen tensor shape (Critical)
+
+*Third pass.*
+
+**File:** `shared/network/src/serializable_tensor.rs:107-110`
+**Test:** `psyche-network --lib hostile_input_tests` (four cases)
+
+Every field of a `SerializableTensor` arrives from a peer: `dims`, `kind`,
+`requires_grad`, and the raw `data` bytes. Deserialising one runs:
+
+```rust
+SerializableTensorData::Full(data) => {
+    Tensor::f_from_data_size(data, &value.dims, (&value.kind).into())?
+}
+```
+
+`f_from_data_size` looks fallible, and it is not fallible in the way that
+matters. Its whole body is:
+
+```rust
+let data = data.as_ptr() as *const c_void;
+let elt_size_in_bytes = kind.elt_size_in_bytes();
+let c_tensor = unsafe_torch_err!(at_tensor_of_data(
+    data, size.as_ptr(), size.len(), elt_size_in_bytes, kind.c_int(),
+));
+```
+
+**The slice's length is never passed to C++ and never checked.** Only the
+pointer crosses. `at_tensor_of_data` allocates a tensor of `product(size)`
+elements and `memcpy`s `numel * element_size` bytes from that pointer. The one
+check it does make is that `element_size_in_bytes` agrees with the chosen dtype
+— a coherence check on the kind, not on the length.
+
+So a peer that declares a shape larger than the bytes it sent makes the
+receiving process read that far past the end of a heap buffer, and the bytes it
+reads land in a tensor the peer then gets to observe through the aggregate.
+
+**Failure scenario, and it is what the test does.** Hand over a 16-byte slice of
+zeros, declare `dims = [64]`, `kind = Float`. The call returns `Ok`. The tensor
+has 64 elements. The first four are the zeros that were sent; **elements 4
+through 63 are read from memory past the end of the slice** — in the test that
+memory is a known 0xAA pattern, so the read is demonstrated rather than
+inferred. A second test does the same with `dims = [1000]` against 16 bytes:
+accepted, `numel() == 1000`, which is libtorch copying 4000 bytes out of a
+16-byte buffer.
+
+**What lets it through.** `apply_distro_result` does gate the payload, and the
+gate runs *before* deserialisation: it recomputes `comptue_hash()` and compares
+against the signed `commitment.data_hash` (`steps.rs:613`). That gate does not
+help, because of finding 26: the committed hash covers the tensor bytes and not
+`dims`. An attacker commits to the honest bytes, signs that hash legitimately,
+and ships whatever shape it likes alongside. The two findings are one exploit —
+26 is the reason 25 is reachable through an authenticated, signed, committed
+payload.
+
+The sender must be a joined run client (`client.rs:253` looks the peer up in the
+roster and `raw_p2p_verify` checks the signature), so this is not open to the
+internet. It is open to every participant, and finding 19 is how cheaply one
+becomes several.
+
+Note the code already knows the shape is unverified. `steps.rs:601`:
+`// TODO: verify shape of distro_results`.
+
+**Fix.** Check the length before the pointer leaves Rust:
+`data.len() == dims.iter().product::<i64>() as usize * kind.elt_size_in_bytes()`,
+with the product computed in `u128` or with `checked_mul`, and a rejection for
+negative dimensions. Do it in `TryFrom<&SerializableTensor> for Tensor` so both
+branches are covered, and treat `f_from_data_size` as unsafe-by-contract
+wherever else it is reached.
+
+## 26. The commitment hash does not cover how the bytes are read (High)
+
+*Third pass.*
+
+**File:** `shared/network/src/serialized_distro.rs:33-43`
+**Test:** `psyche-network --lib commitment_binding_tests` (three cases)
+
+```rust
+pub fn comptue_hash(&self) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(self.step.to_be_bytes());
+    hasher.update(self.batch_id.0.start.to_be_bytes());
+    hasher.update(self.batch_id.0.end.to_be_bytes());
+    for result in &self.distro_results {
+        hasher.update(result.sparse_idx.raw_tensor_data());
+        hasher.update(result.sparse_val.raw_tensor_data());
+    }
+    hasher.finalize().into()
+}
+```
+
+What is covered: the step, the batch bounds, and the raw tensor bytes. What is
+not: `dims`, `kind`, `requires_grad`, `xshape`, `totalk`, `trainer_nonce` — every
+field that decides how those bytes are turned back into a gradient. And the
+results are concatenated with no length prefix and no separator, so the division
+of one run of bytes into results is not covered either.
+
+This is the hash a peer signs, the hash `apply_distro_result` verifies a download
+against, and the hash witnesses put in `broadcast_bloom` for
+`select_consensus_commitment_by_witnesses` to count. A commitment that does not
+determine what the receiver computes is not binding, and all three of those uses
+assume it is.
+
+**Failure scenario.** The tests build it twice. Two payloads carrying the same
+four floats — one as `dims = [4]` with `xshape = [2,2]`, `totalk = 4`, the other
+as `dims = [2,2]` with `xshape = [4,1]`, `totalk = 9999` — produce **the same
+hash**. So do one result holding eight floats and two results holding four each.
+A node can therefore sign one commitment and hand different receivers payloads
+that decompress to different gradients, and every receiver believes it verified
+the signature.
+
+Changing an actual tensor byte does change the hash, so the fields that are
+covered are covered correctly. The defect is the choice of fields.
+
+**Fix.** Hash the serialised form rather than a hand-picked subset — the payload
+already round-trips through postcard, so hashing those bytes covers everything
+by construction. Failing that, feed every field in with lengths, and prefix each
+result with its own length.
+
+## 27. The one-bit deserialisation branch panics where the other errors (Medium)
+
+*Third pass.*
+
+**File:** `shared/network/src/serializable_tensor.rs:111-133`
+**Test:** `psyche-network --lib hostile_input_tests`
+
+The two branches of the same `TryFrom` do not agree on how to fail. `Full` calls
+the fallible `f_from_data_size` and returns `Err(TchError)`. `OneBit` calls
+`reshape`, `slice` and `bitwise_and_tensor` — the panicking variants — and
+computes `let total_elements: i64 = value.dims.iter().product();` on numbers a
+peer chose, where the product can overflow.
+
+The tests confirm both routes abort: one byte of packed data declared as 1000
+bits, and `dims = [i64::MAX, 4]`.
+
+The impact is contained, and worth stating precisely so it is not overrated:
+deserialisation runs under `spawn_blocking` and the join result is mapped to
+`DeserializeError::DeserializeThreadCrashed` (`steps.rs:687`), so a hostile
+payload drops rather than taking the process down. That guard is doing real
+work. What is left is that a `Result` type is lying about how the function
+fails, and a caller reading the signature would not know to expect a panic.
+
+**Fix.** Use `f_reshape`, `f_slice` and `f_bitwise_and_tensor`, and compute the
+element count with `checked_mul`.
+
+## 28. `xshape` is an unbounded allocation size taken from one peer (Medium)
+
+*Third pass. Read, not executed — the test for this one is an attempt to make
+the machine allocate, which is not a thing to run in CI.*
+
+**Files:** `shared/modeling/src/distro.rs:383`, and `:658-661`, `:673-676`
+
+`CompressDCT::decompress` opens with `let mut x: Tensor = Tensor::zeros(xshape, (kind, device));`.
+
+`xshape` reaches it from `SerializedDistroResult.xshape`, a `Vec<u16>` off the
+wire. Postcard puts no bound on the vector's length and each entry may be up to
+65535, so `[65535, 65535, 65535]` asks for 2.8 × 10^14 elements — about a
+petabyte at four bytes each. `Tensor::zeros` is the panicking variant.
+
+Two details make it worse than one peer harming itself. The shape is not applied
+per peer: both call sites pass `results[0][index].xshape` and
+`results[0][index].totalk` — **whichever result sorted first** — to every peer's
+indices. So one participant's `xshape` sets the allocation for the whole
+aggregation step. And `totalk` from the same first result drives
+`decompress_idx`, which reinterprets index bytes with `view_dtype`, so the same
+peer chooses how the other peers' indices are read.
+
+`internal_scatter_reduce_` then scatters those reinterpreted indices into `x`.
+Indices and target shape are both peer-controlled, so an out-of-range scatter is
+straightforward to arrange, and that call is a panicking variant too.
+
+**Fix.** Bound `xshape` where it is deserialised: cap the rank, cap the product,
+and reject anything that does not match the model's actual parameter shape —
+which the receiver knows independently and never consults. Derive the shape from
+local state rather than accepting it from a peer at all, if that is possible
+here.
+
+## 29. The shape gap was already marked in the code (Info)
+
+*Third pass.*
+
+`shared/client/src/state/steps.rs` carried `// TODO: verify shape of
+distro_results`, on the line after the commitment lookup and before the payload
+was deserialised and used. Findings 25, 26 and 28 were all downstream of that
+one comment. The fix closes it: the comment now records where the shape is
+checked instead of noting that it is not.
+
+## 16. The disclosure channel SECURITY.md names does not exist (Process)
+
+`SECURITY.md` and `docs/REDTEAM_BOUNTY.md` both instruct reporters to use
+GitHub private vulnerability reporting and explicitly say not to open a public
+issue for anything exploitable. Private vulnerability reporting is **disabled**
+on both `wienerlabs/leviathan` and `wienerlabs/leviathan-net`
+(`GET /repos/{owner}/{repo}/private-vulnerability-reporting` → `{"enabled": false}`).
+
+An outside reporter has already hit this and said so in #15, having by then
+posted partial exploit details publicly because there was nowhere else to put
+them. That is a predictable outcome of publishing a policy that points at a
+switch nobody turned on, and it will keep happening.
+
+Enable it on both repositories before the bounty program is advertised
+anywhere. It is a repository setting, not a code change.
+
+---
+
+## Read and found sound
+
+Listed so the external audit does not spend hours re-deriving these.
+
+**`run_submit_audit_verdict.rs`**
+- Bond gate: `verifier_participant.bond_amount < run.bond_minimum_amount` is
+  checked before anything else (`:83-87`), and `verifier_participant` is a PDA
+  seeded by the signer, so it cannot be substituted.
+- Double voting: `voters.contains(verifier_key)` (`:140-142`). Correct.
+- Committee membership is checked against a freshly computed selection, not a
+  caller-supplied proof (`:103-108`). Correct, and the right pattern: the
+  coordinator's warmup witness path takes the opposite approach and pays for it
+  in finding 15.
+- Target spoofing: `params.target_index` is resolved against the live client
+  list and the resulting signer compared to `params.target` (`:110-118`). An
+  attacker cannot name one key and slash another.
+- The `AuditVerdict` PDA is seeded by `params.target`, so the account and the
+  claimed target cannot disagree.
+- Quorum arithmetic `⌈2n/3⌉` is right for a two-thirds rule; the `.max(1)`
+  boundary is finding 11, not an arithmetic error.
+
+**`run_open_challenge.rs`**
+- The verdict PDA is seeded by `challenger.key()`, so only the target can
+  challenge its own conviction. That is the intended restriction and it is
+  enforced structurally rather than by a comparison that could be forgotten.
+- The window is closed correctly (`now >= pending_since_unix + window` rejects),
+  and it is the exact complement of the check in `run_finalize_slash`, so there
+  is no gap or overlap between "can still challenge" and "can now finalise".
+- Status must be `SlashPending`, so a challenge cannot reopen a resolved verdict.
+
+**`run_submit_appeal_verdict.rs`**
+- Tie-breaker membership, bond minimum, duplicate voting and the voter cap are
+  all checked, mirroring the audit path.
+- `verdict.target != params.target` is rejected (`:123-125`) *in addition to*
+  the PDA seeding — belt and braces, and correct.
+- The slash CPI uses `params.target_index`, freshly validated in this same
+  instruction (`:102-110`), not the stored one. Correct, and the reason this
+  instruction does not suffer finding 5.
+- State machine: `Voting → SlashPending → Challenged → {Upheld, Overturned}`
+  moves in one direction only; every transition is guarded by an equality check
+  on the current status. No backwards move exists other than
+  `reset_for_epoch` (finding 6).
+
+**`run_slash_losing_verifier.rs`**
+- The index walk cannot be replayed, skipped or run past the end (`:63-68`).
+  Sound, as the issue hoped. The problem is what happens on a miss (finding 8),
+  not the walk.
+- The loser is resolved by public key against the live client list, not by a
+  stored index. Correct.
+
+**`participant_bond_finalize_withdraw.rs`**
+- The voter branch validates every recipient three ways: unpacks it as a
+  `TokenAccount`, checks `owner == voter`, checks `mint == collateral_mint`
+  (`:194-201`). This is the branch the tests cover and it is correct.
+- Forfeit arithmetic: `saturating_sub` on the points difference, `min` against
+  the bond, `min` again for the payout (`:113-124`). It cannot underflow and it
+  cannot pay out more than the bond holds. `overflow-checks = true` is set for
+  the release profile (`solana-treasurer/Cargo.toml:6`), so the remaining
+  unchecked arithmetic aborts rather than wraps.
+- `share = bounty / voters.len()` truncates, leaving a remainder in the vault.
+  Not a leak.
+- The appeal-verdict branch requires `Overturned` status, a matching run, and
+  that the withdrawing user is one of the recorded original voters (`:152-162`).
+  Correct.
+
+**`participant_bond_deposit.rs` / `participant_bond_request_withdraw.rs`**
+- Deposit rejects zero, moves tokens before crediting, and requires
+  `user_collateral.owner == user` with no delegate.
+- Request checks `collateral_amount > bond_amount - pending`, so pending
+  withdrawals cannot be double-counted.
+
+**`participant_claim.rs`**
+- Bond gate, unclaimed-points check, and 1 collateral per point. The
+  `participant_earned_points - claimed_earned_points` subtraction at `:91-92` is
+  unchecked, but `clients_state.clients` is append-only (`instance_state.rs:366`)
+  and entries are never removed or reset, so `earned` is monotonic and the
+  subtraction cannot go negative. Sound, for a reason worth writing down.
+
+**`run_slash.rs`, `run_set_slash_bounty.rs`, `run_set_challenge_config.rs`, `run_bond_config_update.rs`, `run_update.rs`**
+- All authority-gated on `run.main_authority == authority.key()`, and the run
+  account is cross-checked against both coordinator accounts where it matters.
+
+**`CommitteeSelection`**
+- `compute_shuffled_index` is a swap-or-not shuffle over `[0, total_nodes)`, so
+  it is a permutation: one index maps to one position, and the position ranges
+  for TieBreaker / Verifier / Trainer are disjoint. **A client cannot land in
+  two committees in the same draw.** The overlap that does exist is across
+  draws (finding 7).
+- `CommitteeSelection::new` validates `total_nodes >= tie_breaker_nodes`,
+  `verification_percent <= 100` and the witness count.
+
+### Read in the second pass
+
+**`solana-authorizer`** — `grantor` is written from a `Signer` at creation and
+compared by value, and `scope` must match exactly, so an authorization cannot be
+minted on someone else's behalf and `join_run` is safe to omit a seeds
+constraint. `authorization_close` is grantor-gated, requires `!active`, and
+imposes a 30-day wait when delegates exist. The delegate reach is finding 19;
+everything else here is sound.
+
+**`join_run`** — the client id must match the signer, the instance PDA is seeded
+by `run_id`, and the coordinator account is cross-checked against the instance.
+
+**`health_check` / `healthy`** — this looked like the same shape as finding 15
+and is not. `healthy` bounds `proof.index` against `previous_round.clients_len`
+*and* runs `verify_client`, which is a bounds-checked `get` against the very
+list `health_check` later indexes. Within an epoch `epoch_state.clients` only
+shrinks, so the second bound is always the tighter one and the later index is
+safe. A health check also only succeeds against a node that genuinely failed to
+participate, so it cannot be used to drop an honest, working node.
+
+**`Commitment`** — the 64-byte signature is not decorative: `client.rs:254`
+verifies it against the p2p sender before the commitment is accepted.
+
+**`init_coordinator`** — despite the `TODO UNSAFE` comment, the checks are
+adequate: program ownership, exact account size, and an all-zero discriminator
+so an initialised coordinator cannot be re-initialised. The residual is that any
+payer can claim an unused `run_id`, which is namespace squatting rather than
+theft.
+
+**`free_coordinator`** — closes both accounts and would strand every bond in the
+treasurer if it ran on a bonded run. It cannot: for treasurer-created runs
+`main_authority` is the Run PDA, and the treasurer exposes no instruction that
+signs as that PDA to call it. Worth keeping in mind before adding one.
+
+**`OwnerCoordinatorAccounts` / `update`** — the authority gate verifies the
+instance PDA seeds as well as the key, and `update` refuses config, model and
+progress changes unless the run is halted, then runs `config.check()`.
+
+**`solana-distributor`** — `claim_create` requires the claimer's own signature,
+so nobody opens a claim on another key. The `Claim` PDA is seeded by
+`(airdrop, claimer, nonce)` and the merkle leaf binds the same three, so the
+accounting cannot be dodged by varying the nonce. `claimable = vested
+.saturating_sub(claimed)` and the requested amount is checked against it.
+Vesting arithmetic is `u128` with `checked_mul`/`checked_div` and a clamp to the
+end amount. `receiver_collateral.owner` is deliberately not pinned to the
+claimer — the claimer signs, so they are choosing where their own tokens land.
+The remaining exposure is admin: `airdrop_withdraw` can drain the vault with no
+counter, and `airdrop_update` can replace the root at will.
+
+**`solana-mining-pool`** — the pro-rata claim has no ordering advantage:
+`total_repayed` is `already_claimed + vault_balance`, and a claim moves the same
+amount from the second term to the first, so an early claimer gains nothing.
+`pool_claimable` is a genuine one-way switch. `pool_extract` is authority-gated
+with an owner-checked destination. `Pool::space_with_discriminator` repeats the
+`std::mem::size_of` pattern of finding 13 and over-allocates by the same margin.
+
+**Overflow** — all four programs set `overflow-checks = true` on the release
+profile, so the unchecked arithmetic that remains aborts rather than wrapping.
+
+### Read in the third pass
+
+**Gossip authentication** — a broadcast is only applied when the sender resolves
+to a client in the current roster (`client.rs:253`) *and* `raw_p2p_verify`
+checks the signature over the commitment hash. Connections are additionally
+gated at handshake by `AllowlistHook`. Nothing here is open to an unauthenticated
+peer; findings 25 to 28 all require a joined participant.
+
+**Blob downloads** — content-addressed through the iroh ticket, so the bytes that
+arrive are the bytes that were offered. The gap is not in the transport.
+
+**Deserialisation containment** — the panic route in finding 27 is caught:
+`steps.rs:687` maps the join failure to `DeserializeError::DeserializeThreadCrashed`
+rather than unwrapping it. This is the single guard standing between a hostile
+payload and the process, and it holds for the panics. It does not help against
+finding 25, which returns `Ok`.
+
+**Commitment signature** — `Commitment.signature` is verified against the p2p
+sender before anything is applied. The signature itself is sound; what it signs
+is finding 26.
+
+**`apply_distro_result` ordering** — the commitment hash is checked before the
+payload is deserialised, which is the right order. It is the hash that is too
+narrow, not the sequence.
+
+---
+
+## The five questions in the issue
+
+**Can anyone lose a bond without a quorum agreeing?**
+Yes, in three ways. Through configuration, because a one-seat committee has
+quorum one (11). Through accumulation, because votes from different draws are
+pooled and no single committee ever has to agree (3). And the admin `run_slash`
+path bypasses the committee entirely by design.
+
+**Can a target be convicted twice for the same epoch?**
+No. `VerdictAlreadyResolved` blocks a second resolution within an epoch, and
+`eject` refuses a client that is already `Ejected`. Across epochs a target can
+be convicted again, which is intended. The related defect is the opposite one:
+a target convicted *once* may not be charged at all (1).
+
+**Can an attacker force a slash of an honest node cheaply, and what does it cost
+them?**
+Yes, and far more cheaply than designed. Finding 3 reduces the cost from "⅔ of
+one randomly drawn committee" to "⅔ of the union of the committees drawn over an
+epoch". For a 10% sybil holder at `verification_percent = 10` on 100 nodes that
+is roughly seven rounds of waiting instead of a ~10⁻⁶ chance per round. The
+out-of-pocket cost is the minimum bond on each sybil identity, and those bonds
+are never at risk, because the honest target has no way to appeal successfully
+against a bench that may contain the accusers (7).
+
+**Can the appeals path be used to escape a correct conviction?**
+Yes — not by winning the appeal, but by never finishing it. A challenge is free
+and `Challenged` has no deadline (10), so a guilty target can park a correct
+conviction indefinitely. Separately, and outside the appeals path, a correct
+conviction that reached `SlashPending` becomes permanently unfinalisable as soon
+as the target's index drifts (5), and a conviction that fully lands may still
+charge nothing (1).
+
+**Is there any path where forfeited funds leave the vault to an address that is
+not a recorded voter?**
+Yes. Finding 2: when the verdict account is omitted, the bounty goes to an
+arbitrary token account named by the person being slashed, with no owner check.
+Every other payout path is checked.
+
+---
+
+## Recommended order of work
+
+0. Finding 25, ahead of everything on this list. It is a memory-safety defect
+   reachable from any participant through a payload that passes every check the
+   client currently makes, and the fix is a length comparison. Finding 26 goes
+   with it, because 26 is what carries 25 past the commitment gate.
+1. Finding 1, then finding 2. Both are Class B, neither needs privileged access,
+   and until they are fixed the bond mechanism does not reliably take money from
+   anyone.
+2. Finding 4 before appeals are enabled on any run, and finding 3 before the
+   committee is relied on for anything.
+3. Findings 5, 6, 8 together — they are all "a conviction that was reached does
+   not complete".
+4. Finding 18 with them. It is a one-line guard and it closes the only path in
+   the system where fraud is structurally uncatchable rather than merely
+   expensive to catch.
+5. Finding 15, a one-line bounds check against a participant that can otherwise
+   disrupt every warmup, and finding 21, which whoever takes finding 4 has to
+   fix in the same commit or the run aborts on its first round.
+6. Findings 27 and 28 with the rest of the network layer work, and finding 16,
+   which costs nothing and should not wait for a release.

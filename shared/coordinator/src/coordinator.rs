@@ -482,7 +482,23 @@ impl Coordinator {
             self.config.witness_nodes as usize
         };
 
-        // Everyone can send a witness in the warmup phase so we don't need to check for the committee
+        // Everyone can send a witness in the warmup phase so we don't need to
+        // check for the committee. We do have to check that the index names the
+        // sender: it is stored, and the duplicate check below reads it back and
+        // indexes the client list with it. An index nobody validated is an
+        // out-of-bounds read on the next caller's transaction, and an index
+        // naming somebody else lets one client spend another's turn
+        // (wienerlabs/leviathan#15, finding 15).
+        if self
+            .epoch_state
+            .clients
+            .get(witness.proof.index as usize)
+            .map(|client| &client.id)
+            != Some(from)
+        {
+            return Err(CoordinatorError::InvalidCommitteeProof);
+        }
+
         let round = self.current_round().unwrap();
         for witness in round.witnesses.iter() {
             if self.epoch_state.clients[witness.proof.index as usize].id == *from {

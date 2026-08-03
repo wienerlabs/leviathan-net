@@ -54,6 +54,15 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
     )]
     pub participant: Box<Account<'info, Participant>>,
 
+    /// CHECK: pinned to its PDA by the seeds below, and read only after this
+    /// checks that it exists and belongs to this program.
+    ///
+    /// Not an `Option`. Anchor skips every constraint on an optional account the
+    /// client declines to pass, including the seeds - so a participant convicted
+    /// by a full verifier quorum could simply leave the slot empty, fall into
+    /// the branch that pays an unchecked recipient, and take the whole bounty
+    /// itself (wienerlabs/leviathan#15, finding 2). The address is derived here,
+    /// so an empty account at it means there really is no verdict.
     #[account(
         seeds = [
             AuditVerdict::SEEDS_PREFIX,
@@ -62,7 +71,7 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
         ],
         bump,
     )]
-    pub audit_verdict: Option<Box<Account<'info, AuditVerdict>>>,
+    pub audit_verdict: UncheckedAccount<'info>,
 
     #[account()]
     pub appeal_verdict: Option<Box<Account<'info, AuditVerdict>>>,
@@ -105,7 +114,7 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     }
 
     let unlock_unix_timestamp = participant.bond_withdraw_requested_at
-        + run.bond_withdraw_delay_seconds;
+        + participant.bond_withdraw_delay_snapshot;
     if Clock::get()?.unix_timestamp < unlock_unix_timestamp {
         return err!(ProgramError::WithdrawDelayNotElapsed);
     }
@@ -139,9 +148,21 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
 
     if bounty_amount > 0 {
-        let voters: Vec<Pubkey> = if let Some(verdict) =
-            context.accounts.audit_verdict.as_ref()
-        {
+        // The verdict is read from the account at its own PDA, which the caller
+        // cannot substitute or leave out. An account with no data there is the
+        // only thing that counts as "no verdict".
+        let own_verdict = {
+            let info = context.accounts.audit_verdict.to_account_info();
+            if info.data_is_empty() || info.owner != &crate::ID {
+                None
+            } else {
+                Some(AuditVerdict::try_deserialize(
+                    &mut &info.try_borrow_data()?[..],
+                )?)
+            }
+        };
+
+        let voters: Vec<Pubkey> = if let Some(verdict) = own_verdict.as_ref() {
             if verdict.status == VerdictStatus::Upheld
                 && !verdict.appeal_voters.is_empty()
             {
@@ -165,10 +186,24 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
         };
 
         if voters.is_empty() {
+            // No verdict names anyone, so the bounty goes to whoever reported
+            // the fraud out of band. That account still has to be checked the
+            // same three ways the voter branch checks its recipients, and it has
+            // to belong to somebody other than the participant being slashed:
+            // this branch used to check nothing at all, so the participant named
+            // its own token account and took back the bounty half of its own
+            // forfeiture (wienerlabs/leviathan#15, finding 2).
             let reporter = context
                 .remaining_accounts
                 .first()
                 .ok_or(error!(ProgramError::MissingReporter))?;
+            let reporter_token_account = Account::<TokenAccount>::try_from(reporter)
+                .map_err(|_| error!(ProgramError::InvalidBountyRecipient))?;
+            if reporter_token_account.mint != collateral_mint
+                || reporter_token_account.owner == user_key
+            {
+                return err!(ProgramError::InvalidBountyRecipient);
+            }
             transfer(
                 CpiContext::new(
                     context.accounts.token_program.to_account_info(),

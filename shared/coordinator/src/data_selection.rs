@@ -10,18 +10,18 @@ pub fn assign_data_for_state(
 ) -> BTreeMap<BatchId, NodeIdentity> {
     let round = coordinator.current_round().unwrap();
 
+    // Only trainers get data. Verifiers replay somebody else's batch and
+    // tie-breakers sit on appeals, so both are skipped - quietly, because a run
+    // that reserves tie-breaker seats is a run with the appeals court switched
+    // on, not a broken one. This used to assert that `tie_breaker_tasks` was
+    // zero, which made wiring the run's committee size through here abort on the
+    // first round (wienerlabs/leviathan#15, finding 21).
     let trainer_nodes: Vec<_> = (0..coordinator.epoch_state.clients.len())
         .filter_map(|i| {
             let client = &coordinator.epoch_state.clients[i];
-            let committee = committee_selection.get_committee(i as u64).committee;
-
-            if matches!(committee, Committee::Trainer) {
-                Some(client)
-            } else {
-                if matches!(committee, Committee::TieBreaker) {
-                    assert_eq!(round.tie_breaker_tasks, 0);
-                }
-                None
+            match committee_selection.get_committee(i as u64).committee {
+                Committee::Trainer => Some(client),
+                Committee::Verifier | Committee::TieBreaker => None,
             }
         })
         .collect();

@@ -47,30 +47,54 @@ pub struct RunFinalizeSlashAccounts<'info> {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct RunFinalizeSlashParams {
     pub target: Pubkey,
+    /// Where the target sits in the client list *now*.
+    ///
+    /// The verdict records the index it was convicted at, but
+    /// `epoch_state.clients` is compacted at the end of every round, so anyone
+    /// below the target leaving shifts it down. Trusting the stored index left
+    /// a correct conviction permanently unfinalisable with `TargetMismatch` and
+    /// no instruction to correct it (wienerlabs/leviathan#15, finding 5). Every
+    /// other slash path already takes the index fresh and revalidates it; this
+    /// one now does too.
+    pub target_index: u64,
 }
 
 pub fn run_finalize_slash_processor(
     context: Context<RunFinalizeSlashAccounts>,
-    _params: RunFinalizeSlashParams,
+    params: RunFinalizeSlashParams,
 ) -> Result<()> {
     let challenge_window_seconds = context.accounts.run.challenge_window_seconds;
+    let appeal_window_seconds = context.accounts.run.appeal_window_seconds;
 
-    let target_index;
+    let target_index = params.target_index;
     let batch_start;
     let batch_end;
     let committed_hash;
     let replayed_hash;
     {
         let verdict = &mut context.accounts.audit_verdict;
-        if verdict.status != VerdictStatus::SlashPending {
-            return err!(ProgramError::VerdictNotPending);
-        }
         let now = Clock::get()?.unix_timestamp;
-        if now < verdict.pending_since_unix + challenge_window_seconds {
-            return err!(ProgramError::ChallengeWindowOpen);
+        match verdict.status {
+            VerdictStatus::SlashPending => {
+                if now < verdict.pending_since_unix + challenge_window_seconds {
+                    return err!(ProgramError::ChallengeWindowOpen);
+                }
+            },
+            // A challenge that the bench never resolved does not get to hold the
+            // conviction for ever. Past the appeal window the verdict the
+            // verifiers already reached finalises, which is what a target with
+            // nothing to say in its defence would have got anyway (finding 10).
+            // `appeal_window_seconds == 0` keeps the old behaviour: no timeout.
+            VerdictStatus::Challenged => {
+                if appeal_window_seconds == 0
+                    || now < verdict.challenged_since_unix + appeal_window_seconds
+                {
+                    return err!(ProgramError::AppealWindowOpen);
+                }
+            },
+            _ => return err!(ProgramError::VerdictNotPending),
         }
         verdict.status = VerdictStatus::Upheld;
-        target_index = verdict.target_index;
         batch_start = verdict.batch_start;
         batch_end = verdict.batch_end;
         committed_hash = verdict.committed_hash;

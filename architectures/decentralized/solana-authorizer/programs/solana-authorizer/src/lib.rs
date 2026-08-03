@@ -68,4 +68,6 @@ pub enum ProgramError {
     AuthorizationActiveIsTrue,
     #[msg("Authorization closing conditions not reached yet")]
     AuthorizationClosingConditionsNotReachedYet,
+    #[msg("An authorization cannot hold more delegates than the cap allows")]
+    TooManyDelegates,
 }
