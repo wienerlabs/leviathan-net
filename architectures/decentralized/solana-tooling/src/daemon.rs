@@ -120,11 +120,13 @@ pub async fn audit_pass(
             }
         }
 
-        let roster_index = coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .position(|client| format!("{}", client.id) == committer);
+        // Matched on the whole 32-byte signer. `Display` is eight characters
+        // meant for a human reading a log line; using it here made two clients
+        // sharing a prefix indistinguishable, and tied the conviction path to
+        // how identities happen to be printed (finding 20).
+        let roster_index = coordinator.epoch_state.clients.iter().position(|client| {
+            bs58::encode(client.id.signer()).into_string() == committer
+        });
 
         let reference_delta = match (&reference, replay) {
             (Some(reference), _) => {

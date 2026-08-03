@@ -76,14 +76,18 @@ pub fn lender_claim_processor(
         return err!(ProgramError::PoolTotalDepositedCollateralAmountIsZero);
     }
 
-    let total_repayed_redeemable_amount = pool.total_claimed_redeemable_amount
-        + context.accounts.pool_redeemable.amount;
+    // Widened before the addition, not after. `pool_redeemable.amount` is a live
+    // token balance anyone may raise by transferring in, so the sum is not
+    // entirely the program's to bound, and in `u64` it could abort the claim
+    // (wienerlabs/leviathan#15, finding 24).
+    let total_repayed_redeemable_amount = u128::from(pool.total_claimed_redeemable_amount)
+        + u128::from(context.accounts.pool_redeemable.amount);
     let claimable_redeemable_amount = u64::try_from(
-        u128::from(total_repayed_redeemable_amount)
+        total_repayed_redeemable_amount
             * u128::from(lender.deposited_collateral_amount)
             / u128::from(pool.total_deposited_collateral_amount),
     )
-    .unwrap();
+    .map_err(|_| error!(ProgramError::ParamsRedeemableAmountIsTooLarge))?;
 
     if lender.claimed_redeemable_amount + params.redeemable_amount
         > claimable_redeemable_amount

@@ -43,7 +43,18 @@ pub struct RunUpdateParams {
     pub config: Option<CoordinatorConfig>,
     pub model: Option<Model>,
     pub progress: Option<CoordinatorProgress>,
+    /// Shared out among the clients that finish an epoch healthy. In the same
+    /// units as the collateral mint, because `participant_claim` pays one
+    /// collateral base unit per earned point.
     pub epoch_earning_rate_total_shared: Option<u64>,
+    /// Charged to each client ejected during an epoch.
+    ///
+    /// **This is denominated in collateral base units**, not in some separate
+    /// scale: `participant_bond_finalize_withdraw` subtracts the accumulated
+    /// slashed points straight from `bond_amount`. Nothing on chain enforces
+    /// that, so a mint with a different decimal count than the operator assumed
+    /// changes what a conviction costs, in either direction
+    /// (wienerlabs/leviathan#15, finding 14).
     pub epoch_slashing_rate_per_client: Option<u64>,
     pub paused: Option<bool>,
     pub client_version: Option<String>,

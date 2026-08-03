@@ -805,9 +805,17 @@ async fn write_gradients_to_disk(
         .await
         .map_err(WriteGradientsError::CreateDir)?;
 
+    // The full signer, base58 and untruncated. The daemon parses this segment
+    // back out and matches it against the roster, so a truncated `Display` made
+    // the audit pipeline join on eight characters - and any change to how
+    // identities are printed silently broke the match, with the daemon skipping
+    // every contribution while reporting a clean pass
+    // (wienerlabs/leviathan#15, finding 20).
     let fname = format!(
         "result-{}-step{}-batch{}.vec-postcard",
-        identity, distro_result.step, distro_result.batch_id
+        bs58::encode(identity.signer()).into_string(),
+        distro_result.step,
+        distro_result.batch_id
     );
     let fpath = write_gradients_dir.join(&fname);
     let serialized = distro_results_to_bytes(&distro_result.distro_results).map_err(|err| {

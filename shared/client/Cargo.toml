@@ -4,6 +4,7 @@ version.workspace = true
 edition = "2021"
 
 [dependencies]
+bs58 = "0.5"
 psyche-core = { workspace = true, features = ["rand"] }
 psyche-coordinator.workspace = true
 psyche-data-provider.workspace = true

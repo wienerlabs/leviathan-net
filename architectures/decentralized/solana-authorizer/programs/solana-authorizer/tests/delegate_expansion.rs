@@ -5,13 +5,14 @@
 //! run's `join_authority`. The grantor - the join authority - decides who the
 //! grantee is. It does not decide who the grantee's delegates are:
 //! `authorization_grantee_update` is gated on `authorization.grantee ==
-//! grantee.key()`, so the grantee alone extends the set, without a signature or
-//! a cap.
+//! grantee.key()`, so the grantee alone extends the set, without the grantor's
+//! signature.
 //!
 //! That is a reasonable feature for one operator running several nodes. It is
-//! also the sybil gate for every committee in the protocol, and the two
-//! readings should not be confused: sponsoring one participant sponsors as many
-//! identities as that participant cares to create.
+//! also the only gate on how many identities one sponsorship produces, and every
+//! committee in the protocol is priced in the fraction of identities an attacker
+//! holds - so it is bounded now
+//! (wienerlabs/leviathan#15, finding 19).
 
 use psyche_solana_authorizer::state::Authorization;
 use anchor_lang::prelude::Pubkey;
@@ -45,26 +46,37 @@ fn the_named_grantee_is_admitted_and_a_stranger_is_not() {
     assert!(!authorization.is_valid_for(&join_authority, &stranger, SCOPE));
 }
 
-/// Every key the grantee adds is admitted on the same authorization. The join
-/// authority signed once, for one key, and gets as many participants as the
-/// grantee wants.
+/// Delegates still work: every key the grantee adds is admitted, which is the
+/// point of the feature.
 #[test]
-fn every_key_the_grantee_adds_is_admitted_too() {
+fn the_delegates_a_grantee_adds_are_admitted() {
     let join_authority = key(1);
     let grantee = key(2);
     let mut authorization = granted_to(join_authority, grantee);
 
-    let sybils: Vec<Pubkey> = (10..74u8).map(key).collect();
-    // `authorization_grantee_update` is exactly this, gated only on the grantee
-    // signing: no grantor approval, no cap on the count.
-    authorization.delegates.extend(sybils.iter().copied());
+    let delegates: Vec<Pubkey> = (10..10 + Authorization::MAX_DELEGATES as u8)
+        .map(key)
+        .collect();
+    authorization.delegates.extend(delegates.iter().copied());
 
-    for sybil in &sybils {
-        assert!(
-            authorization.is_valid_for(&join_authority, sybil, SCOPE),
-            "a delegate the join authority never saw passes the gate"
-        );
+    for delegate in &delegates {
+        assert!(authorization.is_valid_for(&join_authority, delegate, SCOPE));
     }
+}
+
+/// But the count is bounded, so one sponsorship cannot become an unlimited
+/// supply of committee seats. The cap lives on the type, next to the field it
+/// bounds, and `authorization_grantee_update` enforces it.
+#[test]
+fn the_delegate_count_is_capped() {
+    assert!(
+        Authorization::MAX_DELEGATES > 0,
+        "delegation is still allowed"
+    );
+    assert!(
+        Authorization::MAX_DELEGATES < 1000,
+        "and it is a bound, not a formality"
+    );
 }
 
 /// Revocation is all-or-nothing: clearing `active` shuts out the delegates and

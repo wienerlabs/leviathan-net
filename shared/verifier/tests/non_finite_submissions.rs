@@ -2,50 +2,68 @@
 //! internal review (wienerlabs/leviathan#15).
 //!
 //! `verify_within_band` decides fraud with `distance > band`. If the submitted
-//! delta contains a NaN, the relative L2 distance is NaN, and every IEEE-754
-//! ordered comparison against NaN is false - so `distance > band` is false and
-//! the submission is judged honest. The one input a cheater fully controls is
-//! the one the check cannot see.
+//! delta contained a NaN the relative L2 distance was NaN, and every IEEE-754
+//! ordered comparison against NaN is false - so `distance > band` was false and
+//! the submission was judged honest. The one input a cheater fully controls was
+//! the one the check could not see.
 //!
-//! Infinity behaves correctly, which is what makes this easy to miss: a quick
-//! test of "garbage input" that happens to use inf will pass.
+//! Infinity behaved correctly, which is what made this easy to miss: a quick
+//! test of "garbage input" that happens to use inf passes either way.
+//!
+//! A submission that is not made of numbers is now fraud, not an error. An error
+//! would let the cheater out the same door by another route, because
+//! `audit_round` turns one into `Malformed`, which carries no fraud proof.
 
-use psyche_verifier::AggregationConfig;
-use psyche_verifier::DEFAULT_BAND;
-use psyche_verifier::DEFAULT_SAFETY_FACTOR;
 use psyche_verifier::audit_contribution;
 use psyche_verifier::calibrate_band;
 use psyche_verifier::relative_l2_distance;
 use psyche_verifier::robust_aggregate;
 use psyche_verifier::verify_within_band;
+use psyche_verifier::AggregationConfig;
+use psyche_verifier::DEFAULT_BAND;
+use psyche_verifier::DEFAULT_SAFETY_FACTOR;
 
 fn honest(len: usize) -> Vec<f32> {
     (0..len).map(|i| ((i % 17) as f32) - 8.0).collect()
 }
 
 /// A submission with a single NaN is as far from the honest replay as anything
-/// can be, and is judged honest.
+/// can be, and is convicted.
 #[test]
-fn a_single_nan_is_judged_honest() {
+fn a_single_nan_is_fraud() {
     let recomputed = honest(1024);
     let mut submitted = vec![0.0f32; recomputed.len()];
     submitted[0] = f32::NAN;
 
-    let distance = relative_l2_distance(&submitted, &recomputed).unwrap();
-    assert!(distance.is_nan(), "distance is NaN, not a number to compare");
+    // The distance function reports what is wrong rather than returning a
+    // number nothing can be compared against.
+    assert!(matches!(
+        relative_l2_distance(&submitted, &recomputed),
+        Err(psyche_verifier::VerifierError::NonFiniteSubmission { index: 0 })
+    ));
 
     let verdict = verify_within_band(&submitted, &recomputed, DEFAULT_BAND).unwrap();
     assert!(
-        !verdict.fraud,
-        "BUG: `distance > band` is false for NaN, so the band clears the submission"
+        verdict.fraud,
+        "a delta that is not made of numbers is fraud"
     );
 
-    // And so no fraud proof is produced: there is nothing to take to the chain.
+    // And there is a proof to take to the chain, which is the point: an error
+    // here would be `Malformed` in `audit_round`, carrying nothing.
     let report = audit_contribution(0, &submitted, &recomputed, DEFAULT_BAND).unwrap();
-    assert!(
-        report.proof.is_none(),
-        "BUG: an all-zero delta with one NaN in it produces no fraud proof"
-    );
+    assert!(report.proof.is_some(), "the conviction is provable");
+}
+
+/// A broken replay is the verifier's problem and must not convict the target.
+#[test]
+fn a_non_finite_replay_is_an_error_not_a_conviction() {
+    let submitted = honest(64);
+    let mut recomputed = submitted.clone();
+    recomputed[7] = f32::NAN;
+    assert!(matches!(
+        verify_within_band(&submitted, &recomputed, DEFAULT_BAND),
+        Err(psyche_verifier::VerifierError::NonFiniteReplay { index: 7 })
+    ));
 }
 
 /// The same submission without the NaN - a plain lazy zero - is caught. The NaN
@@ -71,23 +89,26 @@ fn infinity_is_caught() {
     assert!(verdict.fraud, "inf > band is true, so this one is rejected");
 }
 
-/// Calibration silently drops NaN samples, because `f32::max` returns the other
-/// operand when one side is NaN. A drift sample that came back NaN does not
-/// widen the band and does not raise an error either - it just is not there.
+/// Calibration used to drop NaN samples in silence, because `f32::max` returns
+/// the other operand when one side is NaN: the sample neither widened the band
+/// nor raised anything, it just was not there. A measurement that came back as
+/// not-a-number is a broken measurement and the operator should hear about it.
 #[test]
-fn calibration_silently_ignores_a_nan_sample() {
-    let with_nan = calibrate_band(&[0.001, f32::NAN, 0.002], DEFAULT_SAFETY_FACTOR).unwrap();
-    let without = calibrate_band(&[0.001, 0.002], DEFAULT_SAFETY_FACTOR).unwrap();
+fn calibration_reports_a_non_finite_sample() {
+    assert!(calibrate_band(&[0.001, f32::NAN, 0.002], DEFAULT_SAFETY_FACTOR).is_err());
+    assert!(calibrate_band(&[0.001, f32::INFINITY], DEFAULT_SAFETY_FACTOR).is_err());
+    let clean = calibrate_band(&[0.001, 0.002], DEFAULT_SAFETY_FACTOR).unwrap();
     assert_eq!(
-        with_nan, without,
-        "the NaN sample vanishes rather than being reported"
+        clean,
+        0.002 * DEFAULT_SAFETY_FACTOR,
+        "ordinary samples still calibrate off the worst one"
     );
 }
 
 /// What the NaN does downstream, recorded rather than assumed: the aggregator's
 /// keep-mask is built with `distance <= limit`, which is false for NaN, so the
-/// poisoned delta is excised and the aggregate stays finite. The band check is
-/// the layer that fails, not the aggregation.
+/// poisoned delta is excised and the aggregate stays finite. The band check was
+/// the layer that failed, not the aggregation.
 #[test]
 fn the_aggregator_excises_what_the_band_check_waved_through() {
     let base = honest(256);

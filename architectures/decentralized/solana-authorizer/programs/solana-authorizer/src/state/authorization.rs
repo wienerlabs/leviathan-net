@@ -18,6 +18,26 @@ pub struct Authorization {
 impl Authorization {
     pub const SEEDS_PREFIX: &'static [u8] = b"Authorization";
 
+    /// How many keys a grantee may add to its own authorization.
+    ///
+    /// Delegation is a real convenience - one operator, several nodes - but it
+    /// is also the only gate on how many identities a single sponsorship
+    /// produces, and every committee in the protocol is priced in the fraction
+    /// of identities an attacker holds. Uncapped, the join authority approved
+    /// one key and got as many as that key cared to create
+    /// (wienerlabs/leviathan#15, finding 19).
+    ///
+    /// The number is deliberately generous - the same 64 the verdict and appeal
+    /// voter lists use, and well above what `memnet_authorizer_full_cycle`
+    /// exercises - because this is a bound on unbounded growth, not a redesign
+    /// of what delegation is for. Before it, the only limit was Solana's 10 MB
+    /// account ceiling, which is some three hundred thousand keys.
+    ///
+    /// Whether 64 is the right number for a given run's *economics* is the
+    /// operator's call and belongs with the committee sizing in
+    /// `docs/COMMITTEE_ECONOMICS.md`. This only stops the count being unbounded.
+    pub const MAX_DELEGATES: usize = 64;
+
     pub fn space_with_discriminator(
         scope_len: usize,
         delegates_len: usize,

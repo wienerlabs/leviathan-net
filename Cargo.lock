@@ -7201,6 +7201,7 @@ name = "psyche-client"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "chrono",
  "clap",
  "futures",
@@ -7667,6 +7668,7 @@ dependencies = [
  "anchor-lang",
  "anchor-spl",
  "anyhow",
+ "bs58",
  "bytemuck",
  "clap",
  "leviathan-verifier",

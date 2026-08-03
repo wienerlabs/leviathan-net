@@ -15,6 +15,12 @@ pub enum VerifierError {
     InvalidBand(f32),
     #[error("no drift samples to calibrate from")]
     EmptyCalibration,
+    #[error("submitted delta is not finite at index {index}")]
+    NonFiniteSubmission { index: usize },
+    #[error("recomputed delta is not finite at index {index}")]
+    NonFiniteReplay { index: usize },
+    #[error("every drift sample was non-finite")]
+    NonFiniteCalibration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,6 +43,25 @@ pub fn relative_l2_distance(submitted: &[f32], recomputed: &[f32]) -> Result<f32
             recomputed: recomputed.len(),
         });
     }
+    // A NaN anywhere in the submission makes the distance NaN, and every ordered
+    // comparison against NaN is false - so `distance > band` was false and the
+    // submission was judged honest. The submitted delta is the one input a
+    // cheating node fully controls, so the check has to happen before there is a
+    // distance to compare (wienerlabs/leviathan#15, finding 18).
+    //
+    // Infinity was always caught, which is why this survived a casual look at
+    // how the band handles garbage.
+    for (index, value) in submitted.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(VerifierError::NonFiniteSubmission { index });
+        }
+    }
+    for (index, value) in recomputed.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(VerifierError::NonFiniteReplay { index });
+        }
+    }
+
     let mut diff_sq = 0.0f64;
     let mut ref_sq = 0.0f64;
     for (s, r) in submitted.iter().zip(recomputed.iter()) {
@@ -56,7 +81,19 @@ pub fn verify_within_band(
     if !band.is_finite() || band < 0.0 {
         return Err(VerifierError::InvalidBand(band));
     }
-    let distance = relative_l2_distance(submitted, recomputed)?;
+    let distance = match relative_l2_distance(submitted, recomputed) {
+        Ok(distance) => distance,
+        // A submission that is not made of numbers is not the honest replay, so
+        // it is fraud - the easiest verdict in the system, and the one it used
+        // to be unable to reach. Reporting it as an error instead would let the
+        // cheater out the same door by another route: `audit_round` turns an
+        // error into `Malformed`, which produces no fraud proof and so no
+        // verdict, no quorum and no slash (finding 18).
+        Err(VerifierError::NonFiniteSubmission { .. }) => f32::INFINITY,
+        // A replay that is not made of numbers is this verifier's problem, not
+        // the target's, and must not convict anyone.
+        Err(other) => return Err(other),
+    };
     Ok(BandVerdict {
         distance,
         band,
@@ -67,6 +104,13 @@ pub fn verify_within_band(
 pub fn calibrate_band(drift_distances: &[f32], safety_factor: f32) -> Result<f32, VerifierError> {
     if drift_distances.is_empty() {
         return Err(VerifierError::EmptyCalibration);
+    }
+    // `f32::max` returns the other operand when one side is NaN, so a broken
+    // sample used to vanish from the calibration rather than widen the band or
+    // raise anything. A measurement that came back as not-a-number is a broken
+    // measurement and the operator should hear about it (finding 18).
+    if drift_distances.iter().any(|d| !d.is_finite()) {
+        return Err(VerifierError::NonFiniteCalibration);
     }
     let worst = drift_distances
         .iter()

@@ -211,8 +211,12 @@ pub mod psyche_solana_coordinator {
             return err!(ProgramError::UpdateConfigNotHalted);
         }
 
+        // Truncating, the way `init_coordinator` writes the same field. It used
+        // to `unwrap` a `try_from`, so a version string over 96 bytes aborted
+        // the transaction: one field, two behaviours, and an unwrap on caller
+        // data in on-chain code (wienerlabs/leviathan#15, finding 23).
         account.state.client_version =
-            FixedString::<96>::try_from(new_version.as_str()).unwrap();
+            FixedString::from_str_truncated(&new_version);
         msg!("new version: {}", account.state.client_version);
         Ok(())
     }

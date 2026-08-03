@@ -11,19 +11,30 @@ pub struct MerkleHash {
 }
 
 impl MerkleHash {
+    /// Tags a leaf preimage, so a leaf can never be mistaken for a node.
+    ///
+    /// Without it the two are drawn from the same hash and the only thing
+    /// separating them is that an allocation happens to be 60 bytes wide while a
+    /// node is 64. Four more bytes of allocation and a claimer could present an
+    /// internal node as its own leaf and drain the airdrop
+    /// (wienerlabs/leviathan#15, finding 22).
+    const LEAF_DOMAIN: [u8; 1] = [0x00];
+    /// Tags an internal node preimage.
+    const NODE_DOMAIN: [u8; 1] = [0x01];
+
     pub fn from_parts(parts: &[&[u8]]) -> MerkleHash {
+        let mut tagged: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+        tagged.push(&Self::LEAF_DOMAIN);
+        tagged.extend_from_slice(parts);
         MerkleHash {
-            bytes: hashv(parts).to_bytes(),
+            bytes: hashv(&tagged).to_bytes(),
         }
     }
 
     pub fn from_pair(a: &MerkleHash, b: &MerkleHash) -> MerkleHash {
+        let (low, high) = if a.bytes <= b.bytes { (a, b) } else { (b, a) };
         MerkleHash {
-            bytes: if a.bytes <= b.bytes {
-                hashv(&[&a.bytes, &b.bytes]).to_bytes()
-            } else {
-                hashv(&[&b.bytes, &a.bytes]).to_bytes()
-            },
+            bytes: hashv(&[&Self::NODE_DOMAIN, &low.bytes, &high.bytes]).to_bytes(),
         }
     }
 
@@ -53,28 +64,36 @@ mod tests {
     use crate::state::Allocation;
     use crate::state::Vesting;
 
-    /// An internal node is nothing but `from_parts` over two 32-byte halves, so
-    /// a leaf and a node come out of the same hash with no tag telling them
-    /// apart. Recorded during the internal review (wienerlabs/leviathan#15).
+    /// A leaf and a node are now different hashes of the same bytes, so the
+    /// separation no longer rests on an allocation happening to be 60 bytes wide
+    /// while a node is 64 (wienerlabs/leviathan#15, finding 22).
     #[test]
-    fn a_node_is_from_parts_over_sixty_four_bytes() {
+    fn a_leaf_and_a_node_over_the_same_bytes_differ() {
         let a = MerkleHash { bytes: [0x11; 32] };
         let b = MerkleHash { bytes: [0x22; 32] };
         let node = MerkleHash::from_pair(&a, &b);
-        // `from_pair` sorts, and 0x11.. < 0x22.., so the preimage is a then b.
-        let same = MerkleHash::from_parts(&[&a.bytes, &b.bytes]);
-        assert_eq!(
-            node, same,
-            "a node hash is reachable from the leaf constructor given 64 bytes"
+        // `from_pair` sorts, so this is the same 64 bytes in the same order.
+        let leaf = MerkleHash::from_parts(&[&a.bytes, &b.bytes]);
+        assert_ne!(
+            node, leaf,
+            "the domain tag keeps the leaf constructor away from node hashes"
         );
     }
 
-    /// What keeps that from being exploitable today is only the width of an
-    /// allocation: 60 bytes of preimage against a node's 64. Nothing states the
-    /// dependency and nothing enforces it, so four more bytes of allocation
-    /// would let a claimer present an internal node as their own leaf.
+    /// So an allocation that is exactly as wide as a node - which four more
+    /// bytes of fields would make it - still cannot collide with one.
     #[test]
-    fn an_allocation_preimage_is_four_bytes_short_of_a_node() {
+    fn a_leaf_the_width_of_a_node_still_cannot_be_one() {
+        let a = MerkleHash { bytes: [0x33; 32] };
+        let b = MerkleHash { bytes: [0x44; 32] };
+        let sixty_four_byte_leaf = MerkleHash::from_parts(&[&a.bytes, &b.bytes]);
+        assert_ne!(sixty_four_byte_leaf, MerkleHash::from_pair(&a, &b));
+    }
+
+    /// The tree still works: a real allocation proves against a root built the
+    /// way the airdrop builds it.
+    #[test]
+    fn an_honest_allocation_still_proves() {
         let allocation = Allocation {
             claimer: Pubkey::new_unique(),
             nonce: 7,
@@ -84,17 +103,11 @@ mod tests {
                 end_collateral_amount: 3,
             },
         };
-        // The parts `to_merkle_hash` feeds in, in order.
-        let preimage_len = allocation.claimer.as_ref().len()
-            + allocation.nonce.to_le_bytes().len()
-            + allocation.vesting.start_unix_timestamp.to_le_bytes().len()
-            + allocation.vesting.duration_seconds.to_le_bytes().len()
-            + allocation.vesting.end_collateral_amount.to_le_bytes().len();
-        assert_eq!(preimage_len, 60);
-        assert_ne!(
-            preimage_len, 64,
-            "a node preimage is 64 bytes; that difference is the whole separation"
-        );
+        let leaf = allocation.to_merkle_hash();
+        let sibling = MerkleHash { bytes: [0x55; 32] };
+        let root = MerkleHash::from_pair(&leaf, &sibling);
+        assert!(root.is_valid_proof(&leaf, &[sibling.clone()]));
+        assert!(!root.is_valid_proof(&sibling, &[sibling.clone()]));
     }
 
     /// An empty proof is accepted and degenerates to `leaf == root`. That is
