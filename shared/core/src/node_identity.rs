@@ -61,23 +61,28 @@ impl NodeIdentity {
     }
 }
 
+/// The leading characters of the signer's address, in base58.
+///
+/// Short enough to keep a log line readable, and base58 rather than hex because
+/// that is what the operator's wallet shows them: an operator scanning for their
+/// own node matches these characters against the address they already know. The
+/// hex of the same bytes matches nothing they have.
+fn signer_prefix(signer: &[u8; 32]) -> String {
+    let address = Pubkey::from(*signer).to_string();
+    address.chars().take(8).collect()
+}
+
 impl Display for NodeIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Display first 4 bytes of signer as hex
-        for b in &self.signer[..4] {
-            write!(f, "{:02x}", b)?;
-        }
-        Ok(())
+        write!(f, "{}", signer_prefix(&self.signer))
     }
 }
 
 impl Debug for NodeIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NodeIdentity(")?;
-        for b in &self.signer[..4] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "/")?;
+        // The signer is a Solana address and the p2p identity is an iroh key, so
+        // each is printed the way its own tooling prints it: base58 and hex.
+        write!(f, "NodeIdentity({}/", signer_prefix(&self.signer))?;
         for b in &self.p2p_identity[..4] {
             write!(f, "{:02x}", b)?;
         }
@@ -87,4 +92,33 @@ impl Debug for NodeIdentity {
 
 impl Space for NodeIdentity {
     const INIT_SPACE: usize = 64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real devnet participant: address 8tcQfLmW1ucG5ohoDf3fci8vRz3Kspviu5bKsTm628Un.
+    const SIGNER: [u8; 32] = [
+        0x75, 0x3a, 0x77, 0x34, 0x61, 0x0d, 0x5e, 0xbf, 0x81, 0xb6, 0x4d, 0xc2, 0xc9, 0xaa, 0xd5,
+        0x5b, 0xb2, 0xaa, 0xe3, 0x6c, 0x68, 0x45, 0x7a, 0x82, 0x82, 0xe2, 0x41, 0x30, 0x3c, 0x5f,
+        0xca, 0xbf,
+    ];
+
+    #[test]
+    fn display_matches_what_the_wallet_shows() {
+        let id = NodeIdentity::new(SIGNER, [0xce; 32]);
+        // The operator's wallet shows 8tcQfLmW1ucG…, so a log line saying
+        // 8tcQfLmW is one they recognise. 753a7734 is the same bytes in an
+        // encoding that appears nowhere else they look.
+        assert_eq!(id.to_string(), "8tcQfLmW");
+        assert!(Pubkey::from(SIGNER).to_string().starts_with(&id.to_string()));
+    }
+
+    #[test]
+    fn debug_keeps_the_p2p_key_in_its_own_encoding() {
+        let id = NodeIdentity::new(SIGNER, [0xce; 32]);
+        // iroh prints endpoint ids as hex, so the p2p half stays hex.
+        assert_eq!(format!("{id:?}"), "NodeIdentity(8tcQfLmW/cececece)");
+    }
 }
