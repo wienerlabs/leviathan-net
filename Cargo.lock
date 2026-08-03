@@ -5002,6 +5002,7 @@ name = "leviathan-indexer"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "bytemuck",
  "clap",
  "psyche-coordinator",

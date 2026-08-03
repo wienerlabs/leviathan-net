@@ -74,8 +74,11 @@ pub fn assess_security(audit_probability: f64, economics: &RunEconomics) -> Secu
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+// Base58, because that is what a Solana address is everywhere else: what the
+// operator's wallet shows them, what an explorer takes, what they can match
+// against their own key. Hex is the same 32 bytes and recognisable to nobody.
+fn address(bytes: &[u8]) -> String {
+    bs58::encode(bytes).into_string()
 }
 
 pub fn compute_telemetry(
@@ -91,7 +94,7 @@ pub fn compute_telemetry(
     let mut leaderboard: Vec<ClientEntry> = on_chain_clients
         .iter()
         .map(|c| ClientEntry {
-            signer: hex(c.id.signer()),
+            signer: address(c.id.signer()),
             earned: c.earned,
             slashed: c.slashed,
         })

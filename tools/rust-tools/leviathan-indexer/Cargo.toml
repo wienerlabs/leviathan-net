@@ -15,6 +15,7 @@ required-features = ["live"]
 live = ["dep:tokio", "dep:anyhow", "dep:clap", "dep:solana-sdk", "dep:solana_toolbox_endpoint", "dep:psyche-solana-tooling"]
 
 [dependencies]
+bs58 = "0.5"
 serde = { workspace = true }
 serde_json.workspace = true
 psyche-core.workspace = true
