@@ -24,39 +24,59 @@ behaviour; run them with `cargo test -p psyche-solana-tooling` and
 
 ## Summary
 
-| # | Finding | Severity | Bounty class | Reproduced |
-|---|---|---|---|---|
-| 25 | Heap out-of-bounds read from a peer-chosen tensor shape | Critical | — | yes |
-| 1 | Epoch-end accounting silently drops a conviction | Critical | B | yes |
-| 2 | Bounty recipient is unvalidated when the verdict is omitted | Critical | B | yes |
-| 3 | Votes from different rounds are pooled into one quorum | High | — | yes |
-| 26 | The commitment hash does not cover how the bytes are read | High | — | yes |
-| 4 | Daemon and chain disagree on who is a verifier | High | A (enables) | yes |
-| 15 | An unvalidated warmup witness index panics every later witness | High | — | yes |
-| 5 | `run_finalize_slash` trusts a stale client index | High | — | no |
-| 6 | `reset_for_epoch` destroys an appeal and an unfinished settlement | Medium-High | — | no |
-| 7 | The appeal bench may contain the verifiers it is judging | Medium | — | no |
-| 8 | A losing verifier escapes forfeit by leaving the epoch | Medium | — | no |
-| 9 | No evidence consensus; the last voter overwrites the record | Medium | — | no |
-| 10 | A challenged verdict has no deadline | Medium | — | no |
-| 11 | Quorum can be one | Low | — | no |
-| 12 | The voter cap can sit below quorum at scale | Low | — | no |
-| 13 | Borsh accounts are sized with `std::mem::size_of` | Low | — | no |
-| 14 | Slashing points and collateral units are coupled by convention | Info | — | no |
-| 18 | A NaN submission is judged honest by the band check | High | A | yes |
-| 19 | A grantee extends the join gate without the grantor | Medium | — | yes |
-| 20 | The audit pipeline joins clients on a truncated display string | Medium | — | no |
-| 27 | The one-bit deserialisation branch panics where the other errors | Medium | — | yes |
-| 28 | `xshape` is an unbounded allocation size taken from one peer | Medium | — | no |
-| 17 | The withdraw delay is read at finalise time, so it can be revoked | Low | — | no |
-| 21 | Data assignment asserts that no round reserves tie-breakers | Low | — | yes |
-| 22 | Merkle leaf and node are separated only by preimage length | Low | — | yes |
-| 23 | `update_client_version` unwraps on a caller-supplied length | Low | — | no |
-| 24 | `lender_claim` adds two u64 before widening | Low | — | no |
-| 16 | The disclosure channel SECURITY.md names does not exist | Process | — | n/a |
+| # | Finding | Severity | Bounty class | Reproduced | Fixed |
+|---|---|---|---|---|---|
+| 25 | Heap out-of-bounds read from a peer-chosen tensor shape | Critical | — | yes | yes |
+| 1 | Epoch-end accounting silently drops a conviction | Critical | B | yes | yes |
+| 2 | Bounty recipient is unvalidated when the verdict is omitted | Critical | B | yes | yes |
+| 3 | Votes from different rounds are pooled into one quorum | High | — | yes | yes |
+| 26 | The commitment hash does not cover how the bytes are read | High | — | yes | yes |
+| 4 | Daemon and chain disagree on who is a verifier | High | A (enables) | yes | yes |
+| 15 | An unvalidated warmup witness index panics every later witness | High | — | yes | yes |
+| 5 | `run_finalize_slash` trusts a stale client index | High | — | no | yes |
+| 6 | `reset_for_epoch` destroys an appeal and an unfinished settlement | Medium-High | — | no | yes |
+| 7 | The appeal bench may contain the verifiers it is judging | Medium | — | no | yes |
+| 8 | A losing verifier escapes forfeit by leaving the epoch | Medium | — | no | yes |
+| 9 | No evidence consensus; the last voter overwrites the record | Medium | — | no | yes |
+| 10 | A challenged verdict has no deadline | Medium | — | no | yes |
+| 11 | Quorum can be one | Low | — | no | yes |
+| 12 | The voter cap can sit below quorum at scale | Low | — | no | yes |
+| 13 | Borsh accounts are sized with `std::mem::size_of` | Low | — | no | yes |
+| 14 | Slashing points and collateral units are coupled by convention | Info | — | no | yes |
+| 18 | A NaN submission is judged honest by the band check | High | A | yes | yes |
+| 19 | A grantee extends the join gate without the grantor | Medium | — | yes | yes |
+| 20 | The audit pipeline joins clients on a truncated display string | Medium | — | no | yes |
+| 27 | The one-bit deserialisation branch panics where the other errors | Medium | — | yes | yes |
+| 28 | `xshape` is an unbounded allocation size taken from one peer | Medium | — | no | yes |
+| 17 | The withdraw delay is read at finalise time, so it can be revoked | Low | — | no | yes |
+| 21 | Data assignment asserts that no round reserves tie-breakers | Low | — | yes | yes |
+| 22 | Merkle leaf and node are separated only by preimage length | Low | — | yes | yes |
+| 23 | `update_client_version` unwraps on a caller-supplied length | Low | — | no | yes |
+| 24 | `lender_claim` adds two u64 before widening | Low | — | no | yes |
+| 16 | The disclosure channel SECURITY.md names does not exist | Process | — | n/a | setting |
 
 Sections below run in numeric order; the table is sorted by severity, so the
 numbers are identifiers rather than a reading order.
+
+**Every finding here is fixed.** The fixes are in the same branch as this
+report, each commit naming the findings it closes, and every test that
+documented a defect now holds the behaviour that replaced it. Finding 16 is a
+repository setting rather than code and is the one thing still outstanding.
+
+Three of the fixes change formats and cannot be rolled out piecemeal:
+
+- The commitment hash (26) now covers the fields that say how a payload's bytes
+  are read. An old sender's hash will not match a new receiver's recomputation,
+  so every node in a run moves together; the payload is dropped rather than
+  misread in the meantime.
+- `AuditVerdict`, `Run` and `Participant` gain fields (3, 10, 13, 17), so
+  accounts written by the old program are not readable by the new one. Devnet
+  is redeployed, not upgraded in place.
+- Gradient dumps are named with the whole signer (20), so a daemon and the
+  clients it audits have to be upgraded together or the daemon audits nothing.
+
+The airdrop merkle tree is domain-tagged (22), which changes every leaf hash, so
+any published root has to be regenerated.
 
 Findings 1 and 2 are Class B under `docs/REDTEAM_BOUNTY.md` — "recover bonded
 collateral after conviction ... or finalise a withdraw that should have
