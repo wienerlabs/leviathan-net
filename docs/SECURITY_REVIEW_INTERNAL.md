@@ -996,15 +996,15 @@ which the receiver knows independently and never consults. Derive the shape from
 local state rather than accepting it from a peer at all, if that is possible
 here.
 
-## 29. The shape gap is already marked in the code (Info)
+## 29. The shape gap was already marked in the code (Info)
 
 *Third pass.*
 
-`shared/client/src/state/steps.rs:601` reads `// TODO: verify shape of
+`shared/client/src/state/steps.rs` carried `// TODO: verify shape of
 distro_results`, on the line after the commitment lookup and before the payload
-is deserialised and used. Findings 25, 26 and 28 are all downstream of that one
-comment. Recorded so the fix can close the TODO rather than leaving it to be
-rediscovered.
+was deserialised and used. Findings 25, 26 and 28 were all downstream of that
+one comment. The fix closes it: the comment now records where the shape is
+checked instead of noting that it is not.
 
 ## 16. The disclosure channel SECURITY.md names does not exist (Process)
 

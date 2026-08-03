@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use tch::{Device, Kind, TchError, Tensor};
 
@@ -24,6 +25,42 @@ impl SerializableTensor {
             SerializableTensorData::Full(items) => items,
             SerializableTensorData::OneBit(items) => items,
         }
+    }
+
+    /// Feeds every field into a commitment hash.
+    ///
+    /// The bytes alone do not say how they are to be read, and the fields that
+    /// do say - the shape, the dtype, which of the two encodings this is - decide
+    /// what gradient comes out the other end. A commitment that leaves them out
+    /// does not bind what the receiver computes (wienerlabs/leviathan#15,
+    /// finding 26).
+    ///
+    /// The destructuring is the point: adding a field to this struct without
+    /// deciding whether it belongs in the commitment will not compile.
+    pub fn hash_into(&self, hasher: &mut Sha256) {
+        let SerializableTensor {
+            dims,
+            kind,
+            requires_grad,
+            data,
+        } = self;
+
+        hasher.update((dims.len() as u64).to_be_bytes());
+        for dim in dims {
+            hasher.update(dim.to_be_bytes());
+        }
+        hasher.update([crate::serializable_kind::kind_to_u8(&kind.clone().into_inner())]);
+        hasher.update([u8::from(*requires_grad)]);
+
+        // The encoding tag matters as much as the bytes: the same buffer read as
+        // packed bits and as raw values is two different tensors.
+        let (tag, bytes) = match data {
+            SerializableTensorData::Full(bytes) => (0u8, bytes),
+            SerializableTensorData::OneBit(bytes) => (1u8, bytes),
+        };
+        hasher.update([tag]);
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
     }
 }
 
@@ -100,41 +137,96 @@ impl TryFrom<&Tensor> for SerializableTensor {
     }
 }
 
+/// How many elements `dims` describes, or an error if it describes something a
+/// tensor cannot be.
+///
+/// Every one of these numbers arrives from a peer, so this is checked
+/// arithmetic: a negative dimension is not a shape, and a product that leaves
+/// `i64` is not a size. Neither can be handed on to libtorch, which takes the
+/// element count on trust and reads that far.
+fn element_count(dims: &[i64]) -> Result<i64, TchError> {
+    let mut count: i64 = 1;
+    for dim in dims {
+        if *dim < 0 {
+            return Err(TchError::Shape(format!(
+                "negative dimension {dim} in shape {dims:?}"
+            )));
+        }
+        count = count.checked_mul(*dim).ok_or_else(|| {
+            TchError::Shape(format!("shape {dims:?} overflows the element count"))
+        })?;
+    }
+    Ok(count)
+}
+
 impl TryFrom<&SerializableTensor> for Tensor {
     type Error = TchError;
 
     fn try_from(value: &SerializableTensor) -> Result<Self, Self::Error> {
+        let elements = element_count(&value.dims)?;
         let tensor = match &value.data {
             SerializableTensorData::Full(data) => {
-                Tensor::f_from_data_size(data, &value.dims, (&value.kind).into())?
+                // `f_from_data_size` passes the pointer and drops the length, and
+                // libtorch then copies `elements * elt_size` bytes from it. The
+                // buffer has to be measured here or not at all.
+                let kind: Kind = (&value.kind).into();
+                let needed = elements
+                    .checked_mul(kind.elt_size_in_bytes() as i64)
+                    .ok_or_else(|| {
+                        TchError::Shape(format!(
+                            "shape {:?} of {kind:?} overflows a byte count",
+                            value.dims
+                        ))
+                    })?;
+                if data.len() as i64 != needed {
+                    return Err(TchError::Shape(format!(
+                        "shape {:?} of {kind:?} needs {needed} bytes, got {}",
+                        value.dims,
+                        data.len()
+                    )));
+                }
+                Tensor::f_from_data_size(data, &value.dims, kind)?
             }
             SerializableTensorData::OneBit(bytes) => {
+                // One bit per element, so the buffer has to hold at least that
+                // many bits. The rounding up is the sender's padding.
+                let needed_bytes = elements
+                    .checked_add(7)
+                    .ok_or_else(|| TchError::Shape("bit count overflows".to_string()))?
+                    / 8;
+                if (bytes.len() as i64) < needed_bytes {
+                    return Err(TchError::Shape(format!(
+                        "shape {:?} needs {needed_bytes} packed bytes, got {}",
+                        value.dims,
+                        bytes.len()
+                    )));
+                }
+
                 // packed bytes are just a flat 1d slice of bits
-                let packed = Tensor::from_slice(bytes).to_kind(Kind::Uint8);
+                let packed = Tensor::f_from_slice(bytes)?.f_to_kind(Kind::Uint8)?;
 
                 // make a tensor of bit weights (LSB first) to unpack
                 let bit_weights =
-                    Tensor::from_slice(&[1u8, 2, 4, 8, 16, 32, 64, 128]).to_kind(Kind::Uint8);
+                    Tensor::f_from_slice(&[1u8, 2, 4, 8, 16, 32, 64, 128])?.f_to_kind(Kind::Uint8)?;
 
                 // reshape packed to [..., 1] for broadcasting
-                let reshaped_packed = packed.reshape([-1, 1]);
+                let reshaped_packed = packed.f_reshape([-1, 1])?;
 
                 // unpack bits
                 let bits = reshaped_packed
-                    .bitwise_and_tensor(&bit_weights)
-                    .to_kind(Kind::Bool);
+                    .f_bitwise_and_tensor(&bit_weights)?
+                    .f_to_kind(Kind::Bool)?;
 
                 // flatten, select needed bits, and reshape
-                let flat_bits = bits.flatten(0, -1);
-                let total_elements: i64 = value.dims.iter().product();
-                let needed_bits = flat_bits.slice(0, 0, total_elements, 1);
+                let flat_bits = bits.f_flatten(0, -1)?;
+                let needed_bits = flat_bits.f_slice(0, 0, elements, 1)?;
 
-                needed_bits.reshape(&value.dims)
+                needed_bits.f_reshape(&value.dims)?
             }
         };
 
         Ok(if value.requires_grad {
-            tensor.set_requires_grad(true)
+            tensor.f_set_requires_grad(true)?
         } else {
             tensor
         })
@@ -293,87 +385,107 @@ mod hostile_input_tests {
         }
     }
 
-    /// The `Full` path does not check that the declared shape fits the bytes
-    /// that arrived. `f_from_data_size` passes only a raw pointer to libtorch -
-    /// the slice length is dropped - and `at_tensor_of_data` then memcpys
-    /// `numel * element_size` bytes from it. Both `dims` and `kind` come off the
-    /// wire, so a peer chooses how far past the buffer that read goes.
+    /// `f_from_data_size` hands libtorch a pointer and drops the slice length;
+    /// `at_tensor_of_data` then copies `numel * element_size` bytes from it. A
+    /// declared shape larger than the buffer is a read past the end of that
+    /// buffer, so the length has to be compared here, before the pointer leaves
+    /// Rust. wienerlabs/leviathan#15, finding 25.
     #[test]
-    fn full_path_accepts_a_shape_larger_than_the_bytes_that_arrived() {
+    fn a_shape_larger_than_the_bytes_is_refused() {
         let sixteen_bytes_claiming_a_thousand_floats = from_wire(
             vec![1000],
             Kind::Float,
             SerializableTensorData::Full(vec![0u8; 16]),
         );
-        let tensor = Tensor::try_from(&sixteen_bytes_claiming_a_thousand_floats)
-            .expect("BUG: 16 bytes are accepted as 1000 floats");
-        assert_eq!(
-            tensor.numel(),
-            1000,
-            "BUG: libtorch was told to copy 4000 bytes out of a 16-byte buffer"
-        );
+        let err = Tensor::try_from(&sixteen_bytes_claiming_a_thousand_floats)
+            .expect_err("16 bytes are not 1000 floats");
+        assert!(format!("{err:?}").contains("needs 4000 bytes"));
     }
 
-    /// The same call, arranged so the memory past the buffer is known rather
-    /// than arbitrary: the pointer handed over belongs to a longer allocation
-    /// whose tail is a fixed pattern. Every element past the fourth is read from
-    /// bytes that were never part of the slice, and comes back as that pattern.
+    /// The overshoot that matters is the small one - large enough to read
+    /// adjacent heap, small enough not to fault - so it is refused too.
     #[test]
-    fn the_read_runs_past_the_slice_it_was_given() {
-        // 0xAA repeated is -3.0316488e-13 when four of them are read as an f32.
-        // The first sixteen bytes - the part we actually hand over - are zero,
-        // so the two regions are told apart by their contents.
-        let mut backing = vec![0xAAu8; 4096];
-        backing[..16].fill(0);
-        let handed_over = &backing[..16]; // four floats, and that is all we pass
-        let tensor = Tensor::f_from_data_size(handed_over, &[64], Kind::Float)
-            .expect("the length of the slice is never checked");
-        let values: Vec<f32> = Vec::<f32>::try_from(&tensor).unwrap();
-        assert_eq!(values.len(), 64);
-        assert_eq!(values[0], 0.0, "the four floats we did pass are zero");
-        assert_eq!(values[3], 0.0);
-        let pattern = f32::from_le_bytes([0xAA; 4]);
-        assert_eq!(
-            values[4], pattern,
-            "BUG: element 4 was read from memory past the end of the slice"
+    fn a_shape_that_overshoots_by_a_little_is_refused_as_well() {
+        let four_floats_claiming_sixty_four = from_wire(
+            vec![64],
+            Kind::Float,
+            SerializableTensorData::Full(vec![0u8; 16]),
         );
-        assert!(
-            values[4..].iter().all(|v| *v == pattern),
-            "BUG: 240 bytes beyond the buffer are copied into the tensor"
-        );
+        assert!(Tensor::try_from(&four_floats_claiming_sixty_four).is_err());
     }
 
-    /// The `OneBit` path does not: it reaches for panicking tch calls, so the
-    /// same class of mismatch aborts the thread instead of returning
-    /// `Err(TchError)` for the caller to handle. Recorded in the third pass of
-    /// the internal review (wienerlabs/leviathan#15).
+    /// Trailing bytes are refused as well as missing ones: the shape and the
+    /// buffer have to agree exactly, so there is no slack for a sender to hide
+    /// anything in.
     #[test]
-    fn one_bit_path_panics_where_the_full_path_would_have_errored() {
-        let one_byte_claiming_a_thousand_bits =
-            from_wire(vec![1000], Kind::Bool, SerializableTensorData::OneBit(vec![0xFFu8]));
-        let outcome = std::panic::catch_unwind(|| {
-            Tensor::try_from(&one_byte_claiming_a_thousand_bits)
-        });
-        assert!(
-            outcome.is_err(),
-            "BUG: the OneBit branch panics rather than returning Err, so its \
-             errors are not the caller's to handle"
+    fn extra_bytes_are_refused_too() {
+        let too_many = from_wire(
+            vec![2],
+            Kind::Float,
+            SerializableTensorData::Full(vec![0u8; 64]),
         );
+        assert!(Tensor::try_from(&too_many).is_err());
     }
 
-    /// Same asymmetry reached through an overflowing shape rather than a short
-    /// buffer: `dims.iter().product()` is computed on numbers a peer chose.
+    /// A shape whose product leaves `i64` is rejected before anything is
+    /// multiplied out, rather than wrapping into a small number that passes.
     #[test]
-    fn one_bit_path_panics_on_a_shape_whose_product_overflows() {
+    fn an_overflowing_shape_is_refused() {
         let overflowing = from_wire(
             vec![i64::MAX, 4],
             Kind::Bool,
             SerializableTensorData::OneBit(vec![0x00u8; 8]),
         );
-        let outcome = std::panic::catch_unwind(|| Tensor::try_from(&overflowing));
-        assert!(
-            outcome.is_err(),
-            "BUG: an overflowing dimension product is not rejected, it aborts"
+        let err = Tensor::try_from(&overflowing).expect_err("the product overflows");
+        assert!(format!("{err:?}").contains("overflows"));
+    }
+
+    /// A negative dimension is not a shape.
+    #[test]
+    fn a_negative_dimension_is_refused() {
+        let negative = from_wire(
+            vec![-1, 4],
+            Kind::Float,
+            SerializableTensorData::Full(vec![0u8; 16]),
         );
+        let err = Tensor::try_from(&negative).expect_err("-1 is not a dimension");
+        assert!(format!("{err:?}").contains("negative dimension"));
+    }
+
+    /// The one-bit branch now fails the way the other one does - an `Err` the
+    /// caller can act on - instead of panicking out of the thread. finding 27.
+    #[test]
+    fn the_one_bit_branch_returns_an_error_rather_than_panicking() {
+        let one_byte_claiming_a_thousand_bits = from_wire(
+            vec![1000],
+            Kind::Bool,
+            SerializableTensorData::OneBit(vec![0xFFu8]),
+        );
+        let outcome =
+            std::panic::catch_unwind(|| Tensor::try_from(&one_byte_claiming_a_thousand_bits));
+        let result = outcome.expect("no panic escapes the conversion any more");
+        assert!(result.is_err(), "it reports the mismatch instead");
+    }
+
+    /// Honest payloads still round-trip, including the bit-packed ones whose
+    /// buffer is padded up to a whole byte.
+    #[test]
+    fn honest_payloads_still_round_trip() {
+        for dims in [vec![4i64], vec![2, 2], vec![1, 3, 5]] {
+            let n: i64 = dims.iter().product();
+            let floats = Tensor::from_slice(&vec![1.5f32; n as usize])
+                .to_kind(Kind::Float)
+                .reshape(&dims);
+            let wire = SerializableTensor::try_from(&floats).unwrap();
+            let back = Tensor::try_from(&wire).unwrap();
+            assert!(back.equal(&floats), "float round-trip for {dims:?}");
+
+            let bools = Tensor::from_slice(&vec![1i64; n as usize])
+                .to_kind(Kind::Bool)
+                .reshape(&dims);
+            let wire = SerializableTensor::try_from(&bools).unwrap();
+            let back = Tensor::try_from(&wire).unwrap();
+            assert!(back.equal(&bools), "bool round-trip for {dims:?}");
+        }
     }
 }

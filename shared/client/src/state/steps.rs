@@ -597,7 +597,10 @@ impl StepStateMachine {
             return;
         };
 
-        // TODO: verify shape of distro_results
+        // The shape is verified, but not here: the commitment hash now covers
+        // dims, dtype, encoding, xshape and totalk, so the check below rejects a
+        // payload whose shape is not the one that was signed for. Deserialising
+        // it then bounds every one of those against what a tensor can be.
         let commitment = commitment.1.0;
         let batch_ids_not_yet_trained_on = round_state.batch_ids_not_yet_trained_on.clone();
         let blooms = round_state.blooms.clone();

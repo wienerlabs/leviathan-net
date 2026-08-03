@@ -30,14 +30,50 @@ pub struct TransmittableDistroResult {
 }
 
 impl TransmittableDistroResult {
+    /// The hash a sender signs and a receiver checks a download against.
+    ///
+    /// It has to cover everything that decides what gradient comes out of this
+    /// payload, not only the tensor bytes: the shape, the dtype and the
+    /// encoding say how the bytes are read, and `xshape` and `totalk` are what
+    /// `CompressDCT::decompress` rebuilds with. Leaving them out let a sender
+    /// commit to one payload and hand over another that decompressed
+    /// differently and still verified (wienerlabs/leviathan#15, finding 26).
+    ///
+    /// Lengths go in ahead of anything variable, so one run of bytes divided
+    /// into results one way cannot hash the same as the same run divided
+    /// another way.
+    ///
+    /// Both structs are destructured rather than read field by field: a new
+    /// field is then a compile error here, not a silent hole in the commitment.
     pub fn comptue_hash(&self) -> [u8; 32] {
+        let TransmittableDistroResult {
+            step,
+            trainer_nonce,
+            batch_id,
+            distro_results,
+        } = self;
+
         let mut hasher = Sha256::new();
-        hasher.update(self.step.to_be_bytes());
-        hasher.update(self.batch_id.0.start.to_be_bytes());
-        hasher.update(self.batch_id.0.end.to_be_bytes());
-        for result in &self.distro_results {
-            hasher.update(result.sparse_idx.raw_tensor_data());
-            hasher.update(result.sparse_val.raw_tensor_data());
+        hasher.update(step.to_be_bytes());
+        hasher.update(trainer_nonce.to_be_bytes());
+        hasher.update(batch_id.0.start.to_be_bytes());
+        hasher.update(batch_id.0.end.to_be_bytes());
+        hasher.update((distro_results.len() as u64).to_be_bytes());
+
+        for result in distro_results {
+            let SerializedDistroResult {
+                sparse_idx,
+                sparse_val,
+                xshape,
+                totalk,
+            } = result;
+            sparse_idx.hash_into(&mut hasher);
+            sparse_val.hash_into(&mut hasher);
+            hasher.update((xshape.len() as u64).to_be_bytes());
+            for dim in xshape {
+                hasher.update(dim.to_be_bytes());
+            }
+            hasher.update(totalk.to_be_bytes());
         }
         hasher.finalize().into()
     }
@@ -67,6 +103,51 @@ impl TryFrom<&DistroResult> for SerializedDistroResult {
     }
 }
 
+/// The most dimensions a parameter tensor is allowed to claim. Real ones have
+/// two or three; this leaves room and still bounds the rank.
+pub const MAX_XSHAPE_RANK: usize = 8;
+
+/// The most elements a parameter tensor is allowed to claim. `xshape` is a
+/// `Vec<u16>` off the wire and `CompressDCT::decompress` opens by allocating
+/// `Tensor::zeros(xshape)`, so without a ceiling three entries of 65535 ask the
+/// receiver for about a petabyte (wienerlabs/leviathan#15, finding 28).
+///
+/// A better bound is the shape the receiver's own model says this parameter
+/// has, which it knows and never consults. Until that is threaded through, this
+/// is the ceiling: generous next to any real parameter, finite next to what a
+/// peer can ask for.
+pub const MAX_XSHAPE_ELEMENTS: i64 = 1 << 32;
+
+/// Checks a peer-supplied parameter shape before anything allocates from it.
+pub fn validate_xshape(xshape: &[u16]) -> Result<Vec<i64>, tch::TchError> {
+    if xshape.is_empty() {
+        return Err(tch::TchError::Shape("empty parameter shape".to_string()));
+    }
+    if xshape.len() > MAX_XSHAPE_RANK {
+        return Err(tch::TchError::Shape(format!(
+            "parameter shape has rank {}, the most allowed is {MAX_XSHAPE_RANK}",
+            xshape.len()
+        )));
+    }
+    let mut elements: i64 = 1;
+    for dim in xshape {
+        if *dim == 0 {
+            return Err(tch::TchError::Shape(format!(
+                "zero dimension in parameter shape {xshape:?}"
+            )));
+        }
+        elements = elements
+            .checked_mul(*dim as i64)
+            .filter(|n| *n <= MAX_XSHAPE_ELEMENTS)
+            .ok_or_else(|| {
+                tch::TchError::Shape(format!(
+                    "parameter shape {xshape:?} claims more than {MAX_XSHAPE_ELEMENTS} elements"
+                ))
+            })?;
+    }
+    Ok(xshape.iter().map(|x| *x as i64).collect())
+}
+
 impl TryFrom<&SerializedDistroResult> for DistroResult {
     type Error = tch::TchError;
 
@@ -74,7 +155,7 @@ impl TryFrom<&SerializedDistroResult> for DistroResult {
         let mut distro_result = Self {
             sparse_idx: (&value.sparse_idx).try_into()?,
             sparse_val: (&value.sparse_val).try_into()?,
-            xshape: value.xshape.iter().map(|x| *x as i64).collect(),
+            xshape: validate_xshape(&value.xshape)?,
             totalk: value.totalk as i64,
             stats: None,
         };
@@ -226,9 +307,8 @@ mod tests {
     }
 }
 
-/// The commitment hash covers the tensor *bytes* and nothing that says how to
-/// read them. Recorded in the third pass of the internal review
-/// (wienerlabs/leviathan#15).
+/// The commitment hash has to cover everything that decides how the bytes are
+/// read, not only the bytes. wienerlabs/leviathan#15, finding 26.
 #[cfg(test)]
 mod commitment_binding_tests {
     use super::*;
@@ -254,44 +334,38 @@ mod commitment_binding_tests {
 
     const VALUES: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
 
-    /// Two payloads whose tensors hold the same bytes in different shapes commit
-    /// to the same hash, so a signature over that hash does not say which shape
-    /// the sender meant. `CompressDCT::decompress` reads `xshape` and `totalk`
-    /// to rebuild the gradient, and neither is covered either.
-    #[test]
-    fn shape_is_not_covered_by_the_commitment() {
-        let flat = payload(vec![SerializedDistroResult {
-            sparse_idx: tensor(&VALUES, &[4]),
-            sparse_val: tensor(&VALUES, &[4]),
-            xshape: vec![2, 2],
-            totalk: 4,
-        }]);
-        let square = payload(vec![SerializedDistroResult {
-            sparse_idx: tensor(&VALUES, &[2, 2]),
-            sparse_val: tensor(&VALUES, &[2, 2]),
-            xshape: vec![4, 1],
-            totalk: 9999,
-        }]);
+    fn one_result(dims: &[i64], xshape: Vec<u16>, totalk: u32) -> TransmittableDistroResult {
+        payload(vec![SerializedDistroResult {
+            sparse_idx: tensor(&VALUES, dims),
+            sparse_val: tensor(&VALUES, dims),
+            xshape,
+            totalk,
+        }])
+    }
 
-        assert_eq!(
-            flat.comptue_hash(),
-            square.comptue_hash(),
-            "BUG: dims, xshape and totalk are all outside the committed hash"
+    /// The same bytes in a different shape are a different commitment, so a
+    /// signature over the hash now says which shape the sender meant.
+    #[test]
+    fn shape_changes_the_commitment() {
+        assert_ne!(
+            one_result(&[4], vec![2, 2], 4).comptue_hash(),
+            one_result(&[2, 2], vec![2, 2], 4).comptue_hash(),
         );
     }
 
-    /// The results are hashed one after another with no length prefix and no
-    /// separator, so how the same run of bytes is divided into results is not
-    /// committed either.
+    /// So do the two fields `CompressDCT::decompress` actually rebuilds with.
     #[test]
-    fn the_split_between_results_is_not_covered_either() {
-        let one = payload(vec![SerializedDistroResult {
-            sparse_idx: tensor(&VALUES, &[4]),
-            sparse_val: tensor(&VALUES, &[4]),
-            xshape: vec![2, 2],
-            totalk: 4,
-        }]);
-        // Same eight floats in total, cut between the two results differently.
+    fn xshape_and_totalk_change_the_commitment() {
+        let base = one_result(&[4], vec![2, 2], 4).comptue_hash();
+        assert_ne!(base, one_result(&[4], vec![4, 1], 4).comptue_hash());
+        assert_ne!(base, one_result(&[4], vec![2, 2], 9999).comptue_hash());
+    }
+
+    /// And how a run of bytes is divided into results, which the length
+    /// prefixes now pin down.
+    #[test]
+    fn the_split_between_results_changes_the_commitment() {
+        let one = one_result(&[4], vec![2, 2], 4);
         let two = payload(vec![
             SerializedDistroResult {
                 sparse_idx: tensor(&VALUES[..2], &[2]),
@@ -306,30 +380,98 @@ mod commitment_binding_tests {
                 totalk: 4,
             },
         ]);
-
-        assert_eq!(
-            one.comptue_hash(),
-            two.comptue_hash(),
-            "BUG: one result of eight floats hashes the same as two of four"
-        );
+        assert_ne!(one.comptue_hash(), two.comptue_hash());
     }
 
-    /// Changing a byte does change the hash, so the field that is covered is
-    /// covered properly. The gap is which fields, not how they are hashed.
+    /// The encoding tag is covered too: the same buffer read as packed bits and
+    /// as raw values is two different tensors and must be two commitments.
     #[test]
-    fn the_tensor_bytes_themselves_are_covered() {
+    fn the_encoding_changes_the_commitment() {
+        let bools = Tensor::from_slice(&[1i64, 0, 1, 0])
+            .to_kind(Kind::Bool)
+            .to(Device::Cpu);
+        let packed = SerializableTensor::try_from(&bools).unwrap();
+        let raw = tensor(&VALUES, &[4]);
         let a = payload(vec![SerializedDistroResult {
-            sparse_idx: tensor(&VALUES, &[4]),
-            sparse_val: tensor(&VALUES, &[4]),
+            sparse_idx: packed,
+            sparse_val: raw.clone(),
             xshape: vec![2, 2],
             totalk: 4,
         }]);
         let b = payload(vec![SerializedDistroResult {
-            sparse_idx: tensor(&[1.0, 2.0, 3.0, 5.0], &[4]),
-            sparse_val: tensor(&VALUES, &[4]),
+            sparse_idx: raw.clone(),
+            sparse_val: raw,
             xshape: vec![2, 2],
             totalk: 4,
         }]);
         assert_ne!(a.comptue_hash(), b.comptue_hash());
+    }
+
+    /// The bytes are still covered, and the step and batch bounds still are.
+    #[test]
+    fn the_fields_that_were_already_covered_still_are() {
+        let a = one_result(&[4], vec![2, 2], 4);
+        let mut b = one_result(&[4], vec![2, 2], 4);
+        b.distro_results[0].sparse_idx = tensor(&[1.0, 2.0, 3.0, 5.0], &[4]);
+        assert_ne!(a.comptue_hash(), b.comptue_hash());
+
+        let mut c = one_result(&[4], vec![2, 2], 4);
+        c.step = 8;
+        assert_ne!(a.comptue_hash(), c.comptue_hash());
+
+        let mut d = one_result(&[4], vec![2, 2], 4);
+        d.batch_id = BatchId(ClosedInterval::new(0, 4));
+        assert_ne!(a.comptue_hash(), d.comptue_hash());
+    }
+
+    /// Identical payloads still agree, or a sender could not commit to its own.
+    #[test]
+    fn the_same_payload_still_hashes_the_same() {
+        assert_eq!(
+            one_result(&[4], vec![2, 2], 4).comptue_hash(),
+            one_result(&[4], vec![2, 2], 4).comptue_hash(),
+        );
+    }
+}
+
+/// `xshape` is a peer-supplied allocation size, so it is bounded before
+/// `CompressDCT::decompress` allocates from it. wienerlabs/leviathan#15,
+/// finding 28.
+#[cfg(test)]
+mod xshape_bound_tests {
+    use super::*;
+
+    #[test]
+    fn a_shape_that_asks_for_a_petabyte_is_refused() {
+        let err = validate_xshape(&[65535, 65535, 65535]).expect_err("2.8e14 elements");
+        assert!(format!("{err:?}").contains("more than"));
+    }
+
+    #[test]
+    fn rank_is_bounded() {
+        assert!(validate_xshape(&[2; MAX_XSHAPE_RANK]).is_ok());
+        assert!(validate_xshape(&[2; MAX_XSHAPE_RANK + 1]).is_err());
+    }
+
+    #[test]
+    fn degenerate_shapes_are_refused() {
+        assert!(validate_xshape(&[]).is_err(), "no shape at all");
+        assert!(validate_xshape(&[4, 0, 4]).is_err(), "a zero dimension");
+    }
+
+    #[test]
+    fn the_shapes_a_real_parameter_has_still_pass() {
+        // A 4096-wide linear layer, an embedding row, a bias, a conv kernel.
+        for shape in [
+            vec![4096u16, 4096],
+            vec![32000, 512],
+            vec![4096],
+            vec![64, 3, 7, 7],
+        ] {
+            assert!(
+                validate_xshape(&shape).is_ok(),
+                "{shape:?} is an ordinary parameter shape"
+            );
+        }
     }
 }
