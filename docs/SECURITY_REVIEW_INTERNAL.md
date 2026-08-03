@@ -30,6 +30,7 @@ behaviour; run them with `cargo test -p psyche-solana-tooling` and
 | 12 | The voter cap can sit below quorum at scale | Low | — | no |
 | 13 | Borsh accounts are sized with `std::mem::size_of` | Low | — | no |
 | 14 | Slashing points and collateral units are coupled by convention | Info | — | no |
+| 17 | The withdraw delay is read at finalise time, so it can be revoked | Low | — | no |
 | 16 | The disclosure channel SECURITY.md names does not exist | Process | — | n/a |
 
 Sections below run in numeric order; the table is sorted by severity, so the
@@ -524,6 +525,40 @@ way in. Storing an index nobody validated and dereferencing it later is the
 pattern to remove, not the specific value. Consider making `FixedVec`'s `Index`
 impl unavailable in on-chain code so that a `get` with an explicit `None` arm is
 the only way to read.
+
+## 17. The withdraw delay is read at finalise time, so it can be revoked (Low)
+
+**Files:** `.../logic/participant_bond_finalize_withdraw.rs:107-111`,
+`.../logic/run_bond_config_update.rs:37-39`
+
+The unlock time is computed from the delay as it stands *now*, not as it stood
+when the withdrawal was requested:
+
+```rust
+let unlock_unix_timestamp =
+    participant.bond_withdraw_requested_at + run.bond_withdraw_delay_seconds;
+```
+
+`run_bond_config_update` can lower `bond_withdraw_delay_seconds` at any time
+(only `< 0` is rejected, and `0` is allowed whenever `bond_minimum_amount` is
+also 0). Setting it to zero makes every pending withdrawal in the run instantly
+claimable, including those of participants who are mid-dispute.
+
+This is authority-gated, so it sits inside the trust model `docs/GAPS.md`
+already describes. It is recorded because of what the delay is *for*: the whole
+point of a withdraw window is that a cheater cannot exit between committing
+fraud and being convicted. A window the run authority can close retroactively
+does not provide that, and a participant reading `bond_withdraw_delay_seconds`
+at request time has no guarantee it will still hold.
+
+The same instruction can raise `bond_minimum_amount` mid-run, which
+retroactively disqualifies existing participants from claiming
+(`participant_claim.rs:68`), from joining (`participant_authorize_join.rs:52`)
+and from voting (`run_submit_audit_verdict.rs:83`).
+
+**Fix.** Snapshot the delay onto the `Participant` at
+`participant_bond_request_withdraw` and use the stored value at finalise. Two
+fields, no behavioural change for anyone acting in good faith.
 
 ## 16. The disclosure channel SECURITY.md names does not exist (Process)
 
