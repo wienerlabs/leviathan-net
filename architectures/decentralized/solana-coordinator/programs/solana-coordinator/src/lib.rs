@@ -33,7 +33,7 @@ pub use crate::instance_state::RunMetadata;
 // deploy time. A mainnet build carries a different program id, so a binary
 // meant for devnet can never be pointed at mainnet by mistake.
 #[cfg(not(feature = "mainnet"))]
-declare_id!("JD9rHTiqBFgHjViWZc7gFZX74LvKKysbLbqFRaFvtmmN");
+declare_id!("GdHJHiQp7uMv8TanfpaCaKQ8nHm5suvEt9JvjpZFWZ19");
 #[cfg(feature = "mainnet")]
 declare_id!("9Sid2EWErkyMBKoqy9vzruRq6qJV2TUy9grp6NiieWN7");
 
