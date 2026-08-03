@@ -10,8 +10,14 @@ gaps that pass left open, at the request of the reviewer's own coverage note:
 `psyche-verifier` and `leviathan-verifier`, `psyche-solana-authorizer`,
 `data_selection` and `commitment`, the coordinator instructions off the slash
 path, `psyche-solana-distributor` and `psyche-solana-mining-pool` at depth, and
-the verifier daemon. Findings 18 to 24 come from the second pass and are marked
-as such in their sections. Every finding below that is marked *reproduced* has a test in
+the verifier daemon. The third covered the off-chain client and the p2p network
+layer: message handling, blob download, and the deserialisation of tensors that
+arrive from peers. Findings 18 to 24 come from the second pass and 25 to 29 from
+the third; both are marked in their sections.
+
+The third pass needs libtorch to run its tests. Set it up the way
+`scripts/leviathan-node.sh` does (`LIBTORCH_USE_PYTORCH=1` against a venv with
+torch 2.9.1) and run `cargo test -p psyche-network`. Every finding below that is marked *reproduced* has a test in
 this repository that fails on the honest expectation and passes on the current
 behaviour; run them with `cargo test -p psyche-solana-tooling` and
 `cargo test -p psyche-coordinator`.
@@ -20,9 +26,11 @@ behaviour; run them with `cargo test -p psyche-solana-tooling` and
 
 | # | Finding | Severity | Bounty class | Reproduced |
 |---|---|---|---|---|
+| 25 | Heap out-of-bounds read from a peer-chosen tensor shape | Critical | — | yes |
 | 1 | Epoch-end accounting silently drops a conviction | Critical | B | yes |
 | 2 | Bounty recipient is unvalidated when the verdict is omitted | Critical | B | yes |
 | 3 | Votes from different rounds are pooled into one quorum | High | — | yes |
+| 26 | The commitment hash does not cover how the bytes are read | High | — | yes |
 | 4 | Daemon and chain disagree on who is a verifier | High | A (enables) | yes |
 | 15 | An unvalidated warmup witness index panics every later witness | High | — | yes |
 | 5 | `run_finalize_slash` trusts a stale client index | High | — | no |
@@ -38,6 +46,8 @@ behaviour; run them with `cargo test -p psyche-solana-tooling` and
 | 18 | A NaN submission is judged honest by the band check | High | A | yes |
 | 19 | A grantee extends the join gate without the grantor | Medium | — | yes |
 | 20 | The audit pipeline joins clients on a truncated display string | Medium | — | no |
+| 27 | The one-bit deserialisation branch panics where the other errors | Medium | — | yes |
+| 28 | `xshape` is an unbounded allocation size taken from one peer | Medium | — | no |
 | 17 | The withdraw delay is read at finalise time, so it can be revoked | Low | — | no |
 | 21 | Data assignment asserts that no round reserves tie-breakers | Low | — | yes |
 | 22 | Merkle leaf and node are separated only by preimage length | Low | — | yes |
@@ -809,6 +819,193 @@ always in range.
 
 **Fix.** Widen first: `u128::from(a) + u128::from(b)`.
 
+## 25. Heap out-of-bounds read from a peer-chosen tensor shape (Critical)
+
+*Third pass.*
+
+**File:** `shared/network/src/serializable_tensor.rs:107-110`
+**Test:** `psyche-network --lib hostile_input_tests` (four cases)
+
+Every field of a `SerializableTensor` arrives from a peer: `dims`, `kind`,
+`requires_grad`, and the raw `data` bytes. Deserialising one runs:
+
+```rust
+SerializableTensorData::Full(data) => {
+    Tensor::f_from_data_size(data, &value.dims, (&value.kind).into())?
+}
+```
+
+`f_from_data_size` looks fallible, and it is not fallible in the way that
+matters. Its whole body is:
+
+```rust
+let data = data.as_ptr() as *const c_void;
+let elt_size_in_bytes = kind.elt_size_in_bytes();
+let c_tensor = unsafe_torch_err!(at_tensor_of_data(
+    data, size.as_ptr(), size.len(), elt_size_in_bytes, kind.c_int(),
+));
+```
+
+**The slice's length is never passed to C++ and never checked.** Only the
+pointer crosses. `at_tensor_of_data` allocates a tensor of `product(size)`
+elements and `memcpy`s `numel * element_size` bytes from that pointer. The one
+check it does make is that `element_size_in_bytes` agrees with the chosen dtype
+— a coherence check on the kind, not on the length.
+
+So a peer that declares a shape larger than the bytes it sent makes the
+receiving process read that far past the end of a heap buffer, and the bytes it
+reads land in a tensor the peer then gets to observe through the aggregate.
+
+**Failure scenario, and it is what the test does.** Hand over a 16-byte slice of
+zeros, declare `dims = [64]`, `kind = Float`. The call returns `Ok`. The tensor
+has 64 elements. The first four are the zeros that were sent; **elements 4
+through 63 are read from memory past the end of the slice** — in the test that
+memory is a known 0xAA pattern, so the read is demonstrated rather than
+inferred. A second test does the same with `dims = [1000]` against 16 bytes:
+accepted, `numel() == 1000`, which is libtorch copying 4000 bytes out of a
+16-byte buffer.
+
+**What lets it through.** `apply_distro_result` does gate the payload, and the
+gate runs *before* deserialisation: it recomputes `comptue_hash()` and compares
+against the signed `commitment.data_hash` (`steps.rs:613`). That gate does not
+help, because of finding 26: the committed hash covers the tensor bytes and not
+`dims`. An attacker commits to the honest bytes, signs that hash legitimately,
+and ships whatever shape it likes alongside. The two findings are one exploit —
+26 is the reason 25 is reachable through an authenticated, signed, committed
+payload.
+
+The sender must be a joined run client (`client.rs:253` looks the peer up in the
+roster and `raw_p2p_verify` checks the signature), so this is not open to the
+internet. It is open to every participant, and finding 19 is how cheaply one
+becomes several.
+
+Note the code already knows the shape is unverified. `steps.rs:601`:
+`// TODO: verify shape of distro_results`.
+
+**Fix.** Check the length before the pointer leaves Rust:
+`data.len() == dims.iter().product::<i64>() as usize * kind.elt_size_in_bytes()`,
+with the product computed in `u128` or with `checked_mul`, and a rejection for
+negative dimensions. Do it in `TryFrom<&SerializableTensor> for Tensor` so both
+branches are covered, and treat `f_from_data_size` as unsafe-by-contract
+wherever else it is reached.
+
+## 26. The commitment hash does not cover how the bytes are read (High)
+
+*Third pass.*
+
+**File:** `shared/network/src/serialized_distro.rs:33-43`
+**Test:** `psyche-network --lib commitment_binding_tests` (three cases)
+
+```rust
+pub fn comptue_hash(&self) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(self.step.to_be_bytes());
+    hasher.update(self.batch_id.0.start.to_be_bytes());
+    hasher.update(self.batch_id.0.end.to_be_bytes());
+    for result in &self.distro_results {
+        hasher.update(result.sparse_idx.raw_tensor_data());
+        hasher.update(result.sparse_val.raw_tensor_data());
+    }
+    hasher.finalize().into()
+}
+```
+
+What is covered: the step, the batch bounds, and the raw tensor bytes. What is
+not: `dims`, `kind`, `requires_grad`, `xshape`, `totalk`, `trainer_nonce` — every
+field that decides how those bytes are turned back into a gradient. And the
+results are concatenated with no length prefix and no separator, so the division
+of one run of bytes into results is not covered either.
+
+This is the hash a peer signs, the hash `apply_distro_result` verifies a download
+against, and the hash witnesses put in `broadcast_bloom` for
+`select_consensus_commitment_by_witnesses` to count. A commitment that does not
+determine what the receiver computes is not binding, and all three of those uses
+assume it is.
+
+**Failure scenario.** The tests build it twice. Two payloads carrying the same
+four floats — one as `dims = [4]` with `xshape = [2,2]`, `totalk = 4`, the other
+as `dims = [2,2]` with `xshape = [4,1]`, `totalk = 9999` — produce **the same
+hash**. So do one result holding eight floats and two results holding four each.
+A node can therefore sign one commitment and hand different receivers payloads
+that decompress to different gradients, and every receiver believes it verified
+the signature.
+
+Changing an actual tensor byte does change the hash, so the fields that are
+covered are covered correctly. The defect is the choice of fields.
+
+**Fix.** Hash the serialised form rather than a hand-picked subset — the payload
+already round-trips through postcard, so hashing those bytes covers everything
+by construction. Failing that, feed every field in with lengths, and prefix each
+result with its own length.
+
+## 27. The one-bit deserialisation branch panics where the other errors (Medium)
+
+*Third pass.*
+
+**File:** `shared/network/src/serializable_tensor.rs:111-133`
+**Test:** `psyche-network --lib hostile_input_tests`
+
+The two branches of the same `TryFrom` do not agree on how to fail. `Full` calls
+the fallible `f_from_data_size` and returns `Err(TchError)`. `OneBit` calls
+`reshape`, `slice` and `bitwise_and_tensor` — the panicking variants — and
+computes `let total_elements: i64 = value.dims.iter().product();` on numbers a
+peer chose, where the product can overflow.
+
+The tests confirm both routes abort: one byte of packed data declared as 1000
+bits, and `dims = [i64::MAX, 4]`.
+
+The impact is contained, and worth stating precisely so it is not overrated:
+deserialisation runs under `spawn_blocking` and the join result is mapped to
+`DeserializeError::DeserializeThreadCrashed` (`steps.rs:687`), so a hostile
+payload drops rather than taking the process down. That guard is doing real
+work. What is left is that a `Result` type is lying about how the function
+fails, and a caller reading the signature would not know to expect a panic.
+
+**Fix.** Use `f_reshape`, `f_slice` and `f_bitwise_and_tensor`, and compute the
+element count with `checked_mul`.
+
+## 28. `xshape` is an unbounded allocation size taken from one peer (Medium)
+
+*Third pass. Read, not executed — the test for this one is an attempt to make
+the machine allocate, which is not a thing to run in CI.*
+
+**Files:** `shared/modeling/src/distro.rs:383`, and `:658-661`, `:673-676`
+
+`CompressDCT::decompress` opens with `let mut x: Tensor = Tensor::zeros(xshape, (kind, device));`.
+
+`xshape` reaches it from `SerializedDistroResult.xshape`, a `Vec<u16>` off the
+wire. Postcard puts no bound on the vector's length and each entry may be up to
+65535, so `[65535, 65535, 65535]` asks for 2.8 × 10^14 elements — about a
+petabyte at four bytes each. `Tensor::zeros` is the panicking variant.
+
+Two details make it worse than one peer harming itself. The shape is not applied
+per peer: both call sites pass `results[0][index].xshape` and
+`results[0][index].totalk` — **whichever result sorted first** — to every peer's
+indices. So one participant's `xshape` sets the allocation for the whole
+aggregation step. And `totalk` from the same first result drives
+`decompress_idx`, which reinterprets index bytes with `view_dtype`, so the same
+peer chooses how the other peers' indices are read.
+
+`internal_scatter_reduce_` then scatters those reinterpreted indices into `x`.
+Indices and target shape are both peer-controlled, so an out-of-range scatter is
+straightforward to arrange, and that call is a panicking variant too.
+
+**Fix.** Bound `xshape` where it is deserialised: cap the rank, cap the product,
+and reject anything that does not match the model's actual parameter shape —
+which the receiver knows independently and never consults. Derive the shape from
+local state rather than accepting it from a peer at all, if that is possible
+here.
+
+## 29. The shape gap is already marked in the code (Info)
+
+*Third pass.*
+
+`shared/client/src/state/steps.rs:601` reads `// TODO: verify shape of
+distro_results`, on the line after the commitment lookup and before the payload
+is deserialised and used. Findings 25, 26 and 28 are all downstream of that one
+comment. Recorded so the fix can close the TODO rather than leaving it to be
+rediscovered.
+
 ## 16. The disclosure channel SECURITY.md names does not exist (Process)
 
 `SECURITY.md` and `docs/REDTEAM_BOUNTY.md` both instruct reporters to use
@@ -977,6 +1174,31 @@ with an owner-checked destination. `Pool::space_with_discriminator` repeats the
 **Overflow** — all four programs set `overflow-checks = true` on the release
 profile, so the unchecked arithmetic that remains aborts rather than wrapping.
 
+### Read in the third pass
+
+**Gossip authentication** — a broadcast is only applied when the sender resolves
+to a client in the current roster (`client.rs:253`) *and* `raw_p2p_verify`
+checks the signature over the commitment hash. Connections are additionally
+gated at handshake by `AllowlistHook`. Nothing here is open to an unauthenticated
+peer; findings 25 to 28 all require a joined participant.
+
+**Blob downloads** — content-addressed through the iroh ticket, so the bytes that
+arrive are the bytes that were offered. The gap is not in the transport.
+
+**Deserialisation containment** — the panic route in finding 27 is caught:
+`steps.rs:687` maps the join failure to `DeserializeError::DeserializeThreadCrashed`
+rather than unwrapping it. This is the single guard standing between a hostile
+payload and the process, and it holds for the panics. It does not help against
+finding 25, which returns `Ok`.
+
+**Commitment signature** — `Commitment.signature` is verified against the p2p
+sender before anything is applied. The signature itself is sound; what it signs
+is finding 26.
+
+**`apply_distro_result` ordering** — the commitment hash is checked before the
+payload is deserialised, which is the right order. It is the hash that is too
+narrow, not the sequence.
+
 ---
 
 ## The five questions in the issue
@@ -1021,6 +1243,10 @@ Every other payout path is checked.
 
 ## Recommended order of work
 
+0. Finding 25, ahead of everything on this list. It is a memory-safety defect
+   reachable from any participant through a payload that passes every check the
+   client currently makes, and the fix is a length comparison. Finding 26 goes
+   with it, because 26 is what carries 25 past the commitment gate.
 1. Finding 1, then finding 2. Both are Class B, neither needs privileged access,
    and until they are fixed the bond mechanism does not reliably take money from
    anyone.
@@ -1034,5 +1260,5 @@ Every other payout path is checked.
 5. Finding 15, a one-line bounds check against a participant that can otherwise
    disrupt every warmup, and finding 21, which whoever takes finding 4 has to
    fix in the same commit or the run aborts on its first round.
-6. The rest, and finding 16, which costs nothing and should not wait for a
-   release.
+6. Findings 27 and 28 with the rest of the network layer work, and finding 16,
+   which costs nothing and should not wait for a release.

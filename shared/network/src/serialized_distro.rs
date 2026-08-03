@@ -225,3 +225,111 @@ mod tests {
         assert!(decompressed_signed.equal(&signed_truth));
     }
 }
+
+/// The commitment hash covers the tensor *bytes* and nothing that says how to
+/// read them. Recorded in the third pass of the internal review
+/// (wienerlabs/leviathan#15).
+#[cfg(test)]
+mod commitment_binding_tests {
+    use super::*;
+    use psyche_core::{BatchId, ClosedInterval};
+    use tch::{Device, Kind, Tensor};
+
+    fn tensor(values: &[f32], dims: &[i64]) -> SerializableTensor {
+        let t = Tensor::from_slice(values)
+            .to_kind(Kind::Float)
+            .to(Device::Cpu)
+            .reshape(dims);
+        SerializableTensor::try_from(&t).unwrap()
+    }
+
+    fn payload(results: Vec<SerializedDistroResult>) -> TransmittableDistroResult {
+        TransmittableDistroResult {
+            step: 7,
+            trainer_nonce: 1,
+            batch_id: BatchId(ClosedInterval::new(0, 3)),
+            distro_results: results,
+        }
+    }
+
+    const VALUES: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+
+    /// Two payloads whose tensors hold the same bytes in different shapes commit
+    /// to the same hash, so a signature over that hash does not say which shape
+    /// the sender meant. `CompressDCT::decompress` reads `xshape` and `totalk`
+    /// to rebuild the gradient, and neither is covered either.
+    #[test]
+    fn shape_is_not_covered_by_the_commitment() {
+        let flat = payload(vec![SerializedDistroResult {
+            sparse_idx: tensor(&VALUES, &[4]),
+            sparse_val: tensor(&VALUES, &[4]),
+            xshape: vec![2, 2],
+            totalk: 4,
+        }]);
+        let square = payload(vec![SerializedDistroResult {
+            sparse_idx: tensor(&VALUES, &[2, 2]),
+            sparse_val: tensor(&VALUES, &[2, 2]),
+            xshape: vec![4, 1],
+            totalk: 9999,
+        }]);
+
+        assert_eq!(
+            flat.comptue_hash(),
+            square.comptue_hash(),
+            "BUG: dims, xshape and totalk are all outside the committed hash"
+        );
+    }
+
+    /// The results are hashed one after another with no length prefix and no
+    /// separator, so how the same run of bytes is divided into results is not
+    /// committed either.
+    #[test]
+    fn the_split_between_results_is_not_covered_either() {
+        let one = payload(vec![SerializedDistroResult {
+            sparse_idx: tensor(&VALUES, &[4]),
+            sparse_val: tensor(&VALUES, &[4]),
+            xshape: vec![2, 2],
+            totalk: 4,
+        }]);
+        // Same eight floats in total, cut between the two results differently.
+        let two = payload(vec![
+            SerializedDistroResult {
+                sparse_idx: tensor(&VALUES[..2], &[2]),
+                sparse_val: tensor(&VALUES[2..], &[2]),
+                xshape: vec![2, 2],
+                totalk: 4,
+            },
+            SerializedDistroResult {
+                sparse_idx: tensor(&VALUES[..2], &[2]),
+                sparse_val: tensor(&VALUES[2..], &[2]),
+                xshape: vec![2, 2],
+                totalk: 4,
+            },
+        ]);
+
+        assert_eq!(
+            one.comptue_hash(),
+            two.comptue_hash(),
+            "BUG: one result of eight floats hashes the same as two of four"
+        );
+    }
+
+    /// Changing a byte does change the hash, so the field that is covered is
+    /// covered properly. The gap is which fields, not how they are hashed.
+    #[test]
+    fn the_tensor_bytes_themselves_are_covered() {
+        let a = payload(vec![SerializedDistroResult {
+            sparse_idx: tensor(&VALUES, &[4]),
+            sparse_val: tensor(&VALUES, &[4]),
+            xshape: vec![2, 2],
+            totalk: 4,
+        }]);
+        let b = payload(vec![SerializedDistroResult {
+            sparse_idx: tensor(&[1.0, 2.0, 3.0, 5.0], &[4]),
+            sparse_val: tensor(&VALUES, &[4]),
+            xshape: vec![2, 2],
+            totalk: 4,
+        }]);
+        assert_ne!(a.comptue_hash(), b.comptue_hash());
+    }
+}
