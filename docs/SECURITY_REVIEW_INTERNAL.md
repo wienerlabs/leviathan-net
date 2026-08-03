@@ -4,9 +4,14 @@ Scope and method for wienerlabs/leviathan#15. This is the internal pass that
 precedes the external audit (#4). It does not close #4 and does not clear
 mainnet bonds.
 
-Reviewed at commit `2a24bad9`, against `psyche-solana-treasurer`,
-`psyche-solana-coordinator` and the parts of `psyche-coordinator` the conviction
-path depends on. Every finding below that is marked *reproduced* has a test in
+Reviewed in two passes. The first covered `psyche-solana-treasurer` in full,
+`CommitteeSelection`, and the coordinator's slash path. The second closed the
+gaps that pass left open, at the request of the reviewer's own coverage note:
+`psyche-verifier` and `leviathan-verifier`, `psyche-solana-authorizer`,
+`data_selection` and `commitment`, the coordinator instructions off the slash
+path, `psyche-solana-distributor` and `psyche-solana-mining-pool` at depth, and
+the verifier daemon. Findings 18 to 24 come from the second pass and are marked
+as such in their sections. Every finding below that is marked *reproduced* has a test in
 this repository that fails on the honest expectation and passes on the current
 behaviour; run them with `cargo test -p psyche-solana-tooling` and
 `cargo test -p psyche-coordinator`.
@@ -30,7 +35,14 @@ behaviour; run them with `cargo test -p psyche-solana-tooling` and
 | 12 | The voter cap can sit below quorum at scale | Low | — | no |
 | 13 | Borsh accounts are sized with `std::mem::size_of` | Low | — | no |
 | 14 | Slashing points and collateral units are coupled by convention | Info | — | no |
+| 18 | A NaN submission is judged honest by the band check | High | A | yes |
+| 19 | A grantee extends the join gate without the grantor | Medium | — | yes |
+| 20 | The audit pipeline joins clients on a truncated display string | Medium | — | no |
 | 17 | The withdraw delay is read at finalise time, so it can be revoked | Low | — | no |
+| 21 | Data assignment asserts that no round reserves tie-breakers | Low | — | yes |
+| 22 | Merkle leaf and node are separated only by preimage length | Low | — | yes |
+| 23 | `update_client_version` unwraps on a caller-supplied length | Low | — | no |
+| 24 | `lender_claim` adds two u64 before widening | Low | — | no |
 | 16 | The disclosure channel SECURITY.md names does not exist | Process | — | n/a |
 
 Sections below run in numeric order; the table is sorted by severity, so the
@@ -560,6 +572,243 @@ and from voting (`run_submit_audit_verdict.rs:83`).
 `participant_bond_request_withdraw` and use the stored value at finalise. Two
 fields, no behavioural change for anyone acting in good faith.
 
+## 18. A NaN submission is judged honest by the band check (High, Class A)
+
+*Second pass.*
+
+**File:** `shared/verifier/src/lib.rs:63` (and `:47-48`)
+**Test:** `psyche-verifier --test non_finite_submissions` (five cases)
+
+Fraud is decided by one comparison:
+
+```rust
+Ok(BandVerdict { distance, band, fraud: distance > band })
+```
+
+`distance` comes from `relative_l2_distance`, which sums `(s - r)^2` over the
+submitted and recomputed deltas. If any submitted value is NaN the sum is NaN,
+the square root is NaN, and the quotient is NaN. Every ordered IEEE-754
+comparison against NaN is false, so `distance > band` is **false** and the
+verdict is `fraud: false`.
+
+The submitted delta is the one input a cheating node fully controls.
+
+**Failure scenario.** A node submits an all-zero delta - the laziest possible
+forgery, and one the test suite already proves is caught - with a single element
+set to NaN. `relative_l2_distance` returns NaN, `verify_within_band` clears it,
+`audit_contribution` produces `proof: None`, and the daemon prints its "ok ...
+within band" line and moves on. There is no fraud proof to take to the chain,
+so no verdict, no quorum, no slash. Not caught late: never caught, because the
+check structurally cannot see it.
+
+That is Class A under `docs/REDTEAM_BOUNTY.md` - work that is not the honest
+replay, receiving reward without conviction - and it holds for every round, not
+just beyond `2/p`.
+
+Infinity is handled correctly (`inf > band` is true), which is exactly why this
+survives a casual "does it reject garbage" check. The tests cover both, so the
+distinction stays visible.
+
+Two smaller consequences of the same root cause, both covered by the tests:
+
+- `calibrate_band` folds with `f32::max`, which returns the other operand when
+  one side is NaN. A NaN drift sample is silently dropped rather than widening
+  the band or raising `EmptyCalibration`.
+- What the NaN does *not* do is poison the model: `robust_aggregate` builds its
+  keep-mask with `distance <= limit`, false for NaN, so the delta is excised and
+  the aggregate stays finite. The failure is confined to the layer that decides
+  guilt, which is the layer that matters here.
+
+**Fix.** Reject non-finite input where it enters. `relative_l2_distance` should
+return an error for a submitted delta that is not entirely finite, and
+`verify_within_band` should treat a non-finite distance as fraud rather than as
+a comparison. A cheater who submits values that are not numbers has already
+failed to submit the honest replay; that should be the easiest verdict in the
+system, not the one it cannot reach.
+
+## 19. A grantee extends the join gate without the grantor (Medium)
+
+*Second pass.*
+
+**Files:** `.../solana-authorizer/src/logic/authorization_grantee_update.rs:16, 44-47`,
+`.../solana-authorizer/src/state/authorization.rs:49-51`
+**Test:** `psyche-solana-authorizer --test delegate_expansion` (four cases)
+
+`join_run` admits a signer when `Authorization::is_valid_for` holds, which ends
+in:
+
+```rust
+self.grantee == Pubkey::default() || self.grantee.eq(grantee) || self.delegates.contains(grantee)
+```
+
+`authorization_grantee_update` is gated on `authorization.grantee ==
+grantee.key()` - the **grantee** signs, not the grantor - and appends
+`params.delegates_added` with no cap and no grantor approval.
+
+So the join authority approves one key and gets however many identities that key
+chooses to create. For a single operator running several nodes this is a
+sensible feature. For the committee lottery it is the sybil gate, and the two
+readings should not be conflated: finding 3 is priced in sybil fraction, finding
+1 needs one throwaway identity, and `global_batch_size_end` caps seats. All
+three assume the identity count is bounded by something. It is bounded by one
+signature, once.
+
+Revocation is all-or-nothing: clearing `active` removes the delegates and the
+original grantee together, so there is no way to drop one bad delegate without
+also ejecting the participant who was legitimately sponsored.
+
+The related question - can an attacker mint their own authorization - is **no**,
+and the tests record that too. `grantor` is written from a `Signer` at creation
+and compared by value against `coordinator_instance.join_authority`, and `scope`
+must match exactly. That is why `join_run` can safely omit a seeds constraint on
+the account: every field it relies on is content-checked and unforgeable.
+
+**Fix.** Decide which of the two things this is. If delegation is meant to be
+operator convenience, cap it and let the grantor set the cap. If the join gate
+is meant to bound identities, delegation has to require the grantor's signature.
+
+## 20. The audit pipeline joins clients on a truncated display string (Medium)
+
+*Second pass.*
+
+**Files:** `solana-tooling/src/daemon.rs:113-117` and `:37-42`,
+`shared/client/src/state/train.rs:808-811`
+
+The client writes each gradient dump as `result-{identity}-step{n}-batch{...}`,
+where `{identity}` is `NodeIdentity`'s `Display`. The daemon parses that segment
+back out of the filename and matches it against the roster:
+
+```rust
+let roster_index = coordinator.epoch_state.clients.iter()
+    .position(|client| format!("{}", client.id) == committer);
+```
+
+Three things follow, in increasing order of how much they should worry anyone:
+
+1. **`Display` is truncated.** It is eight characters, not the 32-byte signer.
+   `position` returns the first match, so two clients sharing a prefix are not
+   distinguished - the audit would be attributed to whichever appears first in
+   the roster.
+2. **Any change to `Display` silently breaks the join.** Dumps written before
+   wienerlabs/leviathan-net#15 carry hex; a daemon built after it looks up
+   base58. Nothing errors: the daemon prints "is not in the epoch roster,
+   nothing to replay against" and skips, so a version-skewed audit pass reports
+   clean while auditing nothing. A silent skip in the component that decides
+   guilt is the wrong failure mode.
+3. **The key is an operator-facing display string.** `Display` exists to be read
+   by humans in log lines. Using it as the identity join in the conviction path
+   means any future change to how identities are printed is a protocol change.
+
+**Fix.** Join on the full signer. Put the 32 bytes in the filename, base58 and
+untruncated, or carry the identity beside the path instead of inside it.
+`Display` should stay free to change.
+
+## 21. Data assignment asserts that no round reserves tie-breakers (Low, blocks finding 4's fix)
+
+*Second pass.*
+
+**File:** `shared/coordinator/src/data_selection.rs:22`
+**Test:** `psyche-coordinator --test tie_breaker_data_assignment` (two cases)
+
+```rust
+if matches!(committee, Committee::TieBreaker) {
+    assert_eq!(round.tie_breaker_tasks, 0);
+}
+```
+
+Dormant today, because `start_round_train` is called with `tie_breaker_tasks = 0`
+at all three of its call sites (`coordinator.rs:500`, `:1009`, `:1084`), so
+`from_coordinator` never yields a TieBreaker seat.
+
+It is recorded here because of what it blocks. The recommended fix for finding 4
+is to write the run's `tie_breaker_committee_size` into `round.tie_breaker_tasks`
+so the daemon and the chain derive one committee from one field. That change
+makes this assert fire on the first round. Whoever takes finding 4 needs to
+teach `assign_data_for_state` to skip tie-breakers in the same commit.
+
+`assign_data_for_state` is not reachable from any on-chain program - it is used
+by the daemon, the event-sourcing timeline and the client - so this is a process
+abort, not a program abort.
+
+## 22. Merkle leaf and node are separated only by preimage length (Low, latent)
+
+*Second pass.*
+
+**File:** `.../solana-distributor/src/state/merkle_hash.rs:14-28`
+**Test:** the `tests` module in that file (three cases)
+
+The airdrop tree sorts pairs and hashes them with no domain tag:
+
+```rust
+pub fn from_pair(a: &MerkleHash, b: &MerkleHash) -> MerkleHash {
+    MerkleHash { bytes: if a.bytes <= b.bytes { hashv(&[&a.bytes, &b.bytes]) } else { hashv(&[&b.bytes, &a.bytes]) }.to_bytes() }
+}
+```
+
+An internal node is therefore exactly `from_parts` applied to 64 bytes, which
+the test asserts directly. The usual consequence - present an internal node as a
+leaf and claim it - is blocked, but only because an allocation preimage is
+`claimer(32) + nonce(8) + start(8) + duration(4) + end(8)` = **60 bytes**, and
+60 is not 64.
+
+That is a four-byte margin holding up the whole tree, and nothing in the code
+says so. Add a `u32` to `Allocation` and the airdrop becomes drainable by anyone
+who can read the tree.
+
+`is_valid_proof` also accepts a proof of any length including zero, which
+degenerates to `leaf == root`. Safe today - reaching the root needs a preimage
+attack - and worth knowing the length is unchecked.
+
+**Fix.** Prefix a domain byte: `0x00` for leaves, `0x01` for nodes. One byte,
+and the margin stops being accidental.
+
+## 23. `update_client_version` unwraps on a caller-supplied length (Low)
+
+*Second pass.*
+
+**File:** `.../solana-coordinator/src/lib.rs:215`
+
+```rust
+account.state.client_version = FixedString::<96>::try_from(new_version.as_str()).unwrap();
+```
+
+A version string over 96 bytes makes `try_from` return `Err` and the `.unwrap()`
+panic. Owner-gated, so the only person who can trigger it is the run authority
+and the only cost is a failed transaction - but it is an `unwrap` on caller data
+in on-chain code, and `init_coordinator` sets the same field with
+`FixedString::from_str_truncated`. Two paths, two behaviours, for one field.
+
+**Fix.** Use the same constructor in both places, or return
+`ProgramError::InvalidParameter` rather than aborting.
+
+## 24. `lender_claim` adds two u64 before widening (Low)
+
+*Second pass.*
+
+**File:** `.../solana-mining-pool/src/logic/lender_claim.rs:79-80`
+
+```rust
+let total_repayed_redeemable_amount =
+    pool.total_claimed_redeemable_amount + context.accounts.pool_redeemable.amount;
+```
+
+Both operands are `u64` and the sum is computed in `u64` before anything widens
+to `u128`. `overflow-checks = true` is set for the release profile, so this
+aborts rather than wraps - but `pool_redeemable.amount` is a live token balance
+that anyone may increase by transferring in, so the input is not fully under the
+program's control. With a redeemable mint whose supply approaches `u64::MAX`,
+claims can be bricked by donation.
+
+Note for the record, because it was raised elsewhere: the `.unwrap()` two lines
+below on the `u128 → u64` conversion **cannot fail**. `lender.deposited` only
+grows alongside `pool.total_deposited` in `lender_deposit`, and nothing anywhere
+decrements either - `pool_extract` touches only
+`total_extracted_collateral_amount`. So `deposited <= total_deposited`
+invariantly, the quotient is at most `total_repayed`, and the conversion is
+always in range.
+
+**Fix.** Widen first: `u128::from(a) + u128::from(b)`.
+
 ## 16. The disclosure channel SECURITY.md names does not exist (Process)
 
 `SECURITY.md` and `docs/REDTEAM_BOUNTY.md` both instruct reporters to use
@@ -669,12 +918,64 @@ Listed so the external audit does not spend hours re-deriving these.
 - `CommitteeSelection::new` validates `total_nodes >= tie_breaker_nodes`,
   `verification_percent <= 100` and the witness count.
 
-**Other programs** — `solana-distributor` and `solana-mining-pool` were read at
-lower depth, since neither is on the conviction path. Merkle verification,
-vesting, claim accounting, freeze guards and authority gating all appear
-correct. The `.unwrap()` on the `u128 → u64` conversion in
-`lender_claim.rs` is reachable only at balances near `u64::MAX` and aborts
-rather than truncating; worth changing for tidiness, not urgency.
+### Read in the second pass
+
+**`solana-authorizer`** — `grantor` is written from a `Signer` at creation and
+compared by value, and `scope` must match exactly, so an authorization cannot be
+minted on someone else's behalf and `join_run` is safe to omit a seeds
+constraint. `authorization_close` is grantor-gated, requires `!active`, and
+imposes a 30-day wait when delegates exist. The delegate reach is finding 19;
+everything else here is sound.
+
+**`join_run`** — the client id must match the signer, the instance PDA is seeded
+by `run_id`, and the coordinator account is cross-checked against the instance.
+
+**`health_check` / `healthy`** — this looked like the same shape as finding 15
+and is not. `healthy` bounds `proof.index` against `previous_round.clients_len`
+*and* runs `verify_client`, which is a bounds-checked `get` against the very
+list `health_check` later indexes. Within an epoch `epoch_state.clients` only
+shrinks, so the second bound is always the tighter one and the later index is
+safe. A health check also only succeeds against a node that genuinely failed to
+participate, so it cannot be used to drop an honest, working node.
+
+**`Commitment`** — the 64-byte signature is not decorative: `client.rs:254`
+verifies it against the p2p sender before the commitment is accepted.
+
+**`init_coordinator`** — despite the `TODO UNSAFE` comment, the checks are
+adequate: program ownership, exact account size, and an all-zero discriminator
+so an initialised coordinator cannot be re-initialised. The residual is that any
+payer can claim an unused `run_id`, which is namespace squatting rather than
+theft.
+
+**`free_coordinator`** — closes both accounts and would strand every bond in the
+treasurer if it ran on a bonded run. It cannot: for treasurer-created runs
+`main_authority` is the Run PDA, and the treasurer exposes no instruction that
+signs as that PDA to call it. Worth keeping in mind before adding one.
+
+**`OwnerCoordinatorAccounts` / `update`** — the authority gate verifies the
+instance PDA seeds as well as the key, and `update` refuses config, model and
+progress changes unless the run is halted, then runs `config.check()`.
+
+**`solana-distributor`** — `claim_create` requires the claimer's own signature,
+so nobody opens a claim on another key. The `Claim` PDA is seeded by
+`(airdrop, claimer, nonce)` and the merkle leaf binds the same three, so the
+accounting cannot be dodged by varying the nonce. `claimable = vested
+.saturating_sub(claimed)` and the requested amount is checked against it.
+Vesting arithmetic is `u128` with `checked_mul`/`checked_div` and a clamp to the
+end amount. `receiver_collateral.owner` is deliberately not pinned to the
+claimer — the claimer signs, so they are choosing where their own tokens land.
+The remaining exposure is admin: `airdrop_withdraw` can drain the vault with no
+counter, and `airdrop_update` can replace the root at will.
+
+**`solana-mining-pool`** — the pro-rata claim has no ordering advantage:
+`total_repayed` is `already_claimed + vault_balance`, and a claim moves the same
+amount from the second term to the first, so an early claimer gains nothing.
+`pool_claimable` is a genuine one-way switch. `pool_extract` is authority-gated
+with an owner-checked destination. `Pool::space_with_discriminator` repeats the
+`std::mem::size_of` pattern of finding 13 and over-allocates by the same margin.
+
+**Overflow** — all four programs set `overflow-checks = true` on the release
+profile, so the unchecked arithmetic that remains aborts rather than wrapping.
 
 ---
 
@@ -727,7 +1028,11 @@ Every other payout path is checked.
    committee is relied on for anything.
 3. Findings 5, 6, 8 together — they are all "a conviction that was reached does
    not complete".
-4. Finding 15, which is a one-line bounds check against a participant that can
-   disrupt every warmup.
-5. The rest, and finding 16, which costs nothing and should not wait for a
+4. Finding 18 with them. It is a one-line guard and it closes the only path in
+   the system where fraud is structurally uncatchable rather than merely
+   expensive to catch.
+5. Finding 15, a one-line bounds check against a participant that can otherwise
+   disrupt every warmup, and finding 21, which whoever takes finding 4 has to
+   fix in the same commit or the run aborts on its first round.
+6. The rest, and finding 16, which costs nothing and should not wait for a
    release.
