@@ -419,6 +419,53 @@ mod tests {
         assert!(CommitteeSelection::new(10, 50, 101, u64::MAX as usize, 12345).is_err());
     }
 
+    /// The two constructors do not agree once tie-breakers are reserved, and
+    /// both are live at the same time: the verifier daemon picks its work with
+    /// `from_coordinator` (via `select_audits_for_current_round`, which passes
+    /// `round.tie_breaker_tasks` - always 0 today), while the treasurer decides
+    /// who may vote with `from_coordinator_with_tie_breakers`, passing the run's
+    /// `tie_breaker_committee_size`.
+    ///
+    /// Reserving tie-breakers both shrinks the verifier count and shifts the
+    /// verifier positions upward, so the two views name different nodes. A node
+    /// the daemon sends out to audit is then rejected on chain as
+    /// `VerifierNotAssigned`, which is what turning the appeals court on costs.
+    #[test]
+    fn reserving_tie_breakers_moves_the_verifier_set() {
+        let total = 100;
+        let seeded = 12345;
+
+        // What the daemon sees: no tie-breakers reserved.
+        let daemon_view = CommitteeSelection::new(0, 0, 30, total, seeded).unwrap();
+        // What the chain enforces: the run reserves 10 tie-breaker seats.
+        let chain_view = CommitteeSelection::new(10, 0, 30, total, seeded).unwrap();
+
+        assert_eq!(daemon_view.get_num_verifier_nodes(), 30);
+        assert_eq!(chain_view.get_num_verifier_nodes(), 27);
+
+        let verifiers = |selection: &CommitteeSelection| {
+            (0..total as u64)
+                .filter(|index| selection.get_committee(*index).committee == Committee::Verifier)
+                .collect::<Vec<_>>()
+        };
+        let daemon_verifiers = verifiers(&daemon_view);
+        let chain_verifiers = verifiers(&chain_view);
+        assert_ne!(
+            daemon_verifiers, chain_verifiers,
+            "the daemon and the chain must not be allowed to disagree on who is a verifier"
+        );
+
+        // Concretely: nodes the daemon sends out to audit that the chain refuses.
+        let rejected = daemon_verifiers
+            .iter()
+            .filter(|index| !chain_verifiers.contains(index))
+            .count();
+        assert!(
+            rejected > 0,
+            "at least one node audits under one rule and is refused under the other"
+        );
+    }
+
     #[test]
     fn test_edge_case_all_tie_breakers() {
         let cs = CommitteeSelection::new(100, 5, 20, 100, 12345).unwrap();
