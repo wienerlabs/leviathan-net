@@ -46,6 +46,12 @@ pub fn participant_bond_request_withdraw_processor(
 
     participant.bond_withdraw_pending_amount += params.collateral_amount;
     participant.bond_withdraw_requested_at = Clock::get()?.unix_timestamp;
+    // Fixed now, not read again at finalise. The window exists so a cheater
+    // cannot leave between committing fraud and being convicted, and one the run
+    // authority can shorten retroactively is not that window
+    // (wienerlabs/leviathan#15, finding 17).
+    participant.bond_withdraw_delay_snapshot =
+        context.accounts.run.bond_withdraw_delay_seconds;
 
     Ok(())
 }

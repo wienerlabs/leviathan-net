@@ -6,18 +6,20 @@
 //! node an attacker has to hold two thirds of the seats in one draw.
 //!
 //! `run_submit_audit_verdict` checks committee membership against the round that
-//! is current when the vote lands, but the verdict it writes into only resets
-//! when the *epoch* changes - and an epoch is many rounds by construction
+//! is current when the vote lands. The verdict it writes into used to reset only
+//! when the *epoch* changed - and an epoch is many rounds by construction
 //! (`Coordinator::check_config` rejects `max_round_train_time >= epoch_time`).
-//! Nothing records which round a vote came from, so votes cast under different,
-//! independently seeded draws are added into one counter and compared against a
-//! quorum computed from whichever round happens to be current last.
+//! Nothing recorded which round a vote came from, so votes cast under different,
+//! independently seeded draws were added into one counter and compared against a
+//! quorum computed from whichever round happened to be current last.
 //!
-//! An attacker therefore does not need two thirds of one committee. They need
-//! two thirds of the *union* of the committees drawn while the epoch runs, which
+//! An attacker therefore did not need two thirds of one committee. They needed
+//! two thirds of the *union* of the committees drawn while the epoch ran, which
 //! a fixed sybil fraction reaches by waiting.
 //!
-//! This test convicts a node with a set of verifiers that was never a committee.
+//! The verdict now records its round and lapses when that round ends, so a vote
+//! from a later draw opens a fresh count rather than completing an old one.
+//! This test casts exactly those two votes and holds that nobody is convicted.
 
 use psyche_coordinator::Committee;
 use psyche_coordinator::CommitteeSelection;
@@ -69,11 +71,10 @@ const REPLAYED: [u8; 32] = [0xBB; 32];
 
 type State = psyche_solana_coordinator::CoordinatorInstanceState;
 
-/// A verdict reaches quorum from voters drawn in different rounds, and the
-/// target is ejected even though no single round's committee ever contained
-/// enough of them to convict.
+/// Two verifiers seated in different rounds vote against the same target. They
+/// were never on the same committee, so they do not add up to one.
 #[tokio::test]
-pub async fn votes_from_different_committees_are_pooled_into_one_quorum() {
+pub async fn votes_from_different_committees_do_not_add_up() {
     let mut endpoint = create_memnet_endpoint().await;
 
     let payer = Keypair::new();
@@ -361,6 +362,9 @@ pub async fn votes_from_different_committees_are_pooled_into_one_quorum() {
         "the target is still healthy going into the second vote"
     );
 
+    // The vote is accepted - this verifier is properly seated today - but it
+    // opens a fresh count for today's round instead of completing the one from
+    // the round that has since ended.
     cast(
         &mut endpoint,
         &payer,
@@ -370,14 +374,36 @@ pub async fn votes_from_different_committees_are_pooled_into_one_quorum() {
         &target_key,
     )
     .await
-    .expect("BUG: a verifier from a later round is allowed to complete an earlier quorum");
+    .expect("a seated verifier may vote");
 
-    let convicted = state_of(&mut endpoint, &coordinator_account).await;
+    let after = state_of(&mut endpoint, &coordinator_account).await;
     assert!(
-        target_is_ejected(&convicted, &target_key),
-        "BUG: quorum was reached and an honest node ejected by two verifiers \
-         who were never seated on the same committee"
+        !target_is_ejected(&after, &target_key),
+        "an honest node is not ejected by two verifiers who were never seated \
+         on the same committee"
     );
+
+    // And the count really did restart rather than merely falling short: a
+    // second vote from this round's committee, on top of the first, does convict.
+    let same_round_partner = verifiers_now(&after, &clients)
+        .into_iter()
+        .find(|key| *key != second_voter && *key != target_key);
+    if let Some(partner) = same_round_partner {
+        cast(
+            &mut endpoint,
+            &payer,
+            keypair_for(&clients, &partner),
+            &run,
+            &coordinator_account,
+            &target_key,
+        )
+        .await
+        .expect("a second verifier from the same round completes the quorum");
+        assert!(
+            target_is_ejected(&state_of(&mut endpoint, &coordinator_account).await, &target_key),
+            "two verifiers seated together still convict"
+        );
+    }
 }
 
 fn keypair_for<'a>(clients: &'a [Keypair], key: &Pubkey) -> &'a Keypair {

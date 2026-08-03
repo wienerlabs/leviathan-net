@@ -343,7 +343,7 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw_with_reporter(
         run_collateral,
         coordinator_account: *coordinator_account,
         participant,
-        audit_verdict: None,
+        audit_verdict: find_audit_verdict(run, &user.pubkey()),
         appeal_verdict: None,
         token_program: token::ID,
     };
@@ -451,7 +451,7 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw(
         run_collateral,
         coordinator_account: *coordinator_account,
         participant,
-        audit_verdict: None,
+        audit_verdict: find_audit_verdict(run, &user.pubkey()),
         appeal_verdict: None,
         token_program: token::ID,
     };
@@ -493,7 +493,7 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw_with_voters(
         run_collateral,
         coordinator_account: *coordinator_account,
         participant,
-        audit_verdict: Some(audit_verdict),
+        audit_verdict,
         appeal_verdict: None,
         token_program: token::ID,
     };
@@ -543,7 +543,9 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw_with_appeal(
         run_collateral,
         coordinator_account: *coordinator_account,
         participant,
-        audit_verdict: None,
+        // Always the withdrawer's own verdict PDA; the appeal being settled
+        // belongs to somebody else and goes in the slot below.
+        audit_verdict: find_audit_verdict(run, &user.pubkey()),
         appeal_verdict: Some(appeal_verdict),
         token_program: token::ID,
     };
@@ -644,6 +646,7 @@ pub async fn process_treasurer_run_set_challenge_config(
     run: &Pubkey,
     challenge_window_seconds: i64,
     tie_breaker_committee_size: u16,
+    appeal_window_seconds: i64,
 ) -> Result<()> {
     let accounts = RunSetChallengeConfigAccounts {
         main_authority: main_authority.pubkey(),
@@ -655,6 +658,7 @@ pub async fn process_treasurer_run_set_challenge_config(
             params: RunSetChallengeConfigParams {
                 challenge_window_seconds,
                 tie_breaker_committee_size,
+                appeal_window_seconds,
             },
         }
         .data(),
@@ -744,6 +748,7 @@ pub async fn process_treasurer_run_finalize_slash(
     coordinator_account: &Pubkey,
     run_id: &str,
     target: &Pubkey,
+    target_index: u64,
 ) -> Result<()> {
     let coordinator_instance = find_coordinator_instance(run_id);
     let audit_verdict = find_audit_verdict(run, target);
@@ -758,7 +763,10 @@ pub async fn process_treasurer_run_finalize_slash(
     let instruction = Instruction {
         accounts: accounts.to_account_metas(None),
         data: RunFinalizeSlash {
-            params: RunFinalizeSlashParams { target: *target },
+            params: RunFinalizeSlashParams {
+                target: *target,
+                target_index,
+            },
         }
         .data(),
         program_id: psyche_solana_treasurer::ID,

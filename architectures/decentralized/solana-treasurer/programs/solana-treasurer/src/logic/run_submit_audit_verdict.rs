@@ -15,6 +15,20 @@ use crate::state::VerdictStatus;
 use crate::state::MAX_VERDICT_VOTERS;
 use crate::ProgramError;
 
+/// The smallest verifier committee a slash may come out of.
+///
+/// At one seat the old `(2*1).div_ceil(3).max(1)` gave a quorum of one, so a
+/// single verifier ejected whoever it named and "quorum" meant nothing
+/// (wienerlabs/leviathan#15, finding 11). Two seats with a quorum of two is a
+/// real, if small, agreement, and it is a configuration an operator may
+/// legitimately want. One seat is not a committee, so it is refused rather than
+/// silently given a quorum it cannot fail.
+///
+/// How large a committee should be for the sampling argument to hold is the
+/// operator's call and is priced in `docs/COMMITTEE_ECONOMICS.md`; this is only
+/// the floor below which the mechanism is not doing anything at all.
+pub const MIN_VERIFIER_COMMITTEE: u64 = 2;
+
 #[derive(Accounts)]
 #[instruction(params: RunSubmitAuditVerdictParams)]
 pub struct RunSubmitAuditVerdictAccounts<'info> {
@@ -89,7 +103,7 @@ pub fn run_submit_audit_verdict_processor(
     let verifier_key = context.accounts.verifier.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
-    let (current_epoch, quorum) = {
+    let (current_epoch, current_round, quorum) = {
         let account = context.accounts.coordinator_account.load()?;
         let coordinator = &account.state.coordinator;
 
@@ -117,21 +131,50 @@ pub fn run_submit_audit_verdict_processor(
             return err!(ProgramError::TargetMismatch);
         }
 
+        // A committee has to be big enough for agreement to mean something.
+        // `verifier_nodes` rounds down, so small runs land on one seat, where
+        // `.max(1)` made a single verifier a quorum of one and it could eject
+        // anyone it named (wienerlabs/leviathan#15, finding 11).
         let verifier_nodes = selection.get_num_verifier_nodes();
-        let quorum = (2u64 * verifier_nodes).div_ceil(3).max(1);
-        (coordinator.progress.epoch, quorum)
+        if verifier_nodes < MIN_VERIFIER_COMMITTEE {
+            return err!(ProgramError::VerifierCommitteeTooSmall);
+        }
+        let quorum = (2u64 * verifier_nodes).div_ceil(3).max(2);
+
+        // A quorum the voter list cannot hold is a verdict that can never
+        // resolve, so refuse the configuration rather than stall on it
+        // (finding 12).
+        if quorum > MAX_VERDICT_VOTERS as u64 {
+            return err!(ProgramError::QuorumExceedsVoterCapacity);
+        }
+
+        let current_round = coordinator
+            .current_round()
+            .ok_or_else(|| error!(ProgramError::VerifierNotAssigned))?
+            .height;
+        (coordinator.progress.epoch, current_round, quorum)
     };
 
     let should_slash;
     {
         let verdict = &mut context.accounts.audit_verdict;
-        if verdict.run == Pubkey::default() {
+        let fresh_account = verdict.run == Pubkey::default();
+        if fresh_account {
             verdict.bump = context.bumps.audit_verdict;
             verdict.run = context.accounts.run.key();
             verdict.target = params.target;
-            verdict.reset_for_epoch(current_epoch);
-        } else if verdict.epoch != current_epoch {
-            verdict.reset_for_epoch(current_epoch);
+            verdict.reset_for_round(current_epoch, current_round);
+        } else if verdict.epoch != current_epoch || verdict.round_height != current_round {
+            // One PDA per (run, target) is reused for every dispute, so taking
+            // it over has to wait until the last one is finished. Overwriting an
+            // unfinished dispute erased an appeal in progress, and erased the
+            // voter list the losing-verifier crank walks - which let one of
+            // those verifiers free the whole cohort with a single transaction
+            // (finding 6).
+            if !verdict.is_settled() {
+                return err!(ProgramError::PreviousVerdictUnsettled);
+            }
+            verdict.reset_for_round(current_epoch, current_round);
         }
 
         if verdict.status != VerdictStatus::Voting {
@@ -144,18 +187,36 @@ pub fn run_submit_audit_verdict_processor(
             return err!(ProgramError::VerdictVotersFull);
         }
 
+        // The evidence is written once, by whoever votes first, and every later
+        // vote has to agree with it. Letting each vote overwrite it meant the
+        // verifier who completed the quorum decided what the on-chain record
+        // said, which is the only thing an appeal bench or an observer can check
+        // (finding 9). Two verifiers who disagree about what they replayed is
+        // information, and it belongs in a rejected transaction rather than
+        // silently in the last writer's favour.
+        if verdict.voters.is_empty() {
+            verdict.committed_hash = params.committed_hash;
+            verdict.replayed_hash = params.replayed_hash;
+            verdict.target_index = params.target_index;
+            verdict.batch_start = params.batch_start;
+            verdict.batch_end = params.batch_end;
+        } else if verdict.committed_hash != params.committed_hash
+            || verdict.replayed_hash != params.replayed_hash
+            || verdict.target_index != params.target_index
+            || verdict.batch_start != params.batch_start
+            || verdict.batch_end != params.batch_end
+        {
+            return err!(ProgramError::EvidenceMismatch);
+        }
+
         verdict.voters.push(verifier_key);
         verdict.verdict_count += 1;
-        verdict.committed_hash = params.committed_hash;
-        verdict.replayed_hash = params.replayed_hash;
-        verdict.target_index = params.target_index;
-        verdict.batch_start = params.batch_start;
-        verdict.batch_end = params.batch_end;
 
         msg!(
-            "audit_verdict: target_index={} epoch={} count={} quorum={}",
+            "audit_verdict: target_index={} epoch={} round={} count={} quorum={}",
             params.target_index,
             current_epoch,
+            current_round,
             verdict.verdict_count,
             quorum
         );

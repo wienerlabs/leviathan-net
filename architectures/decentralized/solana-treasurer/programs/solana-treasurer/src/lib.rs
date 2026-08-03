@@ -237,4 +237,31 @@ pub enum ProgramError {
 
     #[msg("All losing verifiers have already been settled")]
     AllLosersSettled,
+
+    #[msg("The verifier committee is too small for a quorum to mean anything")]
+    VerifierCommitteeTooSmall,
+
+    #[msg("The quorum for this run exceeds the number of voters a verdict can hold")]
+    QuorumExceedsVoterCapacity,
+
+    #[msg("The previous dispute for this target has not been settled yet")]
+    PreviousVerdictUnsettled,
+
+    #[msg("This verdict already records different evidence for this target")]
+    EvidenceMismatch,
+
+    #[msg("A tie-breaker that voted on the original verdict cannot judge its appeal")]
+    AppellateVotedOnVerdict,
+
+    #[msg("The appeal window has not elapsed yet")]
+    AppealWindowOpen,
+
+    #[msg("The bounty recipient must be a token account owned by someone other than the slashed participant")]
+    InvalidBountyRecipient,
+
+    #[msg("An audit verdict exists for this participant and must be provided")]
+    AuditVerdictRequired,
+
+    #[msg("The losing verifier is not in a slashable state yet; retry while it is")]
+    LoserNotSlashableYet,
 }

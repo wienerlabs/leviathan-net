@@ -4,17 +4,19 @@
 //! `participant_bond_finalize_withdraw` splits the slash bounty two ways. When
 //! the verdict names voters, each recipient is unpacked as a `TokenAccount` and
 //! checked against both the recorded voter and the collateral mint. When it
-//! names none, the bounty goes to `remaining_accounts[0]` with no check at all -
-//! and the account list is supplied by the withdrawing participant, who is the
-//! one being slashed.
+//! names none, the bounty goes to `remaining_accounts[0]` - an account the
+//! withdrawing participant supplies, and the withdrawing participant is the one
+//! being slashed.
 //!
-//! Reaching the unchecked branch does not need a missing verdict, only an
-//! *omitted* one: `audit_verdict` is an optional account, and Anchor skips every
-//! constraint on an optional account the client declines to pass. So the branch
-//! is reachable by anyone finalising a withdraw, whatever the committee decided.
+//! That branch used to check nothing at all, so naming your own token account
+//! handed you back the bounty half of your own forfeiture. It was reachable
+//! without a missing verdict too: `audit_verdict` was an optional account, and
+//! Anchor skips every constraint on an optional account the client declines to
+//! pass, so a participant convicted by a full quorum could simply leave the slot
+//! empty and fall into it.
 //!
-//! This test is `memnet_treasurer_bounty` with one line changed: the reporter
-//! token account is the slashed client's own.
+//! This test is `memnet_treasurer_bounty` with one line changed - the reporter
+//! token account is the slashed client's own - and it must now be refused.
 
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
@@ -65,9 +67,9 @@ const WITHDRAW_DELAY: i64 = 100;
 const BOUNTY_BPS: u16 = 5_000;
 
 /// The slashed client names its own token account as the bounty recipient and
-/// keeps the bounty half of its own forfeiture.
+/// is refused.
 #[tokio::test]
-pub async fn the_slashed_client_can_name_itself_as_the_bounty_recipient() {
+pub async fn the_slashed_client_cannot_name_itself_as_the_bounty_recipient() {
     let mut endpoint = create_memnet_endpoint().await;
 
     let payer = Keypair::new();
@@ -381,8 +383,7 @@ pub async fn the_slashed_client_can_name_itself_as_the_bounty_recipient() {
         .unwrap();
 
     // The only change from `memnet_treasurer_bounty`: the account handed over as
-    // the bounty recipient belongs to the client being slashed. Nothing in the
-    // program looks at whose account it is.
+    // the bounty recipient belongs to the client being slashed.
     process_treasurer_participant_bond_finalize_withdraw_with_reporter(
         &mut endpoint,
         &payer,
@@ -394,25 +395,40 @@ pub async fn the_slashed_client_can_name_itself_as_the_bounty_recipient() {
         &clients_collateral[cheater],
     )
     .await
+    .expect_err("a slashed participant cannot be its own reporter");
+
+    // Nothing moved: the withdrawal is refused whole, so the bond is still
+    // pending and the vault still holds it.
+    assert_amount(&mut endpoint, &clients_collateral[cheater], 0).await;
+    assert_amount(&mut endpoint, &run_collateral, BOND).await;
+
+    // Naming somebody else still works, and the run keeps its half.
+    let reporter = Keypair::new();
+    let reporter_collateral = endpoint
+        .process_spl_associated_token_account_get_or_init(
+            &payer,
+            &reporter.pubkey(),
+            &collateral_mint,
+        )
+        .await
+        .unwrap();
+    process_treasurer_participant_bond_finalize_withdraw_with_reporter(
+        &mut endpoint,
+        &payer,
+        &clients[cheater],
+        &clients_collateral[cheater],
+        &collateral_mint,
+        &run,
+        &coordinator_account,
+        &reporter_collateral,
+    )
+    .await
     .unwrap();
 
     let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
-
-    // The forfeiture is recorded in full - the slash itself worked.
+    assert_amount(&mut endpoint, &reporter_collateral, bounty).await;
+    assert_amount(&mut endpoint, &clients_collateral[cheater], BOND - SLASHING_RATE).await;
     assert_amount(&mut endpoint, &run_collateral, SLASHING_RATE - bounty).await;
-
-    // But the bounty came straight back to the client it was taken from, so the
-    // net loss is half of what the run configured.
-    assert_amount(
-        &mut endpoint,
-        &clients_collateral[cheater],
-        BOND - SLASHING_RATE + bounty,
-    )
-    .await;
-    assert_eq!(
-        bounty, 100,
-        "BUG: 100 of the 200 forfeited is returned to the slashed client"
-    );
 }
 
 async fn assert_amount(
