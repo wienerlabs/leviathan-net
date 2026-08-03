@@ -53,10 +53,24 @@ pub fn select_audits(
     audits
 }
 
+/// Audit assignments for the current round, drawn with the run's tie-breaker
+/// count.
+///
+/// The count has to be the one the treasurer gates votes with. Reserving
+/// tie-breaker seats both shrinks the verifier set and shifts its position
+/// window, so a verifier picked under a different count is a verifier the chain
+/// will refuse with `VerifierNotAssigned` - and the nodes it would have accepted
+/// were never told to audit anything. That is silent: the run stops convicting
+/// and nothing reports why (wienerlabs/leviathan#15, finding 4).
+///
+/// Callers read `Run::tie_breaker_committee_size` and pass it here. There is no
+/// default worth having: guessing zero is what produced the mismatch.
 pub fn select_audits_for_current_round(
     coordinator: &Coordinator,
+    tie_breaker_nodes: u16,
 ) -> Result<Vec<AuditAssignment>, CoordinatorError> {
-    let committee_selection = CommitteeSelection::from_coordinator(coordinator, 0)?;
+    let committee_selection =
+        CommitteeSelection::from_coordinator_with_tie_breakers(coordinator, 0, tie_breaker_nodes)?;
     let assignments = assign_data_for_state(coordinator, &committee_selection);
     Ok(select_audits(
         &committee_selection,
@@ -140,7 +154,7 @@ mod tests {
     #[test]
     fn test_zero_verification_percent_yields_no_audits() {
         let coordinator = create_test_coordinator(20, 160, 0, 777);
-        let audits = select_audits_for_current_round(&coordinator).unwrap();
+        let audits = select_audits_for_current_round(&coordinator, 0).unwrap();
         assert!(audits.is_empty());
     }
 
@@ -148,8 +162,8 @@ mod tests {
     fn test_seed_changes_assignments() {
         let coordinator_one = create_test_coordinator(20, 160, 20, 777);
         let coordinator_two = create_test_coordinator(20, 160, 20, 778);
-        let audits_one = select_audits_for_current_round(&coordinator_one).unwrap();
-        let audits_two = select_audits_for_current_round(&coordinator_two).unwrap();
+        let audits_one = select_audits_for_current_round(&coordinator_one, 0).unwrap();
+        let audits_two = select_audits_for_current_round(&coordinator_two, 0).unwrap();
         assert_eq!(audits_one.len(), 4);
         assert_eq!(audits_two.len(), 4);
         assert_ne!(audits_one, audits_two);
@@ -162,7 +176,7 @@ mod tests {
         assert_eq!(selection.get_num_verifier_nodes(), 10);
         assert_eq!(selection.get_num_trainer_nodes(), 90);
 
-        let audits = select_audits_for_current_round(&coordinator).unwrap();
+        let audits = select_audits_for_current_round(&coordinator, 0).unwrap();
         assert_eq!(audits.len(), 10);
 
         let mut audited_targets: Vec<_> =

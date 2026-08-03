@@ -419,25 +419,28 @@ mod tests {
         assert!(CommitteeSelection::new(10, 50, 101, u64::MAX as usize, 12345).is_err());
     }
 
-    /// The two constructors do not agree once tie-breakers are reserved, and
-    /// both are live at the same time: the verifier daemon picks its work with
-    /// `from_coordinator` (via `select_audits_for_current_round`, which passes
-    /// `round.tie_breaker_tasks` - always 0 today), while the treasurer decides
-    /// who may vote with `from_coordinator_with_tie_breakers`, passing the run's
-    /// `tie_breaker_committee_size`.
+    /// Why the tie-breaker count is an argument and not a default.
     ///
     /// Reserving tie-breakers both shrinks the verifier count and shifts the
-    /// verifier positions upward, so the two views name different nodes. A node
-    /// the daemon sends out to audit is then rejected on chain as
-    /// `VerifierNotAssigned`, which is what turning the appeals court on costs.
+    /// verifier positions upward, so two callers using different counts name
+    /// different nodes. That is exactly what used to happen: the daemon picked
+    /// its work with `from_coordinator` (via `select_audits_for_current_round`,
+    /// which passed `round.tie_breaker_tasks` - always 0), while the treasurer
+    /// gated votes with the run's `tie_breaker_committee_size`. Every verdict
+    /// came back `VerifierNotAssigned` and the run silently stopped convicting
+    /// (wienerlabs/leviathan#15, finding 4).
+    ///
+    /// `select_audits_for_current_round` now takes the count so its caller has
+    /// to fetch the run's value rather than assume one. This test holds the
+    /// reason: the two are genuinely different committees.
     #[test]
     fn reserving_tie_breakers_moves_the_verifier_set() {
         let total = 100;
         let seeded = 12345;
 
-        // What the daemon sees: no tie-breakers reserved.
+        // Assuming zero, which is what the daemon used to do.
         let daemon_view = CommitteeSelection::new(0, 0, 30, total, seeded).unwrap();
-        // What the chain enforces: the run reserves 10 tie-breaker seats.
+        // The run's actual setting, which is what the chain enforces.
         let chain_view = CommitteeSelection::new(10, 0, 30, total, seeded).unwrap();
 
         assert_eq!(daemon_view.get_num_verifier_nodes(), 30);
@@ -452,10 +455,11 @@ mod tests {
         let chain_verifiers = verifiers(&chain_view);
         assert_ne!(
             daemon_verifiers, chain_verifiers,
-            "the daemon and the chain must not be allowed to disagree on who is a verifier"
+            "a wrong tie-breaker count is a wrong verifier set, not a near miss"
         );
 
-        // Concretely: nodes the daemon sends out to audit that the chain refuses.
+        // Concretely: nodes that would audit under one count and be refused
+        // under the other.
         let rejected = daemon_verifiers
             .iter()
             .filter(|index| !chain_verifiers.contains(index))
@@ -464,6 +468,10 @@ mod tests {
             rejected > 0,
             "at least one node audits under one rule and is refused under the other"
         );
+
+        // Passing the run's own count gives the chain's committee back, which is
+        // what the daemon now does.
+        assert_eq!(verifiers(&CommitteeSelection::new(10, 0, 30, total, seeded).unwrap()), chain_verifiers);
     }
 
     #[test]
