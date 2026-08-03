@@ -1,17 +1,21 @@
-//! Reproduces the unvalidated warmup witness index found in the internal review
-//! of the on-chain programs (wienerlabs/leviathan#15).
+//! Holds the fix for the unvalidated warmup witness index
+//! (wienerlabs/leviathan#15, finding 15).
 //!
 //! `Coordinator::witness` verifies the caller's proof before storing it, so
 //! `proof.index` is known to be in range. `Coordinator::warmup_witness`
-//! deliberately does not - "everyone can send a witness in the warmup phase so
-//! we don't need to check for the committee" - but the duplicate check that runs
-//! on the *next* warmup witness reads the stored index back and uses it to index
-//! `epoch_state.clients` directly.
+//! deliberately does not check committee membership - everyone may witness
+//! during warmup - but it used to skip the index entirely, and the duplicate
+//! check that runs on the *next* warmup witness reads the stored index back and
+//! indexes `epoch_state.clients` with it.
 //!
 //! `FixedVec`'s `Index` impl is `self.get(index).expect("Index out of bounds")`,
-//! so an out-of-range index stored by one client aborts the transaction of every
-//! client that witnesses after it, for as long as the round's witness list
-//! holds it.
+//! so one client could store an index nobody had looked at and abort every
+//! other client's warmup witness for the rest of the round. Naming somebody
+//! else's index was just as bad in a quieter way: the duplicate check would then
+//! read that client as having already witnessed.
+//!
+//! Both are closed by the same check - the index has to name the sender - which
+//! is not a committee check, so warmup stays open to everyone.
 
 use psyche_coordinator::Client;
 use psyche_coordinator::ClientState;
@@ -55,39 +59,77 @@ fn witness_with_index(index: u64) -> Witness {
     }
 }
 
-/// A witness naming a client index that does not exist is accepted, because the
-/// warmup path stores the proof without looking at it.
+/// An index that resolves to nothing is refused, so it is never stored and can
+/// never be read back.
 #[test]
-fn an_out_of_range_warmup_witness_is_accepted() {
+fn an_out_of_range_warmup_witness_is_refused() {
     let mut coordinator = warming_up();
-    coordinator
-        .warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, 7)
-        .expect("BUG: the warmup path stores an index it never checked");
+    assert!(
+        coordinator
+            .warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, 7)
+            .is_err(),
+        "an index nobody can resolve is not a witness"
+    );
     assert_eq!(
         coordinator.current_round().unwrap().witnesses.len(),
-        1,
-        "the poisoned witness is now in the round"
+        0,
+        "and nothing is stored for the next caller to trip over"
     );
 }
 
-/// And the next client to witness in that round pays for it: the duplicate check
-/// reads the stored index back and panics out of bounds, taking the whole
-/// transaction with it.
+/// So the honest client that witnesses next is unaffected. This is the case
+/// that used to abort.
 #[test]
-#[should_panic(expected = "Index out of bounds")]
-fn a_later_warmup_witness_panics_on_the_stored_index() {
+fn a_later_warmup_witness_is_unaffected() {
     let mut coordinator = warming_up();
-    coordinator
-        .warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, 7)
-        .unwrap();
+    let _ = coordinator.warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, 7);
 
-    // An honest second client, with a perfectly valid proof of its own.
-    let _ = coordinator.warmup_witness(&client(2).id, witness_with_index(1), 1_001, 7);
+    coordinator
+        .warmup_witness(&client(2).id, witness_with_index(1), 1_001, 7)
+        .expect("an honest witness with its own index still goes through");
+    assert_eq!(coordinator.current_round().unwrap().witnesses.len(), 1);
 }
 
-/// The same shape of input on the round-witness path is rejected instead, which
-/// is what the warmup path should be doing: `verify_witness_for_client` bounds
-/// checks the index before anything stores it.
+/// Claiming another client's index is refused too. It is in range, so a bounds
+/// check alone would have let it through - and the duplicate check would then
+/// have counted that client as having witnessed.
+#[test]
+fn a_warmup_witness_cannot_claim_another_clients_index() {
+    let mut coordinator = warming_up();
+    assert!(
+        coordinator
+            .warmup_witness(&client(1).id, witness_with_index(2), 1_000, 7)
+            .is_err(),
+        "client 1 sits at index 0, not index 2"
+    );
+
+    // And the client whose index was borrowed can still witness for itself.
+    coordinator
+        .warmup_witness(&client(3).id, witness_with_index(2), 1_001, 7)
+        .expect("client 3 does sit at index 2");
+}
+
+/// The honest path is unchanged: every client witnesses once, from its own
+/// index, and a second attempt is the duplicate it always was.
+#[test]
+fn every_client_may_witness_once_from_its_own_index() {
+    let mut coordinator = warming_up();
+    for (index, seed) in [(0u64, 1u8), (1, 2)] {
+        coordinator
+            .warmup_witness(&client(seed).id, witness_with_index(index), 1_000, 7)
+            .expect("warmup is open to everyone");
+    }
+    assert_eq!(coordinator.current_round().unwrap().witnesses.len(), 2);
+
+    assert!(
+        coordinator
+            .warmup_witness(&client(1).id, witness_with_index(0), 1_002, 7)
+            .is_err(),
+        "twice is still a duplicate"
+    );
+}
+
+/// The round-witness path was always checked, and still is.
 #[test]
 fn the_round_witness_path_rejects_the_same_input() {
     let mut coordinator = warming_up();

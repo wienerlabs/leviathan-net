@@ -1,16 +1,15 @@
 //! Records a landmine found in the second pass of the internal review
 //! (wienerlabs/leviathan#15).
 //!
-//! `assign_data_for_state` asserts that no round ever reserves tie-breaker
-//! tasks. The assert is dormant because `start_round_train` is called with
-//! `tie_breaker_tasks = 0` at every one of its call sites, so
-//! `CommitteeSelection::from_coordinator` never produces a TieBreaker seat.
+//! `assign_data_for_state` used to assert that no round ever reserves
+//! tie-breaker tasks. The assert was dormant only because `start_round_train`
+//! was called with `tie_breaker_tasks = 0` at every one of its call sites.
 //!
-//! That matters because the recommended fix for the daemon/chain committee
-//! mismatch (finding 4) is to write the run's `tie_breaker_committee_size` into
-//! `round.tie_breaker_tasks`, so that both sides derive the same committee from
-//! one field. Doing that walks straight into this assert. The fix has to teach
-//! `assign_data_for_state` to skip tie-breakers first.
+//! It had to go before finding 4 could be fixed: that fix writes the run's
+//! `tie_breaker_committee_size` into `round.tie_breaker_tasks` so the daemon and
+//! the chain derive one committee from one field, which would have walked
+//! straight into the assert on the first round. Tie-breakers are now skipped
+//! the same way verifiers always were - they are simply not trainers.
 
 use psyche_coordinator::Client;
 use psyche_coordinator::ClientState;
@@ -61,11 +60,26 @@ fn no_tie_breakers_assigns_data_normally() {
     );
 }
 
-/// Reserve even one tie-breaker seat and the same call aborts.
+/// Reserving tie-breaker seats is now an ordinary configuration: the seats are
+/// skipped, the trainers that remain still get the whole batch, and nothing
+/// aborts.
 #[test]
-#[should_panic(expected = "assertion")]
-fn reserving_a_tie_breaker_seat_trips_the_assert() {
+fn reserving_tie_breaker_seats_just_leaves_them_out_of_the_data() {
     let coordinator = coordinator_with(2);
     let selection = CommitteeSelection::from_coordinator(&coordinator, 0).unwrap();
-    let _ = assign_data_for_state(&coordinator, &selection);
+    let assignments = assign_data_for_state(&coordinator, &selection);
+
+    assert!(!assignments.is_empty(), "the trainers still get data");
+    assert_eq!(
+        assignments.len(),
+        selection.get_num_trainer_nodes() as usize,
+        "one batch per trainer, and none for the reserved seats"
+    );
+
+    // The batch is covered exactly once, with no hole where a tie-breaker was.
+    let total: u64 = assignments
+        .keys()
+        .map(|batch| batch.0.end - batch.0.start + 1)
+        .sum();
+    assert_eq!(total, 64, "the whole global batch is still assigned");
 }

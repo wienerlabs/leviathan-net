@@ -9,15 +9,17 @@
 //! ejected clients are matched back to their permanent records and charged
 //! `slashing_rate_per_client`.
 //!
-//! That match is a forward-only merge walk. It steps through
-//! `clients_state.clients` (permanent, in join order) with a single cursor into
-//! `epoch_state.exited_clients` - and `exited_clients` is in *exit* order, not
-//! join order, because `move_clients_to_exited` appends a fresh batch at the end
-//! of every round. When the two orders disagree the cursor walks past a client
-//! and never comes back, so that client's slash is silently dropped.
+//! That match used to be a forward-only merge walk: one cursor stepping through
+//! `clients_state.clients` (permanent, in join order) into
+//! `epoch_state.exited_clients` - which is in *exit* order, not join order,
+//! because `move_clients_to_exited` appends a fresh batch at the end of every
+//! round. When the two orders disagreed the cursor walked past a client and
+//! never came back, so that client's slash was dropped in silence and it
+//! withdrew its whole bond after a conviction that is on chain.
 //!
-//! This test builds the smallest disagreement that exists: two clients ejected
-//! in different rounds, the earlier-joined one ejected second.
+//! This test builds the smallest disagreement that exists - two clients ejected
+//! in different rounds, the earlier-joined one ejected second - and holds the
+//! matching to it.
 
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
@@ -67,10 +69,9 @@ const SLASHING_RATE: u64 = 200;
 const WITHDRAW_DELAY: i64 = 100;
 
 /// Two clients are ejected in the same epoch, in different rounds, and the one
-/// that joined first is ejected second. Only the second entry of
-/// `exited_clients` is ever reached, so the first-joined client keeps its bond.
+/// that joined first is ejected second. Both forfeit.
 #[tokio::test]
-pub async fn exiting_out_of_join_order_voids_the_slash() {
+pub async fn exiting_out_of_join_order_still_forfeits() {
     let mut endpoint = create_memnet_endpoint().await;
 
     let payer = Keypair::new();
@@ -386,22 +387,27 @@ pub async fn exiting_out_of_join_order_voids_the_slash() {
         .unwrap()
         .unwrap();
 
-    // The client the cursor happened to land on is charged correctly.
     assert_eq!(
         slashed_points(&settled, &clients[last_out_first].pubkey()),
         SLASHING_RATE,
-        "the client the cursor reached is slashed as designed"
+        "the client that exited first is charged"
     );
 
-    // The client it walked past is not. Both were Ejected; only one pays.
+    // The one the old cursor walked past. Both were Ejected; both pay.
     assert_eq!(
         slashed_points(&settled, &clients[first_out_last].pubkey()),
-        0,
-        "BUG: an ejected client that exited out of join order is never charged"
+        SLASHING_RATE,
+        "an ejected client that exited out of join order is charged too"
     );
 
-    // And the accounting gap is real money: the conviction is on chain, the
-    // client is out of the run, and the bond still comes back whole.
+    // The bystander stayed healthy all epoch and owes nothing.
+    assert_eq!(
+        slashed_points(&settled, &clients[1].pubkey()),
+        0,
+        "a client that was never ejected is not charged"
+    );
+
+    // And the accounting reaches the money: the forfeit comes out of the bond.
     process_treasurer_participant_bond_request_withdraw(
         &mut endpoint,
         &payer,
@@ -434,8 +440,8 @@ pub async fn exiting_out_of_join_order_voids_the_slash() {
             .unwrap()
             .unwrap()
             .amount,
-        BOND,
-        "BUG: a convicted, ejected client withdraws its full bond, forfeiting nothing"
+        BOND - SLASHING_RATE,
+        "a convicted, ejected client withdraws its bond less the forfeit"
     );
 }
 

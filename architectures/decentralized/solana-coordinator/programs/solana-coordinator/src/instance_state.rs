@@ -130,41 +130,46 @@ impl CoordinatorInstanceState {
             Ok(TickResult::EpochEnd(success)) => {
                 msg!("Epoch end, sucecsss: {}", success);
 
+                // This is where a conviction becomes money. Every slash path in
+                // the treasurer ends in `eject`, which only sets a state flag;
+                // the flag is charged against the bond here, once per epoch.
+                //
+                // Match by identity. The permanent records are in join order and
+                // `exited_clients` is in exit order - `move_clients_to_exited`
+                // appends a fresh batch at the end of every round - so the two
+                // lists disagree whenever a client that joined earlier exits
+                // later. A single forward cursor over both walks past that
+                // client and never comes back, and its slash is dropped in
+                // silence (wienerlabs/leviathan#15, finding 1).
                 let finished_clients = &self.coordinator.epoch_state.clients;
                 let exited_clients =
                     &self.coordinator.epoch_state.exited_clients;
 
-                let mut finished_client_index = 0;
-                let mut exited_client_index = 0;
+                let earned_share = match finished_clients.len() {
+                    0 => 0,
+                    finishers => self
+                        .clients_state
+                        .current_epoch_rates
+                        .earning_rate_total_shared
+                        .saturating_div(finishers as u64),
+                };
+                let slashing_rate = self
+                    .clients_state
+                    .current_epoch_rates
+                    .slashing_rate_per_client;
 
                 for client in self.clients_state.clients.iter_mut() {
-                    if finished_client_index < finished_clients.len()
-                        && client.id
-                            == finished_clients[finished_client_index].id
-                    {
-                        if finished_clients[finished_client_index].state
-                            == ClientState::Healthy
-                        {
-                            client.earned += self
-                                .clients_state
-                                .current_epoch_rates
-                                .earning_rate_total_shared
-                                .saturating_div(finished_clients.len() as u64);
-                        }
-                        finished_client_index += 1;
+                    if finished_clients.iter().any(|finished| {
+                        finished.id == client.id
+                            && finished.state == ClientState::Healthy
+                    }) {
+                        client.earned += earned_share;
                     }
-                    if exited_client_index < exited_clients.len()
-                        && client.id == exited_clients[exited_client_index].id
-                    {
-                        if exited_clients[exited_client_index].state
-                            == ClientState::Ejected
-                        {
-                            client.slashed += self
-                                .clients_state
-                                .current_epoch_rates
-                                .slashing_rate_per_client;
-                        }
-                        exited_client_index += 1;
+                    if exited_clients.iter().any(|exited| {
+                        exited.id == client.id
+                            && exited.state == ClientState::Ejected
+                    }) {
+                        client.slashed += slashing_rate;
                     }
                 }
             },
