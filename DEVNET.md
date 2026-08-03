@@ -75,6 +75,10 @@ The wallet still needs devnet SOL, and the run only advances while a client is
 connected, so bring several nodes up together inside the same
 `WaitingForMembers` window rather than one at a time.
 
+`docs/NOSANA.md` covers renting the hosts to run this on: a job definition that
+works, the settings that fail silently without it, the client limit a run has,
+and what three nodes actually cost.
+
 ### Dashboard telemetry
 
 `leviathan-indexer --features live` reads a coordinator account and prints run
