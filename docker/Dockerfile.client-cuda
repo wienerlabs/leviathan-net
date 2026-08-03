@@ -1,0 +1,68 @@
+# A client image built with plain Docker rather than nix.
+#
+# The nix image (`docker-psyche-solana-client`) is the one CI publishes, but its
+# closure includes CUDA built from source, which no public binary cache carries,
+# so it cannot be produced inside a GitHub Actions job. This one takes CUDA from
+# NVIDIA's own base image and libtorch from the same PyTorch wheel the tch fork
+# pins, so it builds in a normal runner and gives rented GPU hosts a client that
+# starts in seconds instead of compiling for 45 minutes on every boot.
+#
+# It mirrors what `scripts/leviathan-node.sh` sets up on an operator's machine.
+
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git curl ca-certificates build-essential pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
+
+# The tch fork pins PyTorch 2.9.1; the client links libtorch out of this venv.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/root/.local/bin:$PATH
+ENV TORCH_VENV=/opt/torch-venv
+RUN uv venv --python 3.11 "$TORCH_VENV" \
+ && uv pip install --python "$TORCH_VENV/bin/python" torch==2.9.1 numpy setuptools
+
+ENV LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    PYO3_PYTHON=/opt/torch-venv/bin/python \
+    LD_LIBRARY_PATH=/opt/torch-venv/lib/python3.11/site-packages/torch/lib
+
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p psyche-solana-client
+
+# Runtime carries the driver-facing CUDA libraries, the torch venv and one binary.
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/torch-venv /opt/torch-venv
+COPY --from=builder /src/target/release/psyche-solana-client /usr/local/bin/psyche-solana-client
+COPY docker/leviathan_client_entrypoint.sh /usr/local/bin/leviathan_client_entrypoint.sh
+RUN chmod +x /usr/local/bin/leviathan_client_entrypoint.sh
+
+ENV LD_LIBRARY_PATH=/opt/torch-venv/lib/python3.11/site-packages/torch/lib \
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    PYO3_PYTHON=/opt/torch-venv/bin/python \
+    RUST_LOG=info,psyche=info
+# NVIDIA_VISIBLE_DEVICES is what makes the container runtime inject the driver;
+# without it the client reports no GPU on hosts that have one.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+# Default to the public n0 relays: the psyche relays refuse the TLS handshake from
+# outside our own infrastructure, and a node that cannot reach a relay never
+# submits its join. Override with IROH_RELAY=psyche on an internal host.
+ENV IROH_RELAY=n0 \
+    IROH_DISCOVERY=n0
+
+ENTRYPOINT ["/usr/local/bin/leviathan_client_entrypoint.sh"]
