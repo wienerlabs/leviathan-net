@@ -30,9 +30,15 @@ Read state without a wallet:
 run-manager json-dump-run --run-id leviathan-devnet --rpc <rpc>
 ```
 
-### Publish telemetry
+### Read a run without a node
 
-The dashboard consumes `telemetry.json`. Refresh it from the coordinator account:
+The dashboard no longer consumes a published file. It decodes the coordinator
+and treasurer accounts in the browser, so there is nothing to refresh and no
+cross-repo write token to keep alive. The hourly `publish telemetry` action that
+used to do this is gone.
+
+`leviathan-indexer` still prints a run as JSON when you want one on the command
+line rather than in a browser:
 
 ```
 OUT=telemetry.json ./scripts/publish-telemetry.sh \
@@ -40,8 +46,20 @@ OUT=telemetry.json ./scripts/publish-telemetry.sh \
   --reward-per-round <r> --bond <b> --slash-when-caught <s>
 ```
 
-The `publish telemetry` GitHub Action does this every 15 minutes. Point the
-dashboard's `VITE_TELEMETRY_URL` at the committed file.
+### Publish the fleet summary
+
+Hardware is not on chain, so the dashboard's fleet panel is fed out of band.
+Each node reports itself, and the operator folds the reports into counts:
+
+```
+leviathan-fleet report --out node-01.json
+leviathan-fleet summarize node-*.json --out fleet.json
+```
+
+Publish `fleet.json` to the site and point `VITE_FLEET_URL` at it. Only the
+summary is published, never the per-node reports: `random_seed` is public, so
+the verifier seats for a round are already computable by anyone, and naming the
+machine behind each identity turns that into a target list.
 
 ### A dedicated RPC is not optional
 

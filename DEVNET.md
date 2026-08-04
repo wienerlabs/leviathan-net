@@ -91,10 +91,10 @@ OUT=telemetry.json ./scripts/publish-telemetry.sh \
   --reward-per-round 0.324 --bond 10.55 --slash-when-caught 10.55
 ```
 
-The economics flags add the on-chain economic security verdict. The
-`publish telemetry` GitHub Action runs this every 15 minutes and commits
-`telemetry.json`; point the leviathan-web dashboard's `VITE_TELEMETRY_URL` at the
-raw file to make it live.
+The economics flags add the on-chain economic security verdict. This is for the
+command line only. The dashboard reads the coordinator and treasurer accounts
+itself, so it needs nothing published and there is no action keeping a file in
+sync any more.
 
 ### Configure once
 
