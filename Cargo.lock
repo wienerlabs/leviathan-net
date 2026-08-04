@@ -4998,6 +4998,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "leviathan-fleet"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "psyche-metrics",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "leviathan-indexer"
 version = "0.2.0"
 dependencies = [
@@ -7247,6 +7258,7 @@ dependencies = [
  "cfg_eval",
  "psyche-core",
  "serde",
+ "serde_json",
  "serde_with",
  "ts-rs",
 ]
@@ -7620,6 +7632,7 @@ dependencies = [
  "psyche-core",
  "psyche-solana-authorizer",
  "serde",
+ "serde_json",
  "ts-rs",
 ]
 

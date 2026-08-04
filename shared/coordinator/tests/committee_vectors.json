@@ -1,0 +1,900 @@
+[
+  {
+    "tie_breaker_nodes": 0,
+    "witness_nodes": 0,
+    "verification_percent": 0,
+    "total_nodes": 1,
+    "random_seed": "11714962589530486504",
+    "verifier_nodes": 0,
+    "assignments": [
+      {
+        "index": 0,
+        "position": 0,
+        "role": "Trainer",
+        "witness": true
+      }
+    ]
+  },
+  {
+    "tie_breaker_nodes": 0,
+    "witness_nodes": 0,
+    "verification_percent": 50,
+    "total_nodes": 6,
+    "random_seed": "1924996481851443602",
+    "verifier_nodes": 3,
+    "assignments": [
+      {
+        "index": 0,
+        "position": 2,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 1,
+        "position": 3,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 2,
+        "position": 0,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 3,
+        "position": 5,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 4,
+        "position": 1,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 5,
+        "position": 4,
+        "role": "Trainer",
+        "witness": true
+      }
+    ]
+  },
+  {
+    "tie_breaker_nodes": 3,
+    "witness_nodes": 4,
+    "verification_percent": 50,
+    "total_nodes": 12,
+    "random_seed": "855779524057918524",
+    "verifier_nodes": 4,
+    "assignments": [
+      {
+        "index": 0,
+        "position": 1,
+        "role": "Tie breaker",
+        "witness": true
+      },
+      {
+        "index": 1,
+        "position": 4,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 2,
+        "position": 7,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 3,
+        "position": 2,
+        "role": "Tie breaker",
+        "witness": false
+      },
+      {
+        "index": 4,
+        "position": 6,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 5,
+        "position": 11,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 6,
+        "position": 10,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 7,
+        "position": 3,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 8,
+        "position": 5,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 9,
+        "position": 0,
+        "role": "Tie breaker",
+        "witness": false
+      },
+      {
+        "index": 10,
+        "position": 9,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 11,
+        "position": 8,
+        "role": "Trainer",
+        "witness": false
+      }
+    ]
+  },
+  {
+    "tie_breaker_nodes": 2,
+    "witness_nodes": 8,
+    "verification_percent": 100,
+    "total_nodes": 20,
+    "random_seed": "14660810609320035160",
+    "verifier_nodes": 18,
+    "assignments": [
+      {
+        "index": 0,
+        "position": 3,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 1,
+        "position": 0,
+        "role": "Tie breaker",
+        "witness": false
+      },
+      {
+        "index": 2,
+        "position": 2,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 3,
+        "position": 17,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 4,
+        "position": 16,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 5,
+        "position": 19,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 6,
+        "position": 8,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 7,
+        "position": 11,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 8,
+        "position": 15,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 9,
+        "position": 13,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 10,
+        "position": 9,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 11,
+        "position": 5,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 12,
+        "position": 10,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 13,
+        "position": 7,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 14,
+        "position": 14,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 15,
+        "position": 4,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 16,
+        "position": 18,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 17,
+        "position": 6,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 18,
+        "position": 1,
+        "role": "Tie breaker",
+        "witness": false
+      },
+      {
+        "index": 19,
+        "position": 12,
+        "role": "Verifier",
+        "witness": false
+      }
+    ]
+  },
+  {
+    "tie_breaker_nodes": 0,
+    "witness_nodes": 32,
+    "verification_percent": 33,
+    "total_nodes": 64,
+    "random_seed": "17594232420418697730",
+    "verifier_nodes": 21,
+    "assignments": [
+      {
+        "index": 0,
+        "position": 38,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 1,
+        "position": 35,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 2,
+        "position": 25,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 3,
+        "position": 45,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 4,
+        "position": 40,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 5,
+        "position": 0,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 6,
+        "position": 48,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 7,
+        "position": 50,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 8,
+        "position": 16,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 9,
+        "position": 34,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 10,
+        "position": 32,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 11,
+        "position": 61,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 12,
+        "position": 37,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 13,
+        "position": 47,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 14,
+        "position": 5,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 15,
+        "position": 62,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 16,
+        "position": 30,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 17,
+        "position": 59,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 18,
+        "position": 3,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 19,
+        "position": 1,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 20,
+        "position": 13,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 21,
+        "position": 53,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 22,
+        "position": 22,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 23,
+        "position": 7,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 24,
+        "position": 52,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 25,
+        "position": 46,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 26,
+        "position": 17,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 27,
+        "position": 39,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 28,
+        "position": 29,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 29,
+        "position": 19,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 30,
+        "position": 24,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 31,
+        "position": 28,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 32,
+        "position": 56,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 33,
+        "position": 8,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 34,
+        "position": 49,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 35,
+        "position": 33,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 36,
+        "position": 36,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 37,
+        "position": 44,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 38,
+        "position": 21,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 39,
+        "position": 23,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 40,
+        "position": 15,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 41,
+        "position": 9,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 42,
+        "position": 6,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 43,
+        "position": 10,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 44,
+        "position": 55,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 45,
+        "position": 58,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 46,
+        "position": 12,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 47,
+        "position": 63,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 48,
+        "position": 4,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 49,
+        "position": 31,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 50,
+        "position": 42,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 51,
+        "position": 20,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 52,
+        "position": 18,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 53,
+        "position": 51,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 54,
+        "position": 57,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 55,
+        "position": 43,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 56,
+        "position": 26,
+        "role": "Trainer",
+        "witness": false
+      },
+      {
+        "index": 57,
+        "position": 11,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 58,
+        "position": 14,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 59,
+        "position": 41,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 60,
+        "position": 54,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 61,
+        "position": 27,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 62,
+        "position": 2,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 63,
+        "position": 60,
+        "role": "Trainer",
+        "witness": true
+      }
+    ]
+  },
+  {
+    "tie_breaker_nodes": 5,
+    "witness_nodes": 0,
+    "verification_percent": 67,
+    "total_nodes": 33,
+    "random_seed": "15982172444493427426",
+    "verifier_nodes": 18,
+    "assignments": [
+      {
+        "index": 0,
+        "position": 16,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 1,
+        "position": 19,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 2,
+        "position": 30,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 3,
+        "position": 1,
+        "role": "Tie breaker",
+        "witness": true
+      },
+      {
+        "index": 4,
+        "position": 32,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 5,
+        "position": 10,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 6,
+        "position": 29,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 7,
+        "position": 31,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 8,
+        "position": 22,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 9,
+        "position": 26,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 10,
+        "position": 23,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 11,
+        "position": 21,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 12,
+        "position": 15,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 13,
+        "position": 27,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 14,
+        "position": 25,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 15,
+        "position": 9,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 16,
+        "position": 18,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 17,
+        "position": 4,
+        "role": "Tie breaker",
+        "witness": true
+      },
+      {
+        "index": 18,
+        "position": 6,
+        "role": "Verifier",
+        "witness": false
+      },
+      {
+        "index": 19,
+        "position": 8,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 20,
+        "position": 11,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 21,
+        "position": 24,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 22,
+        "position": 0,
+        "role": "Tie breaker",
+        "witness": true
+      },
+      {
+        "index": 23,
+        "position": 20,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 24,
+        "position": 14,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 25,
+        "position": 7,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 26,
+        "position": 17,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 27,
+        "position": 28,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 28,
+        "position": 12,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 29,
+        "position": 3,
+        "role": "Tie breaker",
+        "witness": true
+      },
+      {
+        "index": 30,
+        "position": 13,
+        "role": "Verifier",
+        "witness": true
+      },
+      {
+        "index": 31,
+        "position": 2,
+        "role": "Tie breaker",
+        "witness": true
+      },
+      {
+        "index": 32,
+        "position": 5,
+        "role": "Verifier",
+        "witness": true
+      }
+    ]
+  },
+  {
+    "tie_breaker_nodes": 1,
+    "witness_nodes": 1,
+    "verification_percent": 10,
+    "total_nodes": 2,
+    "random_seed": "0",
+    "verifier_nodes": 0,
+    "assignments": [
+      {
+        "index": 0,
+        "position": 1,
+        "role": "Trainer",
+        "witness": true
+      },
+      {
+        "index": 1,
+        "position": 0,
+        "role": "Tie breaker",
+        "witness": false
+      }
+    ]
+  }
+]

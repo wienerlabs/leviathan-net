@@ -1,3 +1,4 @@
+pub mod hardware;
 mod iroh;
 
 use std::{

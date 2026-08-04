@@ -1,6 +1,9 @@
 #![allow(unexpected_cfgs)]
 mod client;
-mod clients_state;
+// Public because the earned and slashed ledger lives in here, and the readers
+// that need it - the indexer, the layout test the web decoder is pinned to -
+// are outside this crate.
+pub mod clients_state;
 mod instance_state;
 pub mod logic;
 mod program_error;

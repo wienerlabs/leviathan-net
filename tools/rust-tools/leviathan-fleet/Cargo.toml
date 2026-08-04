@@ -1,0 +1,15 @@
+[package]
+name = "leviathan-fleet"
+edition = "2021"
+version.workspace = true
+
+[[bin]]
+name = "leviathan-fleet"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+psyche-metrics.workspace = true
+serde.workspace = true
+serde_json.workspace = true

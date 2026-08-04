@@ -42,3 +42,6 @@ psyche-solana-authorizer = { path = "../../../solana-authorizer/programs/solana-
 ts-rs = { git = "https://github.com/arilotter/ts-rs.git", rev = "20c5bef07f3aa8ca3aa1b5cdad11ecdd60c64d34", features = [
   "psyche-impl",
 ] }
+
+[dev-dependencies]
+serde_json = "1"
