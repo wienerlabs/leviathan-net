@@ -57,6 +57,11 @@ const WAITING_EXTRA: u8 = 3;
 const SLEEP_BUFFER: u64 = 3;
 const CHALLENGE_WINDOW: i64 = 60;
 const TIE_BREAKER_SIZE: u16 = 2;
+// The ceiling a challenge may hold a conviction open before the verifiers'
+// verdict finalises anyway (leviathan#15, finding 10). A tie-breaker quorum
+// resolves the appeal immediately, so this is only ever the ceiling; kept large,
+// as in memnet_treasurer_appeals, so the overturn is never pre-empted by it.
+const APPEAL_WINDOW: i64 = 10_000;
 const EPOCH_TIME: u64 = 120;
 
 async fn sleep_seconds(seconds: u64) {
@@ -168,6 +173,7 @@ async fn main() -> Result<()> {
         &run,
         CHALLENGE_WINDOW,
         TIE_BREAKER_SIZE,
+        APPEAL_WINDOW,
     )
     .await
     .unwrap();
