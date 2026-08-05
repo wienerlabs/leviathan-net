@@ -48,6 +48,11 @@ path = "src/bin/devnet_appeals_demo.rs"
 required-features = ["demo"]
 
 [[bin]]
+name = "devnet-bond-gated-claim-demo"
+path = "src/bin/devnet_bond_gated_claim_demo.rs"
+required-features = ["demo"]
+
+[[bin]]
 name = "leviathan-verifier-daemon"
 path = "src/bin/verifier_daemon.rs"
 required-features = ["daemon"]
