@@ -80,6 +80,15 @@ Paste into the Nosana dashboard, one market at a time:
 }
 ```
 
+The clone above pulls the default branch, which is correct once this lands on
+`main`. **Before it is merged**, point the clone at the PR branch instead, or
+`cargo build` fails with `no bin target named calibrate-band`:
+
+```
+git clone --depth 1 --branch feat/band-calibration-harness-issue-7 \
+  https://github.com/wienerlabs/leviathan-net /opt/leviathan-net
+```
+
 The first build takes 10–20 minutes on a rented host; set the container timeout
 to at least 40 minutes. The last line printed is the JSON to collect. Availability
 binds harder than price — see `docs/NOSANA.md` for which GPU markets can actually
