@@ -45,12 +45,14 @@ cargo build -p leviathan-verifier --bin calibrate-band
 If reference and target are identical the drift is ~0 and the tool says so — vary
 `--target-device` or `--target-dtype` to measure a real class.
 
-An early observation worth recording: bf16 honest drift on the nano model is
-**highly variable** — most batches sit near `3e-3`, but a single batch can spike
-past `0.2`, because bf16 rounding flips which coefficients DisTrO's top-k keeps,
-and a different sparse support decompresses to a very different dense vector. A
-band picked from a handful of samples will swing wildly, so calibrate from a
-healthy sample count (32+).
+A word of caution about the CPU path, worth recording: fp32-vs-bf16 drift
+measured with bf16 **on CPU** is misleading. It sits near `3e-3` for most batches
+but a single batch can spike past `0.2`, because CPU bf16 is emulated and the
+rounding occasionally flips which coefficients DisTrO's top-k keeps, so a
+different sparse support decompresses to a very different dense vector. On a real
+accelerator (see the RTX 3060 Ti row below) native bf16 does not do this — the
+drift stays tight around `4e-3`. So calibrate on the actual hardware class, not on
+a CPU bf16 stand-in, and use a healthy sample count (32+) either way.
 
 ## Running it per hardware class on Nosana
 
@@ -102,7 +104,15 @@ larger audit probability is needed to keep a cheater's expected value negative.
 
 | Hardware class | dtype | samples | drift max | safety | **band** | default 0.05 adequate? |
 |---|---|---|---|---|---|---|
-| _(fill from Nosana runs)_ | bf16 | 32 | | 5.0 | | |
+| NVIDIA GeForce RTX 3060 Ti | bf16 | 32 | 0.005804 | 5.0 | **0.029019** | yes (0.029 < 0.05) |
+| _(more classes as measured)_ | bf16 | 32 | | 5.0 | | |
+
+The 3060 Ti drift was tight across all 32 batches (min 0.00258, mean 0.00366,
+max 0.00580), so its calibrated band (0.029) sits comfortably under the shipped
+default (0.05): honest 3060 Ti nodes will not be falsely convicted, and the band
+is not so wide that it hands a cheater room. The 3060 class is the swarm's most
+common and cheapest-to-rent hardware (see `docs/NOSANA.md`), so this covers the
+dominant case; 24 GB classes (3090/4090) are worth adding before mainnet.
 
 Reference config for all rows: `cpu / fp32`. If the verifier policy changes to
 replay on a GPU instead, re-run with `--reference-device cuda` and record that
