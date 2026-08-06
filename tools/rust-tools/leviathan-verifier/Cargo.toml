@@ -15,6 +15,10 @@ path = "src/bin/nano_dataset.rs"
 name = "nano-contribute"
 path = "src/bin/nano_contribute.rs"
 
+[[bin]]
+name = "calibrate-band"
+path = "src/bin/calibrate_band.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
