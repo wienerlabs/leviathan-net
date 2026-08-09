@@ -93,6 +93,9 @@ fn nano_trainer() -> Trainer {
         clip_grad_norm: Some(1.0),
         quantize_1bit: false,
         device: tch::Device::Cpu,
+        // Matches the daemon, so this suite keeps checking what the daemon
+        // actually does rather than a dtype only the test uses.
+        kind: tch::Kind::Float,
     })
     .expect("the replay trainer must build")
 }
