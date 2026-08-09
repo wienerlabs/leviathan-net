@@ -27,9 +27,12 @@ use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_a
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_voters;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_slash_bounty;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_update;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
@@ -44,6 +47,7 @@ use solana_toolbox_endpoint::ToolboxEndpoint;
 
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
+const BOUNTY_BPS: u16 = 5_000;
 const WITHDRAW_DELAY: i64 = 5;
 const WARMUP_TIME: u64 = 3;
 const WITNESS_TIME: u64 = 3;
@@ -53,6 +57,15 @@ const SLEEP_BUFFER: u64 = 3;
 
 async fn sleep_seconds(seconds: u64) {
     tokio::time::sleep(Duration::from_secs(seconds + SLEEP_BUFFER)).await;
+}
+
+async fn balance(endpoint: &mut ToolboxEndpoint, account: &Pubkey) -> u64 {
+    endpoint
+        .get_spl_token_account(account)
+        .await
+        .unwrap()
+        .map(|a| a.amount)
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -132,6 +145,14 @@ async fn main() -> Result<()> {
     )
     .await
     .unwrap();
+
+    // The bounty rate is read when the slash is finalised, so it has to be in
+    // place before anyone is convicted. Half of every forfeit is routed to the
+    // committee that caught the cheat.
+    println!("[+] setting the slash bounty to {BOUNTY_BPS} bps (the voters' cut of a forfeit)");
+    process_treasurer_run_set_slash_bounty(&mut endpoint, &payer, &main_authority, &run, BOUNTY_BPS)
+        .await
+        .unwrap();
 
     println!("[+] every client posts a bond of {BOND} (verifiers need skin in the game)");
     let mut clients_collateral = vec![];
@@ -382,13 +403,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!();
-    println!("Summary");
-    println!("  verifiers        {}", verifiers.len());
-    println!("  quorum           {}", quorum);
-    println!("  target slashed   {}", target_slashed);
-    println!("  run              {}", run);
-    println!("  coordinator      {}", coordinator_account);
     if target_slashed != SLASHING_RATE {
         return Err(anyhow!(
             "expected slashed {}, got {}",
@@ -396,6 +410,95 @@ async fn main() -> Result<()> {
             target_slashed
         ));
     }
-    println!("[+] live devnet committee vote verified");
+
+    // The conviction has moved the forfeit into the vault. The half that has
+    // only ever run in memnet is the settlement: the target reclaims what the
+    // slash left of its bond, and the recorded voters split the bounty. The
+    // voter set passed here is exactly the committee that reached quorum above.
+    let target_position = clients
+        .iter()
+        .position(|k| k.pubkey() == target_key)
+        .ok_or_else(|| anyhow!("target key not among the demo clients"))?;
+    let voters: Vec<&Keypair> = verifiers.iter().take(quorum as usize).copied().collect();
+    let voter_collaterals: Vec<Pubkey> = voters
+        .iter()
+        .map(|voter| {
+            let position = clients
+                .iter()
+                .position(|k| k.pubkey() == voter.pubkey())
+                .expect("a voter is always one of the demo clients");
+            clients_collateral[position]
+        })
+        .collect();
+
+    println!(
+        "[+] target reclaims its bond; the {} recorded voters split the bounty",
+        voter_collaterals.len()
+    );
+    process_treasurer_participant_bond_request_withdraw(
+        &mut endpoint,
+        &payer,
+        &clients[target_position],
+        &run,
+        BOND,
+    )
+    .await
+    .unwrap();
+    sleep_seconds(WITHDRAW_DELAY as u64).await;
+    process_treasurer_participant_bond_finalize_withdraw_with_voters(
+        &mut endpoint,
+        &payer,
+        &clients[target_position],
+        &clients_collateral[target_position],
+        &collateral_mint,
+        &run,
+        &coordinator_account,
+        &voter_collaterals,
+    )
+    .await
+    .unwrap();
+
+    // Each voter deposited its whole bond, so its wallet sat at zero; whatever
+    // it holds now is its share of the bounty and nothing else.
+    let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
+    let share = bounty / voter_collaterals.len() as u64;
+    let target_recovered = balance(&mut endpoint, &clients_collateral[target_position]).await;
+    let mut voter_amounts = vec![];
+    for voter_collateral in &voter_collaterals {
+        voter_amounts.push(balance(&mut endpoint, voter_collateral).await);
+    }
+
+    println!();
+    println!("Summary");
+    println!("  verifiers          {}", verifiers.len());
+    println!("  quorum / voters    {} / {}", quorum, voter_collaterals.len());
+    println!("  target slashed     {}", target_slashed);
+    println!("  bounty total       {}", bounty);
+    println!("  bounty per voter   {}", share);
+    println!("  target recovered   {}", target_recovered);
+    for (i, amount) in voter_amounts.iter().enumerate() {
+        println!("  voter {} received    {}", i + 1, amount);
+    }
+    println!("  run                {}", run);
+    println!("  coordinator        {}", coordinator_account);
+
+    for (i, amount) in voter_amounts.iter().enumerate() {
+        if *amount != share {
+            return Err(anyhow!(
+                "voter {} expected bounty share {}, got {}",
+                i + 1,
+                share,
+                amount
+            ));
+        }
+    }
+    if target_recovered != BOND - SLASHING_RATE {
+        return Err(anyhow!(
+            "target expected recovery {}, got {}",
+            BOND - SLASHING_RATE,
+            target_recovered
+        ));
+    }
+    println!("[+] live devnet committee vote + bounty split verified");
     Ok(())
 }
