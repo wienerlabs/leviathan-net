@@ -18,6 +18,7 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_coordinator::instruction::Witness;
 use psyche_solana_coordinator::logic::InitCoordinatorParams;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
+use psyche_solana_tooling::blockhash_keeper::BlockhashKeeper;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
@@ -155,7 +156,15 @@ pub async fn run() {
     .unwrap();
 
     // Add a few clients to the run
+    //
+    // Three transactions per client across 240 clients is long enough in real
+    // time to outlive the endpoint's cached blockhash, which expires on a
+    // wall-clock timer rather than on anything this loop does. The keeper
+    // refreshes it as the loop runs, which is what stops this from failing on
+    // machine speed.
+    let mut blockhash_keeper = BlockhashKeeper::new();
     for client in &clients {
+        blockhash_keeper.tick(&mut endpoint).await.unwrap();
         // Add clients to whitelist
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
