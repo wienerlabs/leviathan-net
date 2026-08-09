@@ -126,10 +126,51 @@ and is only paid when it catches someone, so a bond sized only for deterrence
 leaves a rational verifier declining to audit, and a security layer nobody runs
 is not a security layer.
 
-**The collusion column is the one to read for a first run.** A three-verifier
-committee can be bought for $21. That is not a reason to avoid a small committee
-at genesis, it is a reason to say the number out loud rather than let someone
-else discover it.
+### The collusion column means something narrower than it looks
+
+`collusion_capital_usd(quorum, bond) = quorum * bond` in the sim, so the $21 is
+the cost of *bonding* two identities. It is not the cost of *controlling* a
+committee, because the sim does not model the draw: seats come from
+`CommitteeSelection` over `Round.random_seed`, so an attacker cannot choose which
+of its identities is seated. What it actually needs is a fraction of the whole
+pool, and both that fraction and the bond scale with pool size.
+
+At `verification_percent = 10`, quorum `max(2, ceil(2v/3))`, and bond at the
+sim's $5.275 per quorum seat:
+
+| Pool | Seats | Quorum | Bond | Sim figure | Identities for a quorum in half the rounds | Real cost | 20% attacker, per round | Rounds until it lands one |
+|---|---|---|---|---|---|---|---|---|
+| 30 | 3 | 2 | $10.55 | $21 | 15 (50%) | **$158** | 9.4% | **11** |
+| 50 | 5 | 4 | $21.10 | $84 | 35 (70%) | $739 | 0.41% | 245 |
+| 100 | 10 | 7 | $36.93 | $258 | 65 (65%) | $2,400 | 0.04% | 2,553 |
+| 200 | 20 | 14 | $73.85 | $1,034 | 135 (68%) | $9,970 | ~0 | 3.1M |
+| 500 | 50 | 34 | $179.35 | $6,098 | 335 (67%) | **$60,082** | ~0 | >10⁹ |
+
+Three things follow, and they matter more than the headline number.
+
+**Pool size is a security parameter, and it is not in the sim.** The fraction an
+attacker needs stays roughly constant at two thirds, but the absolute cost rises
+380x from a pool of 30 to a pool of 500, because the pool and the bond both grow.
+
+**Reliable control is the wrong threat model. One lucky round is enough.** An
+attacker holding a fifth of a 30-node pool draws a quorum every eleven rounds.
+The same attacker in a 100-node pool waits two and a half thousand. The exposure
+is concentrated almost entirely in small pools and falls off a cliff: between 30
+and 100 nodes the per-round risk drops by a factor of 234. **The first few dozen
+participants are the vulnerable period, not the mechanism.**
+
+**The appeals court is the backstop the sim ignores, and it is partial.** A
+colluding quorum that convicts an innocent can be challenged, and if the bench
+overturns, the colluding verifiers forfeit. So a lucky round is not a free win.
+But tie-breakers are drawn from the same shuffle, so an attacker large enough to
+hold the verifier quorum reliably is also large enough to hold the bench. The
+appeal defends against a small attacker that got lucky. It does not defend
+against a majority.
+
+Say all of this rather than the $21 alone. Unqualified, that number reads as a
+fatal flaw and understates the real attack cost by an order of magnitude; with
+the sampling, it is a bounded and manageable parameter regime whose one genuine
+danger is launching with too few participants.
 
 One correction to the framing: the bond is a **floor**, not a ceiling. The
 mechanism has `bond_minimum_amount` and no maximum. Sizing it is choosing how
