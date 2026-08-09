@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
                 clip_grad_norm: Some(1.0),
                 quantize_1bit: false,
                 device,
+                kind: tch::Kind::Float,
             })?;
 
             let mut provider = LocalDataProvider::new_from_directory(

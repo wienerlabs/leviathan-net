@@ -110,6 +110,12 @@ async fn build_replay_engine(
         clip_grad_norm: Some(1.0),
         quantize_1bit: false,
         device: tch::Device::Cpu,
+        // What the daemon has always replayed in. The network trains in
+        // BFloat16 and that gap is the largest source of honest drift, but
+        // narrowing it is a decision for the calibration harness to inform
+        // rather than a side effect of making the dtype configurable: moving
+        // the verifier's dtype moves what counts as a forgery.
+        kind: tch::Kind::Float,
     })?;
 
     let mut provider = LocalDataProvider::new_from_directory(

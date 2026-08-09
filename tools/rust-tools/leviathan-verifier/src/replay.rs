@@ -54,12 +54,17 @@ pub struct ReplayTrainerConfig {
     pub clip_grad_norm: Option<f32>,
     pub quantize_1bit: bool,
     pub device: tch::Device,
+    /// The dtype the model is loaded and trained in. The real network trains in
+    /// `BFloat16`; the verifier historically replayed in `Float` (fp32). The
+    /// gap between the two is the dominant source of honest drift the tolerance
+    /// band has to cover, so the calibration harness sweeps this.
+    pub kind: tch::Kind,
 }
 
 pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
     let model: Box<dyn CausalLM> = auto_model_for_causal_lm_from_pretrained(
         config.repo_files.clone(),
-        Some(tch::Kind::Float),
+        Some(config.kind),
         None,
         Some(config.device),
         None,

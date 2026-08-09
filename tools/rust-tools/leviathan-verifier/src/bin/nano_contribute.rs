@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
         clip_grad_norm: Some(1.0),
         quantize_1bit: false,
         device: tch::Device::Cpu,
+        kind: tch::Kind::Float,
     })?;
 
     let batch_id = BatchId(ClosedInterval::new(args.batch_start, args.batch_end));
