@@ -63,7 +63,10 @@ pub struct TrainArgs {
     #[clap(long, env)]
     pub bind_p2p_interface: Option<String>,
 
-    /// What relays to use - public n0 or the private Psyche ones
+    /// Which relays to use: `n0` (public), `psyche` (the private Psyche relays),
+    /// `disabled`, or a URL like `https://relay.example.com` for a self-hosted
+    /// relay. For a self-hosted relay whose certificate is not chained to a
+    /// public root, also set `IROH_RELAY_CA` to the PEM of the trusted cert.
     #[clap(long, env, default_value = "psyche")]
     pub iroh_relay: RelayKind,
 

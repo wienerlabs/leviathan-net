@@ -3,6 +3,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use download::{DownloadManager, DownloadManagerEvent, DownloadUpdate};
 use futures_util::{StreamExt, TryFutureExt};
+use iroh::tls::CaRootsConfig;
 use iroh::{EndpointAddr, RelayConfig};
 use iroh::{endpoint::QuicTransportConfig, protocol::Router};
 use iroh_blobs::api::Tag;
@@ -34,6 +35,7 @@ use std::{
     hash::{DefaultHasher, Hash as _, Hasher},
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -84,6 +86,7 @@ pub use download::{
 pub use iroh::protocol::ProtocolHandler;
 pub use iroh::{Endpoint, EndpointId, PublicKey, SecretKey};
 use iroh_relay::{RelayMap, RelayQuicConfig};
+use rustls_pki_types::CertificateDer;
 pub use latency_sorted::LatencySorted;
 pub use p2p_model_sharing::{
     ALPN, ModelRequestType, SharableModel, SharableModelError, TransmittableModelConfig,
@@ -131,7 +134,7 @@ impl FromStr for DiscoveryMode {
 }
 
 /// What relays should we connect to?
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum RelayKind {
     /// No relays (for local tests)
     Disabled,
@@ -139,20 +142,39 @@ pub enum RelayKind {
     Psyche,
     /// N0 default relays
     N0,
+    /// A single self-hosted relay at this URL.
+    ///
+    /// If the relay presents a certificate that is not chained to a public root
+    /// (a self-signed relay, for example), point `IROH_RELAY_CA` at the PEM of
+    /// the trusted certificate so the client will accept it.
+    Custom(Url),
 }
 
 impl FromStr for RelayKind {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // The keywords are matched case-insensitively, but a URL must not be
+        // lowercased - its path and query are case-sensitive - so it is parsed
+        // from the original string.
         match s.to_lowercase().as_str() {
             "disabled" => Ok(RelayKind::Disabled),
             "psyche" => Ok(RelayKind::Psyche),
             "n0" => Ok(RelayKind::N0),
-            _ => Err(format!(
-                "Invalid relay kind: '{}'. Expected 'psyche' or 'n0'",
-                s
-            )),
+            _ => {
+                let url = Url::parse(s).map_err(|err| {
+                    format!(
+                        "Invalid relay kind: '{s}'. Expected 'disabled', 'psyche', 'n0', \
+                         or a relay URL, but this did not parse as a URL either ({err})"
+                    )
+                })?;
+                match url.scheme() {
+                    "http" | "https" => Ok(RelayKind::Custom(url)),
+                    other => Err(format!(
+                        "Invalid relay URL '{s}': scheme must be http or https, got '{other}'"
+                    )),
+                }
+            }
         }
     }
 }
@@ -347,10 +369,11 @@ where
                 .set_max_remote_nat_traversal_addresses(12)
                 .build();
 
-            let relay_mode = match relay_kind {
+            let relay_mode = match &relay_kind {
                 RelayKind::Disabled => RelayMode::Disabled,
                 RelayKind::N0 => RelayMode::Default,
                 RelayKind::Psyche => RelayMode::Custom(psyche_relay_map()),
+                RelayKind::Custom(url) => RelayMode::Custom(custom_relay_map(url)),
             };
             debug!("Using relay servers: {}", fmt_relay_mode(&relay_mode));
 
@@ -362,6 +385,23 @@ where
                 .clear_address_lookup()
                 .hooks(allowlist_hook.clone())
                 .hooks(connection_monitor.clone());
+
+            // A self-hosted relay may present a certificate that does not chain
+            // to a public root. `IROH_RELAY_CA` names a PEM whose certificates
+            // are trusted in addition to the built-in roots, so the standard
+            // relays keep working while a private one is also accepted.
+            let endpoint = match std::env::var_os("IROH_RELAY_CA") {
+                Some(ca_path) => {
+                    let extra_roots = load_relay_ca_roots(Path::new(&ca_path))?;
+                    debug!(
+                        "Trusting {} extra relay CA certificate(s) from IROH_RELAY_CA ({})",
+                        extra_roots.len(),
+                        Path::new(&ca_path).display(),
+                    );
+                    endpoint.ca_roots_config(CaRootsConfig::embedded().with_extra_roots(extra_roots))
+                }
+                None => endpoint,
+            };
 
             let endpoint = match discovery_mode {
                 DiscoveryMode::Local => {
@@ -1008,6 +1048,41 @@ pub fn psyche_usw_relay_node() -> RelayConfig {
     }
 }
 
+/// Build a [`RelayMap`] containing a single self-hosted relay at `url`.
+pub fn custom_relay_map(url: &Url) -> RelayMap {
+    RelayMap::from_iter([custom_relay_node(url)])
+}
+
+/// The [`RelayConfig`] for a single self-hosted relay at `url`.
+pub fn custom_relay_node(url: &Url) -> RelayConfig {
+    RelayConfig {
+        url: url.clone().into(),
+        quic: Some(RelayQuicConfig::default()),
+    }
+}
+
+/// Load the PEM certificates at `path` as extra trusted relay CA roots.
+///
+/// Used for a self-hosted relay whose certificate does not chain to a public
+/// root; see [`RelayKind::Custom`] and the `IROH_RELAY_CA` environment variable.
+/// An empty or unreadable file is an error rather than a silent no-op, because a
+/// missing root would only surface later as an opaque TLS handshake failure.
+fn load_relay_ca_roots(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening relay CA file {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let ders = rustls_pemfile::certs(&mut reader).with_context(|| {
+        format!("reading PEM certificates from relay CA file {}", path.display())
+    })?;
+    if ders.is_empty() {
+        return Err(anyhow!(
+            "relay CA file {} contained no certificates",
+            path.display()
+        ));
+    }
+    Ok(ders.into_iter().map(CertificateDer::from).collect())
+}
+
 fn hash_bytes(bytes: &Bytes) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -1080,4 +1155,106 @@ pub async fn blob_ticket_param_request_task(
     Err(anyhow!(
         "Failed to get model parameter blob ticket after {max_attempts} attempts"
     ))
+}
+
+#[cfg(test)]
+mod relay_config_tests {
+    use super::*;
+
+    #[test]
+    fn keywords_parse_case_insensitively() {
+        assert!(matches!(
+            "disabled".parse::<RelayKind>(),
+            Ok(RelayKind::Disabled)
+        ));
+        assert!(matches!("psyche".parse::<RelayKind>(), Ok(RelayKind::Psyche)));
+        assert!(matches!("PSYCHE".parse::<RelayKind>(), Ok(RelayKind::Psyche)));
+        assert!(matches!("n0".parse::<RelayKind>(), Ok(RelayKind::N0)));
+        assert!(matches!("N0".parse::<RelayKind>(), Ok(RelayKind::N0)));
+    }
+
+    #[test]
+    fn a_url_parses_as_a_custom_relay() {
+        let Ok(RelayKind::Custom(url)) = "https://relay.leviathan.run".parse::<RelayKind>() else {
+            panic!("expected a custom relay");
+        };
+        assert_eq!(url.as_str(), "https://relay.leviathan.run/");
+    }
+
+    #[test]
+    fn a_custom_relay_url_keeps_its_path_case_and_port() {
+        // The keyword arm lowercases its input, so this guards that a URL is
+        // parsed from the original string and not the lowercased copy.
+        let Ok(RelayKind::Custom(url)) =
+            "https://relay.example.com:8443/Path".parse::<RelayKind>()
+        else {
+            panic!("expected a custom relay");
+        };
+        assert_eq!(url.port(), Some(8443));
+        assert_eq!(url.path(), "/Path");
+    }
+
+    #[test]
+    fn a_non_http_scheme_is_rejected() {
+        assert!("ftp://relay.example.com".parse::<RelayKind>().is_err());
+        assert!("file:///etc/passwd".parse::<RelayKind>().is_err());
+    }
+
+    #[test]
+    fn nonsense_is_rejected() {
+        assert!("not a relay".parse::<RelayKind>().is_err());
+        assert!("".parse::<RelayKind>().is_err());
+    }
+
+    #[test]
+    fn custom_relay_map_holds_exactly_the_one_node() {
+        let url: Url = "https://relay.leviathan.run".parse().unwrap();
+        let map = custom_relay_map(&url);
+        assert_eq!(map.len(), 1);
+        let node = custom_relay_node(&url);
+        assert!(node.quic.is_some(), "QUIC discovery should be configured");
+        assert_eq!(node.url, url.into());
+    }
+
+    // A throwaway self-signed certificate, used only to exercise PEM parsing.
+    const CA_FIXTURE_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBWTCCAQugAwIBAgIUE02qfcxe+ricpfTYVFwdp45KQd0wBQYDK2VwMCIxIDAe
+BgNVBAMMF2xldmlhdGhhbi10ZXN0LXJlbGF5LWNhMB4XDTI2MDgwNTIyNDYwNFoX
+DTM2MDgwMjIyNDYwNFowIjEgMB4GA1UEAwwXbGV2aWF0aGFuLXRlc3QtcmVsYXkt
+Y2EwKjAFBgMrZXADIQCOysV8BM1weJSOIgjrAhbVfcdIAmq1JYPDjGwcPT7tiaNT
+MFEwHQYDVR0OBBYEFNzmbKUA/7K9c+W7a74HtGNtfK6GMB8GA1UdIwQYMBaAFNzm
+bKUA/7K9c+W7a74HtGNtfK6GMA8GA1UdEwEB/wQFMAMBAf8wBQYDK2VwA0EAC/b/
+faJFG6nKE09faWn6UGD2jbCs60WqJ9nbeN8g1AwFkL2z7zAmC21AOTxsPRBhzeDN
+m+B++YwFqp6esxqDBw==
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn loads_pem_ca_roots() {
+        let path = std::env::temp_dir().join(format!(
+            "leviathan-relay-ca-ok-{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, CA_FIXTURE_PEM).unwrap();
+        let roots = load_relay_ca_roots(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn a_ca_file_with_no_certificates_is_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "leviathan-relay-ca-empty-{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, "there is no certificate in here\n").unwrap();
+        let result = load_relay_ca_roots(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_missing_ca_file_is_an_error() {
+        assert!(load_relay_ca_roots(Path::new("/nonexistent/leviathan/relay-ca.pem")).is_err());
+    }
 }
