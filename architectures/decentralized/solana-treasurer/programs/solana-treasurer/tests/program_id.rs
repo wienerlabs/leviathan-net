@@ -3,7 +3,7 @@ use psyche_solana_treasurer::ID;
 #[cfg(not(feature = "mainnet"))]
 #[test]
 fn a_default_build_carries_the_devnet_id() {
-    assert_eq!(ID.to_string(), "9A1kc8Dr9dFJW9t1npAk7EHrADm6TAyFeVLH27CDdvv8");
+    assert_eq!(ID.to_string(), "Fq1Mv8osXqHxiiXjm4yhvQGE5wgx9QMueK8n2qwbqovV");
 }
 
 #[cfg(feature = "mainnet")]

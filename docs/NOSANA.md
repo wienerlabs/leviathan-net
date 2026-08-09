@@ -47,11 +47,12 @@ dashboard, filling in your own endpoints and key:
     "args": {
       "image": "docker.io/nvidia/cuda:12.4.1-devel-ubuntu22.04",
       "gpu": true,
-      "cmd": ["bash", "-c", "set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update -qq\napt-get install -y -qq --no-install-recommends git curl ca-certificates build-essential pkg-config libssl-dev\ncurl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable\n. \"$HOME/.cargo/env\"\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nexport PATH=\"$HOME/.local/bin:$PATH\"\ngit clone --depth 1 https://github.com/wienerlabs/leviathan-net /opt/leviathan-net\ncd /opt/leviathan-net\nnvidia-smi || echo 'WARNING: nvidia-smi failed'\nwhile true; do\n  ./scripts/leviathan-node.sh --wallet /opt/wallet.json || true\n  echo '[loop] client exited, retrying in 15s'\n  sleep 15\ndone\n"],
+      "cmd": ["bash", "-c", "set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update -qq\napt-get install -y -qq --no-install-recommends git curl ca-certificates build-essential pkg-config libssl-dev\ncurl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable\n. \"$HOME/.cargo/env\"\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nexport PATH=\"$HOME/.local/bin:$PATH\"\ngit clone --depth 1 https://github.com/wienerlabs/leviathan-net /opt/leviathan-net\ncd /opt/leviathan-net\necho \"[boot] commit: $(git rev-parse --short HEAD)\"\nif ! grep -q \"$EXPECT_COORDINATOR_PROGRAM\" architectures/decentralized/solana-coordinator/programs/solana-coordinator/src/lib.rs; then\n  echo \"[boot] FATAL: this checkout does not carry coordinator id $EXPECT_COORDINATOR_PROGRAM\"\n  echo \"[boot] Stopping rather than deriving the coordinator under a different program and joining the wrong run.\"\n  exit 1\nfi\necho \"[boot] coordinator program confirmed: $EXPECT_COORDINATOR_PROGRAM, run: $RUN_ID\"\nnvidia-smi || echo 'WARNING: nvidia-smi failed'\nwhile true; do\n  ./scripts/leviathan-node.sh --wallet /opt/wallet.json || true\n  echo '[loop] client exited, retrying in 15s'\n  sleep 15\ndone\n"],
       "env": {
         "RPC": "https://devnet.helius-rpc.com/?api-key=YOUR_KEY",
         "WS_RPC": "wss://devnet.helius-rpc.com/?api-key=YOUR_KEY",
         "RUN_ID": "leviathan-devnet",
+        "EXPECT_COORDINATOR_PROGRAM": "GdHJHiQp7uMv8TanfpaCaKQ8nHm5suvEt9JvjpZFWZ19",
         "RAW_WALLET_PRIVATE_KEY": "YOUR_BASE58_DEVNET_KEY",
         "IROH_RELAY": "n0",
         "IROH_DISCOVERY": "n0",
@@ -71,6 +72,40 @@ minutes on a rented host, and the container has to outlive it by enough to train
 For N nodes, submit this N times. **Each node needs its own keypair** — two nodes
 sharing a wallet share an on-chain identity and collide. Each also needs a little
 devnet SOL for transaction fees.
+
+### Why the job checks the program id before it builds
+
+`EXPECT_COORDINATOR_PROGRAM` is compared against the checkout before anything is
+compiled, and the job stops if it does not match.
+
+The client derives the coordinator account as
+`PDA(["coordinator", RUN_ID], coordinator_program_id)`, and the program id comes
+from `declare_id!` in the source it just cloned. If that source is at a revision
+with a different id, the client builds cleanly, derives a different coordinator,
+and either fails with `AccountNotFound` after a 45 minute build or — worse —
+finds a run that happens to exist there and joins it. Nothing in the logs looks
+wrong in the second case.
+
+Devnet was redeployed under new program ids (see `DEVNET.md`, "Why the program
+ids changed"), so both outcomes are live possibilities for anyone running an
+older checkout. The check costs a second and turns a silent wrong-run into a
+loud stop.
+
+### The run is not permissionless
+
+`join_run` needs an authorization whose grantor is the run's join authority,
+whose grantee is the node, and whose scope is `CoordinatorJoinRun`. The join
+authority creates one per node before that node starts:
+
+```
+run-manager join-authorization-create --rpc <rpc> --ws-rpc <ws> \
+  --wallet-private-key-path <join-authority-key> --authorizer <node pubkey>
+```
+
+The direction matters and is easy to get backwards: the **join authority signs**
+and the **node is the argument**. Signing as the node and passing the authority
+creates the mirror-image authorization, which is accepted on chain, costs rent,
+and does nothing for joining.
 
 ## Four settings that are not optional
 
