@@ -8,7 +8,7 @@ use logic::*;
 // deploy time. A mainnet build carries a different program id, so a binary
 // meant for devnet can never be pointed at mainnet by mistake.
 #[cfg(not(feature = "mainnet"))]
-declare_id!("2Kg5ERG6ubuzyPmQ24axsws7V2ja2EvWp5CHMKFCrTxv");
+declare_id!("ECEmta24U9WCwh397N4diSc8JnAbyJTG3YiTUVL5umrb");
 #[cfg(feature = "mainnet")]
 declare_id!("2QXAd9g31vKFGSyxZC2wcjJdCZ4bjCdzrXA95H6Ft2eU");
 

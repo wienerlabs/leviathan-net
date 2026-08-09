@@ -8,9 +8,9 @@ devnet SPL collateral token with no real value.
 
 | program | id |
 |---|---|
-| coordinator | `JD9rHTiqBFgHjViWZc7gFZX74LvKKysbLbqFRaFvtmmN` |
-| authorizer | `2Kg5ERG6ubuzyPmQ24axsws7V2ja2EvWp5CHMKFCrTxv` |
-| treasurer | `9A1kc8Dr9dFJW9t1npAk7EHrADm6TAyFeVLH27CDdvv8` |
+| coordinator | `GdHJHiQp7uMv8TanfpaCaKQ8nHm5suvEt9JvjpZFWZ19` |
+| authorizer | `ECEmta24U9WCwh397N4diSc8JnAbyJTG3YiTUVL5umrb` |
+| treasurer | `Fq1Mv8osXqHxiiXjm4yhvQGE5wgx9QMueK8n2qwbqovV` |
 
 Build with `anchor build --no-idl`.
 
@@ -19,17 +19,48 @@ Build with `anchor build --no-idl`.
 | field | value |
 |---|---|
 | run id | `leviathan-devnet` |
-| coordinator account | `FyACSfZFC2oRiJqx7vYakrrMzm46AqTYTSgBW7DHxCHY` |
-| collateral mint | `BWLv1Fj5RKJbcr3ZMLVKhviFq1i3tq6afgVS2ngyot3X` |
+| coordinator instance | `HXpzk5aUxUiRVs12DJZBPQMwtdoZXZhkheHqEBXyqXzc` |
+| coordinator account | `GMSnhB7W4cVUr4kstVB7DgHDsoCYNk5jgHmZQwoSiDFP` |
 | model | Nano-Llama (nano CI model) |
-| rewards funded | 500,000 collateral in the run vault |
-| epoch rates | earning 1,000 per epoch (shared), slashing 100 per client |
-| access | permissionless (authorizer sentinel `111...1`) |
+| authorities | main and join both `33qU3JFkrehB2HkgdHzcpj9gDkFk8c2okQC51REWhjKh` |
+| access | per-node join authorization, granted by the join authority |
+| bonds | none: this run is coordinator-only |
 
-The run is treasurer-managed and unpaused; it sits in WaitingForMembers until a
-client connects, then advances through its epochs as clients tick it. Healthy
-clients accrue earned points at each epoch boundary, redeemable for collateral
-through the treasurer's `participant_claim`.
+The run is unpaused and sits in WaitingForMembers until clients connect, then
+advances through its epochs as clients tick it.
+
+This one is **coordinator-only**: no treasurer, so no bonds, no reward accrual
+and no slash settlement. It exists to carry training on the redeployed programs.
+A treasurer-managed run has to be created separately, and its economics — the
+epoch rates in particular — are set per run.
+
+### Joining
+
+`join_run` requires an authorization whose grantor is the run's join authority,
+whose grantee is the node, and whose scope is `CoordinatorJoinRun`. The join
+authority creates one per node:
+
+```
+run-manager join-authorization-create --rpc <rpc> --ws-rpc <ws> \
+  --wallet-private-key-path <join-authority> --authorizer <node pubkey>
+```
+
+The three nodes currently authorized:
+
+| node | authorization |
+|---|---|
+| `8tcQfLmW1ucG5ohoDf3fci8vRz3Kspviu5bKsTm628Un` | `5nqfj7T2mqHKWztKmVmXagJzvopQeB7CXAebDiKKuzYH` |
+| `Cgh78poQ5uwqkzxz4Qt5e7jAodqWtkYAekzU3JPWVijD` | `CwLedrkTsR3Nc3jP83xQ2HT1wxZspAgtHYCapHnx6QDn` |
+| `DW2boohj6G1NMwr2w3NtLd3da7QFQ6Gkp9xD1s6gozqs` | `CEaRbDetAfa5vfeP8wwRyRnHd5DTFy4KZP89GZA9pj7r` |
+
+### Why the program ids changed
+
+The internal security review (wienerlabs/leviathan#15) added fields to
+`AuditVerdict`, `Run` and `Participant`, so accounts written by the old programs
+cannot be read by the new ones. The old deployment's upgrade authority
+(`HYXmvGi8SFn7GdGLA2m7YVUxqqwv3rYy7wYhwZ4EoaYn`) is not held here, so the
+programs were redeployed under ids this repository controls rather than upgraded
+in place. The previous deployment and its runs are abandoned, not migrated.
 
 ## Run a node
 
