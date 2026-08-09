@@ -1,3 +1,4 @@
+pub mod blockhash_keeper;
 pub mod create_memnet_endpoint;
 #[cfg(feature = "daemon")]
 pub mod daemon;

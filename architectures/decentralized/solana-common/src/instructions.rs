@@ -413,6 +413,12 @@ pub fn treasurer_participant_bond_finalize_withdraw(
     let run = psyche_solana_treasurer::find_run(treasurer_index);
     let run_collateral = associated_token::get_associated_token_address(&run, collateral_mint);
     let participant = psyche_solana_treasurer::find_participant(&run, user);
+    // Always derived and always passed. The program pins this to its own PDA and
+    // decides from the account's own contents whether a verdict exists, because
+    // an optional account is one the beneficiary can leave out - and leaving it
+    // out used to drop the withdrawal into the branch that paid an unchecked
+    // recipient (wienerlabs/leviathan#15, finding 2).
+    let audit_verdict = psyche_solana_treasurer::find_audit_verdict(&run, user);
     anchor_instruction(
         psyche_solana_treasurer::ID,
         psyche_solana_treasurer::accounts::ParticipantBondFinalizeWithdrawAccounts {
@@ -422,7 +428,7 @@ pub fn treasurer_participant_bond_finalize_withdraw(
             run_collateral,
             coordinator_account: *coordinator_account,
             participant,
-            audit_verdict: None,
+            audit_verdict,
             appeal_verdict: None,
             token_program: token::ID,
         },
