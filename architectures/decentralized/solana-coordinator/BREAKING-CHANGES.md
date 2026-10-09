@@ -27,9 +27,9 @@ Due to the nature of serialization/deserialization where all information is stor
 
 It then makes a lot of sense to split the program's state into multiple PDAs to avoid a large monolithic state, this also would allow for easier migrations of smaller PDAs. Different PDAs could use different mitigation strategies independently, depending on the specific situation. This would also help upgrade and migrate individual chunks of data atomically and independently. It also helps with avoiding the 10KB max size limit per account.
 
-#### B) Add data-structure versionning
+#### B) Add data-structure versioning
 
-Adding a versionning system to the data structures enables conditional migration logic. This can be done through either:
+Adding a versioning system to the data structures enables conditional migration logic. This can be done through either:
 
 - an `Enum` of which each case is a version (most powerful, but complex)
 - a `version` field on the data structure (most simple, but has limitations)
