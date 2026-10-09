@@ -23,6 +23,9 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_par
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
+use psyche_solana_tooling::redact::guard_rpc_url;
+use psyche_solana_tooling::redact::redact_rpc_url;
+use psyche_solana_tooling::redact::scrub_rpc_url;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
@@ -37,6 +40,14 @@ const WITHDRAW_DELAY: i64 = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // An RPC error quotes the URL it failed to reach, key included, so the
+    // error that ends the run is scrubbed on the way out.
+    run()
+        .await
+        .map_err(|error| anyhow!(scrub_rpc_url(&format!("{error:?}"))))
+}
+
+async fn run() -> Result<()> {
     let wallet_path = std::env::var("LEVIATHAN_DEVNET_WALLET").unwrap_or_else(|_| {
         format!(
             "{}/.config/solana/leviathan-devnet.json",
@@ -49,7 +60,8 @@ async fn main() -> Result<()> {
 
     let mut endpoint = match std::env::var("LEVIATHAN_DEVNET_RPC").ok() {
         Some(url) => {
-            println!("[+] rpc {}", url);
+            guard_rpc_url(&url);
+            println!("[+] rpc {}", redact_rpc_url(&url));
             ToolboxEndpoint::new_rpc_with_url_or_moniker_and_commitment(
                 &url,
                 CommitmentConfig::confirmed(),
