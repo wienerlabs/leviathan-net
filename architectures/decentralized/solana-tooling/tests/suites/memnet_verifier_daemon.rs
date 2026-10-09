@@ -329,10 +329,7 @@ pub async fn run() {
         .unwrap();
     }
 
-    let cheater_committer = format!(
-        "{}",
-        NodeIdentity::new(clients[cheater].pubkey().to_bytes(), Default::default())
-    );
+    let cheater_committer = clients[cheater].pubkey().to_string();
     let submitted_dir = scratch("submitted");
     let reference_dir = scratch("reference");
     place_fixture(&reference_dir, "honest.vec-postcard", &cheater_committer);
@@ -346,6 +343,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        replay_step: None,
     };
 
     let mut convicted = HashSet::new();

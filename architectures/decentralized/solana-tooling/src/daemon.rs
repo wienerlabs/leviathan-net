@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use leviathan_verifier::decompress_dump;
 use leviathan_verifier::index_dir;
+use leviathan_verifier::parse_assignment_key;
 use psyche_coordinator::select_audits_for_current_round;
 use psyche_verifier::hash_delta;
 use psyche_verifier::verify_within_band;
@@ -29,6 +30,11 @@ pub struct AuditConfig {
     pub audit_assigned: bool,
     pub dry_run: bool,
     pub verdict_mode: bool,
+    /// With a replay engine, the one step whose contributions it can reproduce:
+    /// the step trained from the published checkpoint with fresh optimizer
+    /// state. Contributions from any other step are left alone, because judging
+    /// them against that model would convict honest nodes.
+    pub replay_step: Option<u32>,
 }
 
 pub fn hex8(bytes: &[u8; 32]) -> String {
@@ -59,7 +65,10 @@ pub async fn audit_pass(
     run: &Pubkey,
     config: &AuditConfig,
     replay: Option<&(dyn psyche_verifier::ReplayEngine + Sync)>,
-    convicted: &mut HashSet<String>,
+    // What this session has settled: convicted committers by signer, and
+    // contributions already found within band by file key, so a long-running
+    // daemon neither slashes twice nor replays the same file every pass.
+    judged: &mut HashSet<String>,
 ) -> Result<usize> {
     // The tie-breaker count comes from the run, because that is what the
     // treasurer gates votes with. Deriving it any other way picks a different
@@ -82,7 +91,8 @@ pub async fn audit_pass(
                     .iter()
                     .filter_map(|a| {
                         let (start, end) = parse_batch_bounds(&format!("{}", a.batch_id))?;
-                        Some((format!("{}", a.target), start, end))
+                        // The full signer, as the dump names carry it (finding 20).
+                        Some((bs58::encode(a.target.signer()).into_string(), start, end))
                     })
                     .collect(),
             ),
@@ -112,6 +122,9 @@ pub async fn audit_pass(
         let Some(committer) = parse_committer(submitted_path) else {
             continue;
         };
+        if judged.contains(key) {
+            continue;
+        }
         let (batch_start, batch_end) = parse_batch_bounds(key).unwrap_or((0, 0));
 
         if let Some(assigned) = &assigned {
@@ -136,6 +149,11 @@ pub async fn audit_pass(
                 decompress_dump(reference_path, device)?
             }
             (None, Some(engine)) => {
+                if let Some(step) = config.replay_step {
+                    if parse_assignment_key(key).map(|(at, _)| at) != Some(step) {
+                        continue;
+                    }
+                }
                 let Some(index) = roster_index else {
                     println!(
                         "[verifier-daemon] skip  {key} committer {committer} is not in the epoch roster, nothing to replay against"
@@ -163,6 +181,7 @@ pub async fn audit_pass(
                 "[verifier-daemon] ok    {key} committer {committer} distance {:.4} within band {:.4}",
                 verdict.distance, config.band
             );
+            judged.insert(key.clone());
             continue;
         }
 
@@ -176,7 +195,7 @@ pub async fn audit_pass(
             hex8(&replayed_hash)
         );
 
-        if convicted.contains(&committer) {
+        if judged.contains(&committer) {
             println!("  already convicted {committer} this session, skipping");
             continue;
         }
@@ -239,7 +258,8 @@ pub async fn audit_pass(
         match result {
             Ok(()) => {
                 println!("  {action} submitted for {committer} at epoch index {index}");
-                convicted.insert(committer);
+                judged.insert(committer);
+                judged.insert(key.clone());
                 new_convictions += 1;
             }
             Err(err) => {

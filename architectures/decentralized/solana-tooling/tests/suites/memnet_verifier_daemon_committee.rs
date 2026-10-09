@@ -298,10 +298,7 @@ pub async fn run() {
     let target_key = target.expect("no trainer target found");
     assert!(verifiers.len() as u64 >= quorum);
 
-    let target_committer = format!(
-        "{}",
-        NodeIdentity::new(target_key.to_bytes(), Default::default())
-    );
+    let target_committer = target_key.to_string();
     let submitted_dir = scratch("submitted");
     let reference_dir = scratch("reference");
     place_fixture(&reference_dir, "honest.vec-postcard", &target_committer);
@@ -315,6 +312,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: true,
+        replay_step: None,
     };
 
     for verifier in verifiers.iter().take((quorum - 1) as usize) {

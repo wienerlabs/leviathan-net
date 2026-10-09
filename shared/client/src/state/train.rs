@@ -762,7 +762,7 @@ pub enum ApplyError {
 }
 
 #[derive(Debug, Error)]
-enum WriteGradientsError {
+pub(crate) enum WriteGradientsError {
     #[error("Failed to create write_gradients_dir: {0}")]
     CreateDir(tokio::io::Error),
 
@@ -795,7 +795,7 @@ fn inject_fake_delta(results: Vec<DistroResult>) -> Vec<DistroResult> {
         .collect()
 }
 
-async fn write_gradients_to_disk(
+pub(crate) async fn write_gradients_to_disk(
     write_gradients_dir: PathBuf,
     identity: NodeIdentity,
     distro_result: TransmittableDistroResult,

@@ -126,7 +126,9 @@ pub struct TrainArgs {
     #[clap(long, env, default_value_t = 1)]
     pub micro_batch_size: usize,
 
-    /// If provided, every shared gradient this client sees will be written to this directory.
+    /// If provided, every result this client trains, and every result it receives from a peer
+    /// that matches the peer's signed commitment, is written to this directory. A verifier reads
+    /// these files back as the contributions it audits.
     #[clap(long, env)]
     pub write_gradients_dir: Option<PathBuf>,
 
