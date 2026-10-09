@@ -64,7 +64,7 @@ Measured on Nosana, from `docs/NOSANA.md`:
 
 | Class | VRAM | Price | Availability |
 |---|---|---|---|
-| RTX 3060 / 3060 Ti | 8–12 GB | $0.048/hr | open |
+| RTX 3060 / 3060 Ti | 8 to 12 GB | $0.048/hr | open |
 | RTX 3090 | 24 GB | ~$0.19/hr | 23 of 59 hosts free |
 | A100 / H100 / A40 / A6000 / 6000 Ada | 40 GB+ | n/a | **no free hosts at all** |
 
