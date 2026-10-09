@@ -8,9 +8,9 @@ On a high level, the flow of an distribution is the following:
 
 1. An authority wallet creates an `Airdrop` PDA with the list of recipients hash
 2. The authority wallet funds the `Airdrop`'s collateral vault with tokens
-3. Users can claim their share if they can proove that they are a valid recipient
+3. Users can claim their share if they can prove that they are a valid recipient
 
-Internally, the `Airdrop` contains the hash of the root of a merkle tree of all the token allocations (users/amounts). In order for users to proove that they are indeed a valid recipient of some distributed tokens, users must submit a merkle-proof of their own token allocation (recipient address / amount / vesting info). This proof will be checked against the merkle tree root during redeem operations.
+Internally, the `Airdrop` contains the hash of the root of a merkle tree of all the token allocations (users/amounts). In order for users to prove that they are indeed a valid recipient of some distributed tokens, users must submit a merkle-proof of their own token allocation (recipient address / amount / vesting info). This proof will be checked against the merkle tree root during redeem operations.
 
 ## Solana Instructions
 
