@@ -31,8 +31,8 @@ advances through its epochs as clients tick it.
 
 This one is **coordinator-only**: no treasurer, so no bonds, no reward accrual
 and no slash settlement. It exists to carry training on the redeployed programs.
-A treasurer-managed run has to be created separately, and its economics — the
-epoch rates in particular — are set per run.
+A treasurer-managed run has to be created separately, and its economics (the
+epoch rates in particular) are set per run.
 
 ### Joining
 
