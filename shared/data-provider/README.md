@@ -1,6 +1,6 @@
 # data-provider
 
-there's a bunch of functionality here, but the http stuff is what you probably wanna try out.
+there's a bunch of functionality here, but the http stuff is what you probably want to try out.
 
 ## http data provider fetch example
 
@@ -45,11 +45,11 @@ Example:
 cargo run --example http --batch-ids 1,2,3 template "http://example.com/{}.ds" --start 0 --end 10
 ```
 
-this will fetch urls http://example.com/0.ds thru http://example.com/10.ds
+this will fetch urls http://example.com/0.ds through http://example.com/10.ds
 
 ###### left pad zeros
 
-`--left-pad-zeros 3` will transform fetch URLs http://example.com/000.ds thru http://example.com/010.ds
+`--left-pad-zeros 3` will transform fetch URLs http://example.com/000.ds through http://example.com/010.ds
 
 ##### URL List Mode
 
