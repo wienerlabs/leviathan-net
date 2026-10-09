@@ -31,7 +31,7 @@ and model snapshots
 
 ```mermaid
 ---
-title: Centralized Run, training data provided thru TCP data server.
+title: Centralized Run, training data provided through TCP data server.
 ---
 flowchart TB
 subgraph "Coordinator Server"
