@@ -18,6 +18,7 @@ use psyche_data_provider::download_model_repo_sync;
 use psyche_data_provider::LocalDataProvider;
 use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::BatchDataCPU;
+use psyche_modeling::Trainer;
 use psyche_solana_tooling::daemon::audit_pass;
 use psyche_solana_tooling::daemon::parse_committer;
 use psyche_solana_tooling::daemon::AuditConfig;
@@ -66,6 +67,12 @@ struct Args {
     replay_compression_topk: u16,
     #[arg(long, default_value_t = 64)]
     replay_compression_chunk: u16,
+    /// The step the replay can reproduce: the one trained from the published
+    /// checkpoint with fresh optimizer state, i.e. the first step of the run or
+    /// of an epoch that cold-started from the Hub. Required with
+    /// --replay-model; contributions from other steps are not judged.
+    #[arg(long)]
+    replay_step: Option<u32>,
     #[arg(long, default_value_t = DEFAULT_BAND)]
     band: f32,
     #[arg(long, default_value_t = 8)]
@@ -80,97 +87,130 @@ struct Args {
     verdict: bool,
 }
 
-async fn build_replay_engine(
-    args: &Args,
-    endpoint: &mut ToolboxEndpoint,
-    coordinator_account: &Pubkey,
-) -> Result<TrainerReplayEngine> {
-    let model = args
-        .replay_model
-        .as_ref()
-        .ok_or_else(|| anyhow!("a replay model is required to recompute references"))?;
-    let data_dir = args
-        .replay_data_dir
-        .as_ref()
-        .ok_or_else(|| anyhow!("--replay-data-dir is required alongside --replay-model"))?;
+/// The replay side of the daemon: one model, loaded once, and the run's data.
+/// Each pass gets an engine over the contributions on disk at that moment, so
+/// results that arrive while the daemon runs are judged as they land.
+struct Replayer {
+    trainer: Option<Trainer>,
+    provider: LocalDataProvider,
+    step: u32,
+}
 
-    let state = get_coordinator_account_state(endpoint, coordinator_account)
-        .await?
-        .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
+impl Replayer {
+    fn new(args: &Args) -> Result<Self> {
+        let model = args
+            .replay_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("a replay model is required to recompute references"))?;
+        let data_dir = args
+            .replay_data_dir
+            .as_ref()
+            .ok_or_else(|| anyhow!("--replay-data-dir is required alongside --replay-model"))?;
+        let step = args
+            .replay_step
+            .ok_or_else(|| anyhow!("--replay-step is required alongside --replay-model"))?;
 
-    let repo_files = download_model_repo_sync(&model.to_string(), None, None, None, true)?;
-    let trainer = build_replay_trainer(&ReplayTrainerConfig {
-        repo_files,
-        sequence_length: args.replay_sequence_length,
-        micro_batch_size: 1,
-        learning_rate: args.replay_lr,
-        compression_decay: args.replay_compression_decay,
-        compression_topk: args.replay_compression_topk,
-        compression_chunk: args.replay_compression_chunk,
-        clip_grad_norm: Some(1.0),
-        quantize_1bit: false,
-        device: tch::Device::Cpu,
-        // What the daemon has always replayed in. The network trains in
-        // BFloat16 and that gap is the largest source of honest drift, but
-        // narrowing it is a decision for the calibration harness to inform
-        // rather than a side effect of making the dtype configurable: moving
-        // the verifier's dtype moves what counts as a forgery.
-        kind: tch::Kind::Float,
-    })?;
+        let repo_files = download_model_repo_sync(&model.to_string(), None, None, None, true)?;
+        let trainer = build_replay_trainer(&ReplayTrainerConfig {
+            repo_files,
+            sequence_length: args.replay_sequence_length,
+            micro_batch_size: 1,
+            learning_rate: args.replay_lr,
+            compression_decay: args.replay_compression_decay,
+            compression_topk: args.replay_compression_topk,
+            compression_chunk: args.replay_compression_chunk,
+            clip_grad_norm: Some(1.0),
+            quantize_1bit: false,
+            device: tch::Device::Cpu,
+            // What the daemon has always replayed in. The network trains in
+            // BFloat16 and that gap is the largest source of honest drift, but
+            // narrowing it is a decision for the calibration harness to inform
+            // rather than a side effect of making the dtype configurable: moving
+            // the verifier's dtype moves what counts as a forgery.
+            kind: tch::Kind::Float,
+        })?;
 
-    let mut provider = LocalDataProvider::new_from_directory(
-        data_dir,
-        TokenSize::TwoBytes,
-        args.replay_sequence_length,
-        Shuffle::DontShuffle,
-    )?;
+        let provider = LocalDataProvider::new_from_directory(
+            data_dir,
+            TokenSize::TwoBytes,
+            args.replay_sequence_length,
+            Shuffle::DontShuffle,
+        )?;
 
-    let mut assignments = Vec::new();
-    for (key, path) in index_dir(&args.submitted_dir)? {
-        let Some(committer) = parse_committer(&path) else {
-            continue;
-        };
-        let Some(index) = state
-            .coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .position(|client| format!("{}", client.id) == committer)
-        else {
-            println!("[verifier-daemon] {committer} is not in the epoch roster, nothing to replay");
-            continue;
-        };
-        let Some((step, batch_id)) = parse_assignment_key(&key) else {
-            continue;
-        };
-        let data: Vec<BatchDataCPU> = provider
-            .get_samples(batch_id)
-            .await?
-            .into_iter()
-            .map(|x| BatchDataCPU {
-                input_ids: x.input_ids,
-                labels: x.labels,
-                position_ids: x.position_ids,
-                sequence_lengths: x.sequence_lengths,
-            })
-            .collect();
-        assignments.push(ReplayAssignment {
-            target_index: index as u64,
+        Ok(Self {
+            trainer: Some(trainer),
+            provider,
             step,
-            batch_id,
-            data,
-        });
+        })
     }
 
-    println!(
-        "[verifier-daemon] replay engine ready over {} assignment(s)",
-        assignments.len()
-    );
-    Ok(TrainerReplayEngine::new(
-        trainer,
-        assignments,
-        tch::Device::Cpu,
-    ))
+    async fn engine(
+        &mut self,
+        args: &Args,
+        endpoint: &mut ToolboxEndpoint,
+        coordinator_account: &Pubkey,
+    ) -> Result<TrainerReplayEngine> {
+        let state = get_coordinator_account_state(endpoint, coordinator_account)
+            .await?
+            .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
+
+        let mut assignments = Vec::new();
+        for (key, path) in index_dir(&args.submitted_dir)? {
+            let Some((step, batch_id)) = parse_assignment_key(&key) else {
+                continue;
+            };
+            if step != self.step {
+                continue;
+            }
+            let Some(committer) = parse_committer(&path) else {
+                continue;
+            };
+            // The dump names carry the full base58 signer (finding 20), so the
+            // roster is matched on the same, never on the eight-character
+            // `Display` that made every real contribution unmatchable.
+            let Some(index) = state
+                .coordinator
+                .epoch_state
+                .clients
+                .iter()
+                .position(|client| bs58::encode(client.id.signer()).into_string() == committer)
+            else {
+                continue;
+            };
+            let data: Vec<BatchDataCPU> = self
+                .provider
+                .get_samples(batch_id)
+                .await?
+                .into_iter()
+                .map(|x| BatchDataCPU {
+                    input_ids: x.input_ids,
+                    labels: x.labels,
+                    position_ids: x.position_ids,
+                    sequence_lengths: x.sequence_lengths,
+                })
+                .collect();
+            assignments.push(ReplayAssignment {
+                target_index: index as u64,
+                step,
+                batch_id,
+                data,
+            });
+        }
+
+        let trainer = self
+            .trainer
+            .take()
+            .ok_or_else(|| anyhow!("the replay model was lost in an earlier pass"))?;
+        Ok(TrainerReplayEngine::new(
+            trainer,
+            assignments,
+            tch::Device::Cpu,
+        ))
+    }
+
+    fn reclaim(&mut self, engine: TrainerReplayEngine) {
+        self.trainer = engine.into_trainer();
+    }
 }
 
 #[tokio::main]
@@ -211,6 +251,7 @@ async fn main() -> Result<()> {
         audit_assigned: args.audit_assigned,
         dry_run: args.dry_run,
         verdict_mode: args.verdict,
+        replay_step: args.replay_step,
     };
 
     println!(
@@ -236,24 +277,45 @@ async fn main() -> Result<()> {
         }
     );
 
-    let replay = match args.replay_model {
-        Some(_) => Some(build_replay_engine(&args, &mut endpoint, &coordinator_account).await?),
+    let mut replayer = match args.replay_model {
+        Some(_) => {
+            let replayer = Replayer::new(&args)?;
+            println!(
+                "[verifier-daemon] replay engine loaded, judging step {} contributions",
+                replayer.step
+            );
+            Some(replayer)
+        }
         None => None,
     };
 
-    let mut convicted: HashSet<String> = HashSet::new();
+    let mut judged: HashSet<String> = HashSet::new();
     loop {
-        match audit_pass(
+        let engine = match replayer.as_mut() {
+            Some(replayer) => match replayer.engine(&args, &mut endpoint, &coordinator_account).await {
+                Ok(engine) => Some(engine),
+                Err(err) => {
+                    eprintln!("[verifier-daemon] cannot prepare this pass: {err:#}");
+                    tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let result = audit_pass(
             &mut endpoint,
             &authority,
             &coordinator_account,
             &run,
             &config,
-            replay.as_ref().map(|e| e as &(dyn psyche_verifier::ReplayEngine + Sync)),
-            &mut convicted,
+            engine.as_ref().map(|e| e as &(dyn psyche_verifier::ReplayEngine + Sync)),
+            &mut judged,
         )
-        .await
-        {
+        .await;
+        if let (Some(replayer), Some(engine)) = (replayer.as_mut(), engine) {
+            replayer.reclaim(engine);
+        }
+        match result {
             Ok(new_convictions) => {
                 if args.once {
                     println!(

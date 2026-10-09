@@ -392,10 +392,7 @@ pub async fn run() {
         .unwrap();
     }
 
-    let cheater_committer = format!(
-        "{}",
-        NodeIdentity::new(clients[cheater].pubkey().to_bytes(), Default::default())
-    );
+    let cheater_committer = clients[cheater].pubkey().to_string();
     let roster = get_coordinator_account_state(&mut endpoint, &coordinator_account)
         .await
         .unwrap()
@@ -405,7 +402,7 @@ pub async fn run() {
         .epoch_state
         .clients
         .iter()
-        .position(|client| format!("{}", client.id) == cheater_committer)
+        .position(|client| *client.id.signer() == clients[cheater].pubkey().to_bytes())
         .expect("the cheater must be in the epoch roster") as u64;
 
     let (_, honest) = nano_train_once(nano_trainer());
@@ -439,6 +436,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        replay_step: Some(1),
     };
 
     let mut convicted = HashSet::new();
