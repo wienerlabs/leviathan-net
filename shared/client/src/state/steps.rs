@@ -21,7 +21,7 @@ use tokio::{
     sync::mpsc::{self},
     task::JoinHandle,
 };
-use tracing::{Instrument, debug, info, trace, trace_span, warn};
+use tracing::{Instrument, debug, error, info, trace, trace_span, warn};
 
 use super::{
     FinishedBroadcast, RunInitConfigAndIO,
@@ -30,7 +30,7 @@ use super::{
     init::InitRunError,
     round_state::RoundState,
     stats::StatsLogger,
-    train::{TrainError, TrainingStep, TrainingStepMetadata},
+    train::{TrainError, TrainingStep, TrainingStepMetadata, write_gradients_to_disk},
     types::PayloadState,
     warmup::{WarmupStep, WarmupStepMetadata},
     witness::{WitnessStep, WitnessStepMetadata, WitnessingError},
@@ -556,6 +556,7 @@ impl StepStateMachine {
                 return;
             };
 
+        let is_own_result = self_result.is_some();
         if let Some(self_result) = self_result {
             trace!(
                 "Processing our own distro result for batch {} in step {} with hash {hash}",
@@ -606,6 +607,13 @@ impl StepStateMachine {
         let blooms = round_state.blooms.clone();
         let downloads = round_state.downloads.clone();
         let stats_logger = self.stats_logger.clone();
+        // A verifier judges what its peers broadcast, so a peer's result is kept
+        // once it matches the commitment the peer signed. Our own result was
+        // already written when it was trained.
+        let write_gradients_dir = match is_own_result {
+            true => None,
+            false => self.training.write_gradients_dir.clone(),
+        };
         tokio::spawn(async move {
             // verify that the result matches the commitment
             let (distro_hash, distro_result) =
@@ -620,6 +628,12 @@ impl StepStateMachine {
                     "Distro result failed commitment hash verification",
                 );
                 return;
+            }
+
+            if let Some(dir) = write_gradients_dir {
+                if let Err(err) = write_gradients_to_disk(dir, from, distro_result.clone()).await {
+                    error!("Failed to write a received distro result to disk: {err:#}");
+                }
             }
 
             // we only care to add this to consensus & track it in batch IDs if we have any batch IDs that haven't yet been voted for.
