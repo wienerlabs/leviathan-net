@@ -10,34 +10,53 @@ public invitation, a finish line and a loss curve anyone can watch.
 
 ## 0. The gate that has to move first
 
-**An outsider cannot join today, and no amount of documentation fixes it.**
+**An outsider can join a run only if its join authority has opened it. The
+protocol already supports opening one; whether the first public run should be
+open is the decision, not whether it can be.**
 
-`join_run` requires an `Authorization` account with `grantor == join_authority`,
-`grantee == the node`, scope `CoordinatorJoinRun`, and `active == true`. Creating
-one takes `pub grantor: Signer` — the join authority has to sign, per node. There
-is no sentinel, no open-join flag, no self-service path. `authorization_grantor_update`
-then has to flip `active` to true, which is a second signature.
+`join_run` accepts an `Authorization` when `is_valid_for(join_authority, node,
+CoordinatorJoinRun)` holds (`solana-authorizer/src/state/authorization.rs`): the
+grantor is the run's join authority, the scope matches, `active == true`, and the
+node is the grantee, one of its delegates, or **the grantee is the default pubkey**
+(`11111111111111111111111111111111`), which admits every signer.
+`authorization_create` accepts that grantee and creates it inactive, so opening
+costs the join authority two signatures once, not two per node.
+`run-manager join-authorization-create --authorizer 11111111111111111111111111111111`
+sends the create and the activating `authorization_grantor_update` in one
+command, and `scripts/create-permissionless-run.sh` does exactly that. The
+client looks up that same grant when `--authorizer` is left unset
+(`find_join_authorization` in `solana-common/src/backend.rs` defaults to the
+system program id, the default pubkey), so a node joins an open run with no extra
+flag and no human in the loop.
 
-So a "generate a keypair, airdrop, bond, join" one-liner cannot be written: step
-four blocks on a human with the join authority key. Three options, and this is
-the week's real decision:
+The grant is per join authority, not per run: the account is seeded by grantor,
+grantee and scope, with no run in it. Opening one run opens every run that shares
+its join authority, so a public run needs a join authority key of its own.
+
+So a "generate a keypair, airdrop, bond, join" one-liner can be written today
+against an open run. What blocks it is policy, not code, and this is the week's
+real decision:
 
 | Option | What it costs | What it buys | Risk |
 |---|---|---|---|
-| **A. Admission service** | ~150 lines, a host, the join authority key online | Join works today, no protocol change, no new audit surface | The key is online. Compromise means an attacker admits nodes, not that it steals bonds |
+| **A. Admission service** | ~150 lines, a host, the join authority key online | Join works today, and every admission passes a policy (rate, allowlist, bond) | The key is online. Compromise means an attacker admits nodes, not that it steals bonds. Each admission can grow by delegation, see below |
 | **B. Pre-granted batch** | An afternoon | Nothing to build | Does not scale, and handing out keys is worse than an online service |
-| **C. Open-join mode** | Protocol change, program redeploy, audit | Genuinely permissionless | Removes the only sybil gate the network has. Every committee is priced in the fraction of identities an attacker holds |
+| **C. Open run** | One `join-authorization-create` with the default grantee. No protocol change, no redeploy | Genuinely permissionless, today | Removes the only sybil gate the network has. Every committee is priced in the fraction of identities an attacker holds |
 
 **Recommendation: A.** It is honest to say "the join authority admits anyone who
 asks, automatically, for now" and it makes the three-minute claim true. C is the
-right end state but it must not ship before leviathan#4, because open join plus
-bonds off means an attacker mints identities for free and the committee sampling
-argument collapses. Note that option A does not weaken anything: the join
-authority already has exactly this power, the service only automates its policy.
+right end state, and it is a switch rather than a build, which is exactly why it
+must not be flipped before leviathan#4: open join plus bonds off means an attacker
+mints identities for free and the committee sampling argument collapses. Note
+that option A does not weaken anything: the join authority already has exactly
+this power, the service only automates its policy.
 
-Delegation does not rescue this. One `Authorization` carries up to 64 delegates
-(capped by wienerlabs/leviathan#15 finding 19), but adding a delegate is still a
-grantor signature.
+Delegation cuts the other way. `authorization_grantee_update` is signed by the
+grantee, not the grantor, and every key it adds passes `is_valid_for`, so each
+admitted node can add up to 64 delegates of its own (`MAX_DELEGATES`, the cap
+from wienerlabs/leviathan#15 finding 19). One admission is up to 65 identities,
+and with bonds off they cost nothing. An admission service that meters
+identities has to count delegates as well, or price every grant as 65.
 
 ## 1. Hardware envelope
 
@@ -231,7 +250,8 @@ loss curve.
 
 ## Decision order
 
-1. Join (section 0). Nothing else can be invited until this moves.
+1. Join policy (section 0): admission service or open run, on a join authority
+   key used for this run alone. Nothing else can be invited until it is decided.
 2. Model, dataset and measured VRAM (section 2). Sets which cards can join.
 3. Round length and token target (section 4). Needs the model.
 4. Committee size and bond stage (section 3). Needs the reward rate.
