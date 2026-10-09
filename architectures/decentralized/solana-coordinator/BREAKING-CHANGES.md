@@ -17,7 +17,7 @@ This is because if the program's logic is being upgraded but the on-chain accoun
 
 There are a few types of potential avenues to mitigate the problem, each can be applied in different situations
 
-### 1) Architechtural changes
+### 1) Architectural changes
 
 A few code logic changes can help make future breaking changes more forgiving.
 
