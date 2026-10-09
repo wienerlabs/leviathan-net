@@ -194,7 +194,7 @@ EOF
 
 ### Optional Configuration
 
-You can add these optional variables to tune performance, please ask run adminstrator for help:
+You can add these optional variables to tune performance, please ask run administrator for help:
 
 ```bash
 # Number of GPUs to use for data parallelism (default: 1)
