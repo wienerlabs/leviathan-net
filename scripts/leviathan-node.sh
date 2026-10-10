@@ -8,6 +8,8 @@ set -euo pipefail
 #   ./scripts/leviathan-node.sh --wallet <path/to/keypair.json> [--bond <amount>]
 #
 # Env overrides:
+#   WALLET      (keypair path, same as --wallet)
+#   BOND        (bond amount, same as --bond)
 #   RUN_ID      (default leviathan-devnet)
 #   RPC         (default https://api.devnet.solana.com)
 #   WS_RPC      (default wss://api.devnet.solana.com)
@@ -31,8 +33,8 @@ WS_RPC="${WS_RPC:-wss://api.devnet.solana.com}"
 TORCH_VENV="${TORCH_VENV:-/tmp/leviathan-torch-venv}"
 AUTHORIZER="${AUTHORIZER:-11111111111111111111111111111111}"
 JOIN_TIMEOUT="${LEVIATHAN_JOIN_TIMEOUT_SECS:-45}"
-WALLET=""
-BOND_AMOUNT="${BOND_AMOUNT:-}"
+WALLET="${WALLET:-}"
+BOND_AMOUNT="${BOND_AMOUNT:-${BOND:-}}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,7 +46,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$WALLET" ]]; then
-  echo "error: --wallet <path> is required (a funded devnet keypair)" >&2
+  echo "error: a funded devnet keypair is required, pass --wallet <path> or set WALLET" >&2
   exit 1
 fi
 
