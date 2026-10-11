@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="./assets/leviathan-banner.png" alt="Leviathan">
+    <img src="./assets/leviathan-wordmark.jpg" alt="Leviathan">
 </p>
 
 <h1 align="center">Leviathan</h1>
@@ -11,6 +11,10 @@ Frontier AI is produced inside five balance sheets. The mathematics of training 
 Leviathan is a Solana-coordinated training network where anyone with a GPU joins by posting a bond, earns Proof of Gradient for contributions that survive verification, and loses the bond if they lie. The chain carries commitments, audits and money. The mesh carries compressed tensors. The model belongs to the network that trained it.
 
 Hobbes drew Leviathan as a giant composed of thousands of individuals. This one is composed of thousands of GPUs.
+
+<p align="center">
+    <img src="./assets/leviathan-king.jpg" alt="Leviathan drawn as a crowned king in an engraved ornamental frame" width="360">
+</p>
 
 > This repository is `leviathan-net`, the network substrate: a fork of [PsycheFoundation/nousnet](https://github.com/PsycheFoundation/nousnet) (Apache-2.0) that carries the layer upstream designed but left unimplemented. The vision, whitepaper, simulation and phase plan live in [wienerlabs/leviathan](https://github.com/wienerlabs/leviathan).
 
