@@ -158,7 +158,7 @@ The same toolbox carries three more live drivers (`--features demo`):
 | `devnet-appeals-demo` | two verifiers convict, the target appeals, two tie-breakers overturn; both verifiers forfeit 200 and the target keeps its full bond |
 | `devnet-bond-gated-claim-demo` | a claim is refused before the bond exists and accepted after; a zero withdraw delay is refused |
 
-And with a real model in the loop: on a bonded devnet run, three nodes posted 500 each and one broadcast a forged gradient through the client's `LEVIATHAN_FAKE_DELTA` test switch. `leviathan-verifier-daemon` replayed the first step: the honest nodes landed at 0.0037 and 0.0043, the cheater at 6.0046 against the 0.05 band. The daemon slashed it on chain with both hashes in the log, the coordinator ejected it, and its withdrawal returned nothing of its 500 bond (#29). That slash went through the run authority; the committee path above is separate.
+And with a real model in the loop: on a bonded devnet run, three nodes posted 500 each and one broadcast a forged gradient through the client's `LEVIATHAN_FAKE_DELTA` test switch. `leviathan-verifier-daemon` replayed the first step: the honest nodes landed at 0.0043 and 0.0031, the cheater at 5.9968 against the 0.05 band. The daemon slashed it on chain with both hashes in the log, the coordinator ejected it, and its withdrawal returned nothing of its 500 bond (#29). That slash went through the run authority; the committee path above is separate.
 
 ## Run a node
 
