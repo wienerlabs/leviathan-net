@@ -12,6 +12,9 @@ use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
+use psyche_coordinator::model::HttpLLMTrainingDataLocation;
+use psyche_coordinator::model::LLMTrainingDataLocation;
+use psyche_coordinator::model::Model;
 use psyche_core::Shuffle;
 use psyche_core::TokenSize;
 use psyche_data_provider::download_model_repo_sync;
@@ -96,8 +99,24 @@ struct Replayer {
     step: u32,
 }
 
+async fn run_shuffle(
+    endpoint: &mut ToolboxEndpoint,
+    coordinator_account: &Pubkey,
+) -> Result<Shuffle> {
+    let state = get_coordinator_account_state(endpoint, coordinator_account)
+        .await?
+        .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
+    let Model::LLM(llm) = state.coordinator.model;
+    match llm.data_location {
+        LLMTrainingDataLocation::Http(HttpLLMTrainingDataLocation { shuffle, .. }) => Ok(shuffle),
+        other => Err(anyhow!(
+            "the replay reads local shards in HttpDataProvider order and cannot reproduce the run's {other:?} data location"
+        )),
+    }
+}
+
 impl Replayer {
-    fn new(args: &Args) -> Result<Self> {
+    fn new(args: &Args, shuffle: Shuffle) -> Result<Self> {
         let model = args
             .replay_model
             .as_ref()
@@ -134,7 +153,7 @@ impl Replayer {
             data_dir,
             TokenSize::TwoBytes,
             args.replay_sequence_length,
-            Shuffle::DontShuffle,
+            shuffle,
         )?;
 
         Ok(Self {
@@ -279,10 +298,11 @@ async fn main() -> Result<()> {
 
     let mut replayer = match args.replay_model {
         Some(_) => {
-            let replayer = Replayer::new(&args)?;
+            let shuffle = run_shuffle(&mut endpoint, &coordinator_account).await?;
+            let replayer = Replayer::new(&args, shuffle)?;
             println!(
-                "[verifier-daemon] replay engine loaded, judging step {} contributions",
-                replayer.step
+                "[verifier-daemon] replay engine loaded with the run's {:?} data order, judging step {} contributions",
+                shuffle, replayer.step
             );
             Some(replayer)
         }

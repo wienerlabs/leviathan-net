@@ -1,14 +1,12 @@
 use anyhow::{Result, anyhow, bail};
 use psyche_core::{BatchId, ClosedInterval, Shuffle, TokenSize};
-use rand::seq::SliceRandom;
-use rand_chacha::ChaCha8Rng;
-use rand_chacha::rand_core::SeedableRng;
 use std::fs;
 use tracing::info;
 
 use crate::{
     TokenizedData,
     file_extensions::DATA_FILE_EXTENSIONS,
+    http::{SequencePointer, sequence_pointers},
     traits::{LengthKnownDataProvider, TokenizedDataProvider},
 };
 
@@ -34,11 +32,6 @@ fn mmap_file(p: &std::path::PathBuf) -> Result<Box<dyn AsRef<[u8]> + Send>> {
         }
         Err(e) => Err(e.into()),
     }
-}
-
-struct SequencePointer {
-    file_index: usize,
-    byte_offset: usize,
 }
 
 pub struct LocalDataProvider {
@@ -75,6 +68,7 @@ impl LocalDataProvider {
                 }
             }
         }
+        bin_files.sort();
         let data_files = bin_files
             .iter()
             .map(mmap_file)
@@ -94,32 +88,16 @@ impl LocalDataProvider {
             dir.display()
         );
 
-        let deterministic_rng = match shuffle {
-            Shuffle::Seeded(random_seed) => Some(ChaCha8Rng::from_seed(random_seed)),
-            Shuffle::DontShuffle => None,
-        };
-        let seq_len_in_bytes = num_tokens_per_sequence * usize::from(token_size_in_bytes);
-
-        let sequences: Vec<SequencePointer> = {
-            let mut all_indexes: Vec<_> = data_files
-                .iter()
-                .enumerate()
-                // find every sequence in every file
-                .flat_map(|(file_index, current_tokens)| {
-                    (0..current_tokens.as_ref().as_ref().len() - seq_len_in_bytes)
-                        .step_by(seq_len_in_bytes)
-                        .map(move |byte_offset| SequencePointer {
-                            file_index,
-                            byte_offset,
-                        })
-                })
-                .collect();
-            // and shuffle the whole collection, to avoid bias from a specific file
-            if let Some(mut deterministic_rng) = deterministic_rng {
-                all_indexes.shuffle(&mut deterministic_rng);
-            }
-            all_indexes
-        };
+        let sequences = sequence_pointers(
+            bin_files.iter().map(|path| path.display()).zip(
+                data_files
+                    .iter()
+                    .map(|file| file.as_ref().as_ref().len() as u64),
+            ),
+            token_size_in_bytes,
+            num_tokens_per_sequence as u64,
+            shuffle,
+        )?;
 
         Ok(Self {
             data_files,

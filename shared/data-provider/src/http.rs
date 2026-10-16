@@ -21,9 +21,44 @@ use crate::{
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_millis(5000);
 
 #[derive(Clone, Copy, Debug)]
-struct SequencePointer {
-    file_index: usize,
-    byte_offset: usize,
+pub(crate) struct SequencePointer {
+    pub(crate) file_index: usize,
+    pub(crate) byte_offset: usize,
+}
+
+pub(crate) fn sequence_pointers(
+    files: impl IntoIterator<Item = (impl std::fmt::Display, u64)>,
+    token_size_in_bytes: TokenSize,
+    num_tokens_per_sequence: u64,
+    shuffle: Shuffle,
+) -> Result<Vec<SequencePointer>> {
+    let token_bytes = usize::from(token_size_in_bytes) as u64;
+    let sequence_bytes = num_tokens_per_sequence * token_bytes;
+    let sequence_with_label_bytes = sequence_bytes + token_bytes;
+
+    let mut sequences = Vec::new();
+    for (file_index, (name, file_size)) in files.into_iter().enumerate() {
+        let offsets_end = file_size
+            .checked_sub(sequence_with_label_bytes)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{name} holds {file_size} bytes, fewer than the {sequence_with_label_bytes} that one sequence and its label token need"
+                )
+            })?;
+        sequences.extend(
+            (0..offsets_end)
+                .step_by(sequence_bytes as usize)
+                .map(|byte_offset| SequencePointer {
+                    file_index,
+                    byte_offset: byte_offset as usize,
+                }),
+        );
+    }
+
+    if let Shuffle::Seeded(seed) = shuffle {
+        sequences.shuffle(&mut ChaCha8Rng::from_seed(seed));
+    }
+    Ok(sequences)
 }
 
 pub struct HttpDataProvider {
@@ -179,28 +214,12 @@ impl HttpDataProvider {
 
         let client = reqwest::Client::new();
 
-        let seq_len_in_bytes =
-            num_tokens_per_sequence as u64 * usize::from(token_size_in_bytes) as u64;
-
-        let sequences: Vec<SequencePointer> = {
-            let mut all_indexes: Vec<_> = (0..num_files)
-                .flat_map(|file_index| {
-                    let file_size = file_urls[file_index].1;
-                    (0..file_size - (seq_len_in_bytes + usize::from(token_size_in_bytes) as u64)) // +1 token for pretraining data!
-                        .step_by(seq_len_in_bytes as usize)
-                        .map(move |byte_offset| SequencePointer {
-                            file_index,
-                            byte_offset: byte_offset as usize,
-                        })
-                })
-                .collect();
-
-            if let Shuffle::Seeded(seed) = shuffle {
-                let mut rng = ChaCha8Rng::from_seed(seed);
-                all_indexes.shuffle(&mut rng);
-            }
-            all_indexes
-        };
+        let sequences = sequence_pointers(
+            file_urls.iter().map(|(url, size)| (url, *size)),
+            token_size_in_bytes,
+            num_tokens_per_sequence.into(),
+            shuffle,
+        )?;
 
         info!(
             "Created HTTP data provider for {} files with {} sequences",
@@ -439,4 +458,28 @@ async fn with_file_sizes(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use psyche_core::{Shuffle, TokenSize};
+
+    use super::sequence_pointers;
+
+    #[test]
+    fn refuses_a_file_shorter_than_one_sequence_and_its_label() {
+        let pointers = |size: u64| {
+            sequence_pointers(
+                [("shard", size)],
+                TokenSize::TwoBytes,
+                4,
+                Shuffle::DontShuffle,
+            )
+        };
+
+        let error = pointers(9).unwrap_err().to_string();
+        assert!(error.contains("shard holds 9 bytes"), "{error}");
+        assert!(pointers(10).unwrap().is_empty());
+        assert_eq!(pointers(19).unwrap().len(), 2);
+    }
 }

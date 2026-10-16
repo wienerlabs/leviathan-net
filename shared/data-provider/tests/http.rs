@@ -1,11 +1,12 @@
 use anyhow::Result;
 use psyche_core::{BatchId, Shuffle, TokenSize};
 use psyche_data_provider::{
-    TokenizedDataProvider,
+    LengthKnownDataProvider, LocalDataProvider, TokenizedDataProvider,
     http::{FileURLs, HttpDataProvider},
 };
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::{fs::File, time::Duration};
 use test_log::test;
 use tokio::time::timeout;
@@ -14,6 +15,7 @@ use tracing::debug;
 struct TestServer {
     cancel: tokio::sync::watch::Sender<()>,
     addr: SocketAddr,
+    dir: PathBuf,
 }
 
 impl Drop for TestServer {
@@ -26,7 +28,7 @@ impl TestServer {
     async fn new(files: Vec<Vec<u8>>) -> Result<Self> {
         let temp_dir = tempfile::tempdir()?;
 
-        for (idx, data) in files.iter().enumerate() {
+        for (idx, data) in files.iter().enumerate().rev() {
             let file_path = temp_dir.path().join(format!("{idx:0>3}.ds"));
             let mut file = File::create(&file_path)?;
             file.write_all(data)?;
@@ -36,7 +38,8 @@ impl TestServer {
         let (cancel, rx_cancel) = tokio::sync::watch::channel(());
         let mut settings = static_web_server::Settings::get_unparsed(false)?;
         settings.general.port = 0;
-        settings.general.root = temp_dir.keep();
+        let dir = temp_dir.keep();
+        settings.general.root = dir.clone();
         let (tx_port, rx_port) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             static_web_server::Server::new(settings)
@@ -46,8 +49,62 @@ impl TestServer {
         });
         let port = rx_port.await?;
         let addr = SocketAddr::new("127.0.0.1".parse()?, port);
-        Ok(Self { addr, cancel })
+        Ok(Self { addr, cancel, dir })
     }
+}
+
+#[test(tokio::test)]
+async fn test_http_and_local_providers_agree_on_every_batch_id() -> Result<()> {
+    const SEQUENCE_LEN: u32 = 4;
+    const SEQUENCE_BYTES: usize = SEQUENCE_LEN as usize * 2;
+
+    let file_sizes = [
+        5 * SEQUENCE_BYTES + 2,
+        4 * SEQUENCE_BYTES,
+        3 * SEQUENCE_BYTES + 6,
+        2 * SEQUENCE_BYTES + 2,
+        6 * SEQUENCE_BYTES + 4,
+    ];
+    let files: Vec<Vec<u8>> = file_sizes
+        .iter()
+        .enumerate()
+        .map(|(file, &size)| {
+            (0..size / 2)
+                .flat_map(|token| ((file * 1000 + token) as u16).to_le_bytes())
+                .collect()
+        })
+        .collect();
+
+    let server = TestServer::new(files).await?;
+    let base_url = format!("http://{}/{{}}.ds", server.addr);
+
+    for shuffle in [Shuffle::DontShuffle, Shuffle::Seeded([7; 32])] {
+        let mut http = HttpDataProvider::new(
+            timeout(
+                Duration::from_secs(2),
+                FileURLs::from_template(&base_url, 0, 3, file_sizes.len() as u32),
+            )
+            .await??,
+            TokenSize::TwoBytes,
+            SEQUENCE_LEN,
+            shuffle,
+        )?;
+        let mut local = LocalDataProvider::new_from_directory(
+            &server.dir,
+            TokenSize::TwoBytes,
+            SEQUENCE_LEN as usize,
+            shuffle,
+        )?;
+
+        let every_batch_id = BatchId((0, http.num_sequences() as u64 - 1).into());
+        let from_http = timeout(Duration::from_secs(5), http.get_samples(every_batch_id)).await??;
+        let from_local = local.get_samples(every_batch_id).await?;
+
+        assert_eq!(from_http, from_local, "{shuffle:?}");
+        assert_eq!(http.num_sequences(), local.num_sequences(), "{shuffle:?}");
+    }
+
+    Ok(())
 }
 
 #[test(tokio::test)]
