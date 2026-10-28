@@ -166,7 +166,7 @@ And with a real model in the loop: on a bonded devnet run, three nodes posted 50
 curl -fsSL https://raw.githubusercontent.com/wienerlabs/leviathan-net/main/scripts/install.sh | bash
 ```
 
-[DEVNET.md](./DEVNET.md) covers the flagship run, join authorization, the container image and the env file; [docs/NOSANA.md](docs/NOSANA.md) covers renting GPU hosts; [docs/FIRST_RUN.md](docs/FIRST_RUN.md) lists what is still to decide before a public run.
+[DEVNET.md](./DEVNET.md) covers the flagship run, join authorization, the container image and the env file; [docs/NOSANA.md](docs/NOSANA.md) covers renting GPU hosts; [docs/FIRST_RUN.md](docs/FIRST_RUN.md) lists what is still to decide before a public run. [docs/ROADMAP.md](docs/ROADMAP.md) lays out the path from here to mainnet, in order.
 
 ## Where it stands
 
