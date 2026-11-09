@@ -172,6 +172,10 @@ curl -fsSL https://raw.githubusercontent.com/wienerlabs/leviathan-net/main/scrip
 
 The protocol is live on devnet. Not there yet: the model is a test model (Nano-Llama, 30-token vocabulary); joining needs a per-node authorization from the run's join authority; bonds with real value wait on the external audit (wienerlabs/leviathan#4), so the planned first mainnet stage is bondless ([config/leviathan/mainnet-genesis-bondless.toml](config/leviathan/mainnet-genesis-bondless.toml)); the programs are not deployed on mainnet-beta; the verifier daemon replays a cold-start step; robust aggregation sits behind `LEVIATHAN_ROBUST_AGG` and is off by default. The internal security review is public in [docs/SECURITY_REVIEW_INTERNAL.md](docs/SECURITY_REVIEW_INTERNAL.md).
 
+## Phones
+
+[architectures/mobile](architectures/mobile/README.md) holds Leviathan Multitude, a phone-class training run in Rust: DiLoCo local rounds, SparseLoCo sign votes, an integer tally anyone can recount bit for bit, and replay audits through the same `psyche-verifier`. It runs end to end in a simulator that catches sign-flipping, free-riding and lazy phones and a miscounting relay; it is not yet on chain or on a real phone.
+
 ## Lineage
 
 Built on the shoulders of, and differentiated from, PsycheFoundation/nousnet (Apache-2.0): the Solana coordinator, iroh P2P mesh, and Rust DisTrO compression are inherited; the bond, audit, slash, committee and appeals layers are ours. The compression recipe follows SparseLoCo over a DiLoCo outer loop; the inference path follows vLLM workers verified by TOPLOC. This repository remains Apache-2.0; see [LICENSE](./LICENSE) and [NOTICE](./NOTICE).

@@ -1,0 +1,13 @@
+[package]
+name = "leviathan-multitude-sim"
+description = "End-to-end simulation of a Leviathan Multitude phone swarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+leviathan-multitude.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
