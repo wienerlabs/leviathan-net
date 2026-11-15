@@ -2,11 +2,14 @@ use anchor_lang::InstructionData;
 use anchor_lang::ToAccountMetas;
 use anchor_spl::associated_token;
 use anchor_spl::token;
+use anyhow::anyhow;
 use anyhow::Result;
+use psyche_core::NodeIdentity;
+use crate::get_accounts::get_run;
 use psyche_solana_authorizer::find_authorization;
 use psyche_solana_coordinator::find_coordinator_instance;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
-use psyche_solana_treasurer::accounts::ParticipantAuthorizeJoinAccounts;
+use psyche_solana_treasurer::accounts::ParticipantJoinRunAccounts;
 use psyche_solana_treasurer::accounts::ParticipantBondDepositAccounts;
 use psyche_solana_treasurer::accounts::ParticipantBondFinalizeWithdrawAccounts;
 use psyche_solana_treasurer::accounts::ParticipantBondRequestWithdrawAccounts;
@@ -19,7 +22,7 @@ use psyche_solana_treasurer::accounts::RunSlashAccounts;
 use psyche_solana_treasurer::accounts::RunUpdateAccounts;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::find_run;
-use psyche_solana_treasurer::instruction::ParticipantAuthorizeJoin;
+use psyche_solana_treasurer::instruction::ParticipantJoinRun;
 use psyche_solana_treasurer::instruction::ParticipantBondDeposit;
 use psyche_solana_treasurer::instruction::ParticipantBondFinalizeWithdraw;
 use psyche_solana_treasurer::instruction::ParticipantBondRequestWithdraw;
@@ -35,6 +38,7 @@ use psyche_solana_treasurer::logic::ParticipantBondFinalizeWithdrawParams;
 use psyche_solana_treasurer::logic::ParticipantBondRequestWithdrawParams;
 use psyche_solana_treasurer::logic::ParticipantClaimParams;
 use psyche_solana_treasurer::logic::ParticipantCreateParams;
+use psyche_solana_treasurer::logic::ParticipantJoinRunParams;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunSetSlashBountyParams;
@@ -611,30 +615,44 @@ pub async fn process_treasurer_participant_claim(
     Ok(())
 }
 
-pub async fn process_treasurer_participant_authorize_join(
+/// Joins the next epoch of a bond-gated run through the treasurer, which checks
+/// the committed bond and opens the join authorization only for this join.
+/// The run's coordinator accounts are read from the run itself.
+pub async fn process_treasurer_participant_join_run(
     endpoint: &mut ToolboxEndpoint,
     payer: &Keypair,
-    user: &Pubkey,
+    user: &Keypair,
     run: &Pubkey,
+    client_id: NodeIdentity,
 ) -> Result<Pubkey> {
-    let participant = find_participant(run, user);
-    let authorization = find_authorization(run, user, JOIN_RUN_AUTHORIZATION_SCOPE);
-    let accounts = ParticipantAuthorizeJoinAccounts {
+    let run_account = get_run(endpoint, run)
+        .await?
+        .ok_or_else(|| anyhow!("run {run} not found"))?;
+    let participant = find_participant(run, &user.pubkey());
+    let authorization =
+        find_authorization(run, &user.pubkey(), JOIN_RUN_AUTHORIZATION_SCOPE);
+    let accounts = ParticipantJoinRunAccounts {
         payer: payer.pubkey(),
-        user: *user,
+        user: user.pubkey(),
         run: *run,
         participant,
         authorization,
+        coordinator_instance: run_account.coordinator_instance,
+        coordinator_account: run_account.coordinator_account,
         authorizer_program: psyche_solana_authorizer::ID,
+        coordinator_program: psyche_solana_coordinator::ID,
         system_program: system_program::ID,
     };
     let instruction = Instruction {
         accounts: accounts.to_account_metas(None),
-        data: ParticipantAuthorizeJoin {}.data(),
+        data: ParticipantJoinRun {
+            params: ParticipantJoinRunParams { client_id },
+        }
+        .data(),
         program_id: psyche_solana_treasurer::ID,
     };
     endpoint
-        .process_instruction_with_signers(payer, instruction, &[])
+        .process_instruction_with_signers(payer, instruction, &[user])
         .await?;
     Ok(authorization)
 }
@@ -678,10 +696,15 @@ pub async fn process_treasurer_run_open_challenge(
 ) -> Result<()> {
     let challenger_participant = find_participant(run, &challenger.pubkey());
     let audit_verdict = find_audit_verdict(run, &challenger.pubkey());
+    let coordinator_account = get_run(endpoint, run)
+        .await?
+        .ok_or_else(|| anyhow!("run {run} not found"))?
+        .coordinator_account;
     let accounts = RunOpenChallengeAccounts {
         challenger: challenger.pubkey(),
         challenger_participant,
         run: *run,
+        coordinator_account,
         audit_verdict,
     };
     let instruction = Instruction {

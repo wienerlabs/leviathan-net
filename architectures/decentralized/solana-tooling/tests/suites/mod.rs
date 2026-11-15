@@ -12,7 +12,6 @@ mod memnet_mining_pool_full_cycle;
 mod memnet_mining_pool_live_freeze;
 mod memnet_treasurer_bond;
 mod memnet_treasurer_bond_gated_claim;
-mod memnet_treasurer_bond_gated_join;
 mod memnet_treasurer_appeals;
 mod memnet_treasurer_bounty;
 mod memnet_treasurer_bounty_recipient;
@@ -21,8 +20,10 @@ mod memnet_treasurer_cross_round_quorum;
 mod memnet_treasurer_create_claim;
 mod memnet_treasurer_create_update;
 mod memnet_treasurer_full_epoch;
+mod memnet_treasurer_join_gate;
 mod memnet_treasurer_slash_accounting_order;
 mod memnet_treasurer_slash_settle;
+mod refusal;
 #[cfg(feature = "daemon")]
 mod memnet_verifier_daemon;
 #[cfg(feature = "daemon")]

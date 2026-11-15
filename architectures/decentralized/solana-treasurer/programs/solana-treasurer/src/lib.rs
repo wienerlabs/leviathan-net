@@ -118,10 +118,11 @@ pub mod psyche_solana_treasurer {
         run_set_slash_bounty_processor(context, params)
     }
 
-    pub fn participant_authorize_join(
-        context: Context<ParticipantAuthorizeJoinAccounts>,
+    pub fn participant_join_run(
+        context: Context<ParticipantJoinRunAccounts>,
+        params: ParticipantJoinRunParams,
     ) -> Result<()> {
-        participant_authorize_join_processor(context)
+        participant_join_run_processor(context, params)
     }
 
     pub fn run_submit_audit_verdict(
@@ -264,4 +265,7 @@ pub enum ProgramError {
 
     #[msg("The losing verifier is not in a slashable state yet; retry while it is")]
     LoserNotSlashableYet,
+
+    #[msg("This run is not gated by its own bond; join it through its join authority")]
+    RunNotBondGated,
 }

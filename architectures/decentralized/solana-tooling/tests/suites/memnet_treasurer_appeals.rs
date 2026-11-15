@@ -46,6 +46,10 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
+use psyche_solana_treasurer::ProgramError;
+
+use super::refusal::refusal_code;
+use super::refusal::treasurer_refusal;
 
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
@@ -420,6 +424,21 @@ impl AppealsHarness {
         .await
     }
 
+    /// `client_idx` asks for `amount` of its bond back, which starts it on its
+    /// way out of the vault.
+    async fn request_withdraw(&mut self, client_idx: usize, amount: u64) {
+        let client = self.clients[client_idx].insecure_clone();
+        process_treasurer_participant_bond_request_withdraw(
+            &mut self.endpoint,
+            &self.payer,
+            &client,
+            &self.run,
+            amount,
+        )
+        .await
+        .unwrap();
+    }
+
     async fn client_state(&mut self, key: &Pubkey) -> Option<ClientState> {
         let state = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
             .await
@@ -781,4 +800,62 @@ pub async fn unchallenged_verdict_finalises_after_the_window() {
         SLASHING_RATE,
         "the unchallenged target forfeits its bond",
     );
+}
+
+/// A verdict that turns out wrong is paid for out of the verifier's bond after
+/// the overturn, so a bond already on its way out cannot back a vote
+/// (wienerlabs/leviathan-net#34).
+#[tokio::test]
+pub async fn a_verifier_leaving_its_bond_cannot_vote() {
+    let mut h = setup("Leviathan appeals leaving voter", 93).await;
+    let (leaving, _) = h.verifiers[0];
+    let (staying, _) = h.verifiers[1];
+
+    h.request_withdraw(leaving, 1).await;
+    assert_eq!(
+        refusal_code(h.cast_verdict(leaving).await),
+        treasurer_refusal(ProgramError::BondBelowMinimum),
+        "a verifier with a withdrawal pending cast a verdict its bond may not be there to answer for",
+    );
+    h.cast_verdict(staying).await.unwrap();
+}
+
+/// A tie-breaker sits on a bonded bench for the same reason, and is held to the
+/// same bond (wienerlabs/leviathan-net#34).
+#[tokio::test]
+pub async fn a_tie_breaker_leaving_its_bond_cannot_judge_the_appeal() {
+    let mut h = setup("Leviathan appeals leaving bench", 94).await;
+    h.reach_verifier_quorum().await;
+    let target = h.clients[h.target_client_idx].insecure_clone();
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
+        .await
+        .unwrap();
+
+    let (leaving, _) = h.tie_breakers[0];
+    let (staying, _) = h.tie_breakers[1];
+    h.request_withdraw(leaving, 1).await;
+    assert_eq!(
+        refusal_code(h.cast_appeal(leaving, true).await),
+        treasurer_refusal(ProgramError::BondBelowMinimum),
+        "a tie-breaker with a withdrawal pending judged an appeal",
+    );
+    h.cast_appeal(staying, true).await.unwrap();
+}
+
+/// The target defends a conviction rather than taking on new work, and its bond
+/// is still in the vault while the withdrawal waits, so a pending withdrawal
+/// does not cost it the appeal (wienerlabs/leviathan-net#34).
+#[tokio::test]
+pub async fn a_target_with_a_pending_withdrawal_can_still_appeal() {
+    let mut h = setup("Leviathan appeals pending target", 95).await;
+    let target_idx = h.target_client_idx;
+    h.request_withdraw(target_idx, 1).await;
+    h.reach_verifier_quorum().await;
+
+    let target = h.clients[target_idx].insecure_clone();
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
+        .await
+        .unwrap();
+    let (tie_breaker, _) = h.tie_breakers[0];
+    h.cast_appeal(tie_breaker, true).await.unwrap();
 }

@@ -58,6 +58,13 @@ from wienerlabs/leviathan#15 finding 19). One admission is up to 65 identities,
 and with bonds off they cost nothing. An admission service that meters
 identities has to count delegates as well, or price every grant as 65.
 
+A run that is its own join authority (the treasurer `Run` PDA) does not have
+this problem. Its nodes join through the treasurer's `participant_join_run`,
+which pins each join to the signer's own authorization and checks that signer's
+own committed bond, so every identity posts a bond of its own and delegates do
+not ride on one (wienerlabs/leviathan-net#34). The delegation arithmetic above
+applies to runs admitted by an outside join authority.
+
 ## 1. Hardware envelope
 
 Measured on Nosana, from `docs/NOSANA.md`:

@@ -86,6 +86,14 @@ bonded node is one command. Inspect and manage the bond separately with
 `run-manager bond-status`, `bond-deposit`, `bond-withdraw-request` and
 `bond-withdraw-finalize`.
 
+A run that gates admission on the bond is one whose join authority is its own
+treasurer run. The client recognises it from chain state and joins it through
+the treasurer's `participant_join_run` every epoch, so no `--authorizer` is
+needed. That instruction checks the committed bond (posted, less convictions not
+yet settled and withdrawals already requested) on each join, and the coordinator
+refuses a direct join. `run-manager can-join` and `bond-status` report that
+committed bond, and whether joins, votes and claims are open to it.
+
 The wallet needs a little devnet SOL for transaction fees. Override `RUN_ID`,
 `RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed.
 
@@ -163,7 +171,7 @@ a dedicated RPC: the public devnet endpoint is slow enough that single-node epoc
 completion and run-manager operations are unreliable, which is an infrastructure
 constraint rather than a protocol one.
 
-Next (Phase 2): a dedicated devnet RPC for reliable operations, bond deposit
-enforced at join so every training node is bonded by the protocol rather than by
-convention, a verifier daemon that audits live training contributions and slashes
+Next (Phase 2): a dedicated devnet RPC for reliable operations, a bond
+enforced on every join so every training node is bonded by the protocol rather
+than by convention (net#3, net#34), a verifier daemon that audits live training contributions and slashes
 on a fraud verdict, and a multi-volunteer swarm behind an iroh relay.

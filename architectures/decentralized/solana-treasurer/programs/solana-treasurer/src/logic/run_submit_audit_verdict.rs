@@ -13,6 +13,7 @@ use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
 use crate::state::MAX_VERDICT_VOTERS;
+use crate::state::coordinator_slashed_points;
 use crate::ProgramError;
 
 /// The smallest verifier committee a slash may come out of.
@@ -94,17 +95,26 @@ pub fn run_submit_audit_verdict_processor(
     context: Context<RunSubmitAuditVerdictAccounts>,
     params: RunSubmitAuditVerdictParams,
 ) -> Result<()> {
-    if context.accounts.verifier_participant.bond_amount
-        < context.accounts.run.bond_minimum_amount
-    {
-        return err!(ProgramError::BondBelowMinimum);
-    }
-
     let verifier_key = context.accounts.verifier.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
     let (current_epoch, current_round, quorum) = {
         let account = context.accounts.coordinator_account.load()?;
+
+        // A verdict that turns out wrong is paid for out of this bond, at the
+        // epoch boundary after an overturn. So the bond that counts is the one
+        // still standing then: not what a conviction already charged, and not a
+        // withdrawal already requested, which could leave before the overturn
+        // reaches it (wienerlabs/leviathan-net#34).
+        if context
+            .accounts
+            .verifier_participant
+            .committed_bond(coordinator_slashed_points(&account, &verifier_key))
+            < context.accounts.run.bond_minimum_amount
+        {
+            return err!(ProgramError::BondBelowMinimum);
+        }
+
         let coordinator = &account.state.coordinator;
 
         let verifier_index = coordinator

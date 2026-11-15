@@ -1,9 +1,11 @@
 use anchor_lang::prelude::*;
+use psyche_solana_coordinator::CoordinatorAccount;
 
 use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
+use crate::state::coordinator_slashed_points;
 use crate::ProgramError;
 
 #[derive(Accounts)]
@@ -21,8 +23,13 @@ pub struct RunOpenChallengeAccounts<'info> {
     )]
     pub challenger_participant: Box<Account<'info, Participant>>,
 
-    #[account()]
+    #[account(
+        constraint = run.coordinator_account == coordinator_account.key(),
+    )]
     pub run: Box<Account<'info, Run>>,
+
+    #[account()]
+    pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
 
     #[account(
         mut,
@@ -43,7 +50,19 @@ pub fn run_open_challenge_processor(
     context: Context<RunOpenChallengeAccounts>,
     _params: RunOpenChallengeParams,
 ) -> Result<()> {
-    if context.accounts.challenger_participant.bond_amount
+    // An upheld appeal is paid for out of the challenger's bond, so what counts
+    // is the bond a slash could still take. Earlier convictions it has not
+    // settled are already spoken for (wienerlabs/leviathan-net#34). A pending
+    // withdrawal is not held against it: the challenger is defending a
+    // conviction, not taking on new work, and that bond is still in the vault.
+    let slashed_points = coordinator_slashed_points(
+        &*context.accounts.coordinator_account.load()?,
+        &context.accounts.challenger.key(),
+    );
+    if context
+        .accounts
+        .challenger_participant
+        .unforfeited_bond(slashed_points)
         < context.accounts.run.bond_minimum_amount
     {
         return err!(ProgramError::BondBelowMinimum);

@@ -13,6 +13,7 @@ use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
 use crate::state::MAX_APPEAL_VOTERS;
+use crate::state::coordinator_slashed_points;
 use crate::ProgramError;
 
 #[derive(Accounts)]
@@ -72,17 +73,25 @@ pub fn run_submit_appeal_verdict_processor(
     context: Context<RunSubmitAppealVerdictAccounts>,
     params: RunSubmitAppealVerdictParams,
 ) -> Result<()> {
-    if context.accounts.appellate_participant.bond_amount
-        < context.accounts.run.bond_minimum_amount
-    {
-        return err!(ProgramError::BondBelowMinimum);
-    }
-
     let appellate_key = context.accounts.appellate.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
     let quorum = {
         let account = context.accounts.coordinator_account.load()?;
+
+        // A tie-breaker sits on a bonded bench for the same reason a verifier
+        // does, so it is held to the same bond: what is still standing once
+        // convictions are charged and requested withdrawals have left
+        // (wienerlabs/leviathan-net#34).
+        if context
+            .accounts
+            .appellate_participant
+            .committed_bond(coordinator_slashed_points(&account, &appellate_key))
+            < context.accounts.run.bond_minimum_amount
+        {
+            return err!(ProgramError::BondBelowMinimum);
+        }
+
         let coordinator = &account.state.coordinator;
 
         let appellate_index = coordinator

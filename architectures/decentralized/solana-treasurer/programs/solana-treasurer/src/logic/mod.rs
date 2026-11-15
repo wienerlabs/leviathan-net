@@ -1,9 +1,9 @@
-pub mod participant_authorize_join;
 pub mod participant_bond_deposit;
 pub mod participant_bond_finalize_withdraw;
 pub mod participant_bond_request_withdraw;
 pub mod participant_claim;
 pub mod participant_create;
+pub mod participant_join_run;
 pub mod run_bond_config_update;
 pub mod run_create;
 pub mod run_finalize_slash;
@@ -16,12 +16,12 @@ pub mod run_submit_appeal_verdict;
 pub mod run_submit_audit_verdict;
 pub mod run_update;
 
-pub use participant_authorize_join::*;
 pub use participant_bond_deposit::*;
 pub use participant_bond_finalize_withdraw::*;
 pub use participant_bond_request_withdraw::*;
 pub use participant_claim::*;
 pub use participant_create::*;
+pub use participant_join_run::*;
 pub use run_bond_config_update::*;
 pub use run_create::*;
 pub use run_finalize_slash::*;
