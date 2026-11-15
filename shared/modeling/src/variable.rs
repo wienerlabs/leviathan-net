@@ -123,7 +123,10 @@ impl Variable for (String, Tensor, Option<Shard>, Option<Arc<Communicator>>) {
     }
 
     fn zeros_like(&self, name: String) -> Box<dyn Variable> {
-        Box::new((name, self.1.empty_like(), self.2, self.3.clone()))
+        // Zeros, not `empty_like`: DisTrO's error feedback starts from this,
+        // and uninitialized memory carried whatever the allocator handed back
+        // into every node's results (wienerlabs/leviathan-net#55).
+        Box::new((name, self.1.zeros_like(), self.2, self.3.clone()))
     }
 
     fn set_grad(&self, tensor: Tensor) {
@@ -136,6 +139,33 @@ impl Variable for (String, Tensor, Option<Shard>, Option<Arc<Communicator>>) {
         let grad = self.1.grad();
         if grad.defined() {
             let _ = self.1.grad().zero_();
+        }
+    }
+}
+
+/// A variable's `zeros_like` is what DisTrO's error feedback starts from, so
+/// it has to be zero, whatever the allocator hands back
+/// (wienerlabs/leviathan-net#55).
+#[cfg(test)]
+mod zeros_like_tests {
+    use super::*;
+    use tch::{Device, Kind};
+
+    #[test]
+    fn zeros_like_is_zero_even_over_reused_memory() {
+        let shape = [64i64, 64];
+        let variable: (String, Tensor, Option<Shard>, Option<Arc<Communicator>>) = (
+            "w".to_string(),
+            Tensor::ones(shape, (Kind::Float, Device::Cpu)),
+            None,
+            None,
+        );
+        for _ in 0..64 {
+            // Memory the allocator is free to hand straight back.
+            drop(Tensor::full(shape, 7.0, (Kind::Float, Device::Cpu)));
+            let zeros = variable.zeros_like("w.delta".to_string()).logical_tensor();
+            let largest: f64 = zeros.abs().max().double_value(&[]);
+            assert_eq!(largest, 0.0, "zeros_like held values up to {largest}");
         }
     }
 }
