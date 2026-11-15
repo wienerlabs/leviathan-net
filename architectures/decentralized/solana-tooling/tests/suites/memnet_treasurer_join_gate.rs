@@ -44,6 +44,7 @@ use psyche_solana_treasurer::find_run;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
+use psyche_solana_treasurer::state::Participant;
 use psyche_solana_treasurer::ProgramError;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -567,14 +568,51 @@ impl Harness {
             .unwrap_or((0, 0))
     }
 
-    async fn bond(&mut self, node: usize) -> u64 {
+    async fn participant(&mut self, node: usize) -> Participant {
         let participant =
             find_participant(&self.run, &self.nodes[node].wallet.pubkey());
         get_participant(&mut self.endpoint, &participant)
             .await
             .unwrap()
             .unwrap()
-            .bond_amount
+    }
+
+    async fn bond(&mut self, node: usize) -> u64 {
+        self.participant(node).await.bond_amount
+    }
+
+    /// Another bond-gated run on the same chain, with coordinator accounts of
+    /// its own.
+    async fn add_other_run(
+        &mut self,
+        index: u64,
+        run_id: &str,
+    ) -> (Pubkey, Pubkey) {
+        let coordinator_account = self
+            .endpoint
+            .process_system_new_exempt(
+                &self.payer,
+                CoordinatorAccount::space_with_discriminator(),
+                &psyche_solana_coordinator::ID,
+            )
+            .await
+            .unwrap();
+        let (_, coordinator_instance) = process_treasurer_run_create(
+            &mut self.endpoint,
+            &self.payer,
+            &self.collateral_mint,
+            &coordinator_account,
+            RunCreateParams {
+                index,
+                run_id: run_id.to_string(),
+                main_authority: self.main_authority.pubkey(),
+                join_authority: find_run(index),
+                client_version: "latest".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        (coordinator_instance, coordinator_account)
     }
 
     async fn collateral(&mut self, node: usize) -> u64 {
@@ -897,4 +935,77 @@ pub async fn the_client_joins_an_outside_authority_run_directly() {
         run_account.as_ref()
     )
     .unwrap());
+}
+
+/// What the gates count after a conviction is what settlement leaves: the
+/// unforfeited bond read from chain state beforehand is exactly what
+/// `participant_bond_finalize_withdraw` then pays out of a full withdrawal.
+#[tokio::test]
+pub async fn settlement_pays_out_exactly_the_unforfeited_bond() {
+    let mut harness =
+        Harness::new(350, "Leviathan join gate settle", JoinGate::Bond).await;
+    for node in 0..NODES {
+        harness.join(node).await.unwrap();
+    }
+    harness.advance_to(RunState::RoundTrain).await;
+    harness.convict(SUBJECT).await;
+    harness.finish_epoch().await;
+
+    let (_, slashed) = harness.ledger(SUBJECT).await;
+    let predicted =
+        harness.participant(SUBJECT).await.unforfeited_bond(slashed);
+    assert_eq!(predicted, BOND - SLASHING_RATE);
+
+    let before = harness.collateral(SUBJECT).await;
+    harness.request_withdraw(SUBJECT, BOND).await;
+    harness
+        .endpoint
+        .forward_clock_unix_timestamp(WITHDRAW_DELAY as u64)
+        .await
+        .unwrap();
+    harness.finalize_withdraw(SUBJECT).await;
+    assert_eq!(harness.collateral(SUBJECT).await - before, predicted);
+    assert_eq!(harness.bond(SUBJECT).await, 0);
+}
+
+/// The bond is read from the run's own coordinator: a join that names another
+/// run's coordinator accounts is refused, whichever of the two it swaps.
+#[tokio::test]
+pub async fn a_join_against_another_runs_coordinator_is_refused() {
+    let mut harness =
+        Harness::new(351, "Leviathan join gate mismatch", JoinGate::Bond).await;
+    let (other_instance, other_account) = harness
+        .add_other_run(352, "Leviathan join gate other")
+        .await;
+    let wallet = harness.nodes[0].wallet.insecure_clone();
+    harness
+        .endpoint
+        .request_airdrop(&wallet.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    let swaps = [
+        (other_instance, harness.coordinator_account),
+        (harness.coordinator_instance, other_account),
+        (other_instance, other_account),
+    ];
+    for (coordinator_instance, coordinator_account) in swaps {
+        let instruction = treasurer_participant_join_run(
+            &harness.run,
+            &coordinator_instance,
+            &coordinator_account,
+            &wallet.pubkey(),
+            harness.nodes[0].identity(),
+        );
+        assert_eq!(
+            refusal_code(
+                harness
+                    .endpoint
+                    .process_instruction(&wallet, instruction)
+                    .await
+            ),
+            u32::from(AnchorErrorCode::ConstraintRaw),
+        );
+    }
+    assert_eq!(harness.authorization_active(0).await, None);
+    harness.join(0).await.unwrap();
 }

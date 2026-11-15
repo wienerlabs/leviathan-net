@@ -46,7 +46,16 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
+use anchor_lang::error::ErrorCode as AnchorErrorCode;
+use anchor_lang::InstructionData;
+use anchor_lang::ToAccountMetas;
+use psyche_solana_treasurer::accounts::RunOpenChallengeAccounts;
+use psyche_solana_treasurer::find_audit_verdict;
+use psyche_solana_treasurer::find_participant;
+use psyche_solana_treasurer::instruction::RunOpenChallenge;
+use psyche_solana_treasurer::logic::RunOpenChallengeParams;
 use psyche_solana_treasurer::ProgramError;
+use solana_sdk::instruction::Instruction;
 
 use super::refusal::refusal_code;
 use super::refusal::treasurer_refusal;
@@ -858,4 +867,65 @@ pub async fn a_target_with_a_pending_withdrawal_can_still_appeal() {
         .unwrap();
     let (tie_breaker, _) = h.tie_breakers[0];
     h.cast_appeal(tie_breaker, true).await.unwrap();
+}
+
+/// The challenger's slashed points are read from the run's own coordinator: a
+/// challenge that names another run's coordinator account is refused.
+#[tokio::test]
+pub async fn a_challenge_against_another_runs_coordinator_is_refused() {
+    let mut h = setup("Leviathan appeals foreign ledger", 96).await;
+    h.reach_verifier_quorum().await;
+
+    let other_account = h
+        .endpoint
+        .process_system_new_exempt(
+            &h.payer,
+            CoordinatorAccount::space_with_discriminator(),
+            &psyche_solana_coordinator::ID,
+        )
+        .await
+        .unwrap();
+    process_treasurer_run_create(
+        &mut h.endpoint,
+        &h.payer,
+        &h.collateral_mint,
+        &other_account,
+        RunCreateParams {
+            index: 97,
+            run_id: "Leviathan appeals other ledger".to_string(),
+            main_authority: Keypair::new().pubkey(),
+            join_authority: Keypair::new().pubkey(),
+            client_version: "latest".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let target = h.clients[h.target_client_idx].insecure_clone();
+    let instruction = Instruction {
+        program_id: psyche_solana_treasurer::ID,
+        accounts: RunOpenChallengeAccounts {
+            challenger: target.pubkey(),
+            challenger_participant: find_participant(&h.run, &target.pubkey()),
+            run: h.run,
+            coordinator_account: other_account,
+            audit_verdict: find_audit_verdict(&h.run, &target.pubkey()),
+        }
+        .to_account_metas(None),
+        data: RunOpenChallenge {
+            params: RunOpenChallengeParams {},
+        }
+        .data(),
+    };
+    assert_eq!(
+        refusal_code(
+            h.endpoint
+                .process_instruction_with_signers(&h.payer, instruction, &[&target])
+                .await
+        ),
+        u32::from(AnchorErrorCode::ConstraintRaw),
+    );
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
+        .await
+        .unwrap();
 }

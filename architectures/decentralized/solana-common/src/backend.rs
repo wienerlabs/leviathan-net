@@ -419,7 +419,7 @@ impl SolanaBackend {
     ///
     /// Such a run is its own join authority, and admits a node only through the
     /// treasurer's `participant_join_run`, which checks the committed bond on
-    /// every join and leaves the join authorization closed at rest. Joining it
+    /// every join and leaves the join authorization inactive at rest. Joining it
     /// with the coordinator's `join_run` directly is refused
     /// (wienerlabs/leviathan-net#34). Any other join authority, a wallet or a
     /// treasurer run gated by an outside key, is joined directly.

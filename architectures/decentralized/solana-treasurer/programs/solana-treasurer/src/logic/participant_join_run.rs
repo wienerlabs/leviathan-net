@@ -28,9 +28,17 @@ use crate::ProgramError;
 /// and the authorization then stayed active for good. A node could withdraw its
 /// whole bond and keep joining, and a convicted node re-joined on a bond its
 /// conviction had already forfeited (wienerlabs/leviathan-net#34). Here the
-/// authorization is opened only for the coordinator's `join_run` inside this
-/// instruction and closed again before it returns, so at rest it admits nobody
-/// and every epoch's join passes through this check.
+/// authorization is activated only for the coordinator's `join_run` inside this
+/// instruction and deactivated again before it returns. The account itself
+/// stays (its rent is paid once, on the first join), but at rest it is inactive
+/// and admits nobody, so every epoch's join passes through this check.
+///
+/// Only this instruction can sign as the run, so on a deployment that started
+/// on this program no join authorization of a bond-gated run is ever active
+/// outside it. A deployment whose treasurer still ran the removed
+/// `participant_authorize_join` holds authorizations that instruction left
+/// active, and nothing can deactivate them: such a deployment is redeployed,
+/// not upgraded in place.
 #[derive(Accounts)]
 #[instruction(params: ParticipantJoinRunParams)]
 pub struct ParticipantJoinRunAccounts<'info> {

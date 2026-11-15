@@ -154,25 +154,4 @@ mod tests {
         assert_eq!(p.unforfeited_bond(900), 0);
         assert_eq!(p.committed_bond(900), 0);
     }
-
-    /// The bond `participant_bond_finalize_withdraw` leaves behind once it has
-    /// settled every conviction is exactly what `unforfeited_bond` reports
-    /// beforehand, so the gates never count a unit settlement would take.
-    #[test]
-    fn settlement_forfeits_exactly_what_unforfeited_bond_predicts() {
-        for bond in [0u64, 1, 300, 500, 1_000] {
-            for settled in [0u64, 100, 200] {
-                for coordinator_slashed in [0u64, 100, 200, 450, 2_000] {
-                    let p = participant(bond, settled, 0);
-                    let unsettled = coordinator_slashed.saturating_sub(settled);
-                    let forfeited = unsettled.min(bond);
-                    assert_eq!(
-                        bond - forfeited,
-                        p.unforfeited_bond(coordinator_slashed),
-                        "bond {bond} settled {settled} slashed {coordinator_slashed}"
-                    );
-                }
-            }
-        }
-    }
 }
