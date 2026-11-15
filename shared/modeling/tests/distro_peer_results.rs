@@ -7,195 +7,11 @@
 //! the network serialization. The malformed payloads are what a trainer could
 //! commit and sign: its honest results, cut or rearranged.
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+mod common;
 
-use psyche_coordinator::model::{Checkpoint, Model};
-use psyche_coordinator::CoordinatorConfig;
-use psyche_core::OptimizerDefinition;
-use psyche_data_provider::download_model_repo_sync;
-use psyche_modeling::{
-    auto_model_for_causal_lm_from_pretrained, CausalLM, CompressDCT, Distro, DistroResult,
-    DistroResultMismatch, Trainer, TransformDCT,
-};
-use psyche_network::SerializedDistroResult;
+use common::*;
+use psyche_modeling::{CompressDCT, DistroResult, DistroResultMismatch, TransformDCT};
 use tch::{Device, Kind, Tensor};
-
-#[derive(serde::Deserialize)]
-struct RunConfig {
-    #[allow(dead_code)]
-    config: CoordinatorConfig,
-    model: Model,
-}
-
-/// The model and the DisTrO settings the genesis rehearsal runs with.
-struct Recipe {
-    repo_files: Vec<PathBuf>,
-    max_seq_len: usize,
-    compression_decay: f64,
-    compression_chunk: i64,
-    compression_topk: i64,
-    quantize_1bit: bool,
-    lr: f64,
-}
-
-fn genesis_recipe() -> Recipe {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../config/leviathan/genesis-rehearsal.toml"
-    );
-    let run: RunConfig = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let Model::LLM(llm) = run.model;
-    let Checkpoint::Hub(hub) = llm.checkpoint else {
-        panic!("the genesis rehearsal starts from a Hub checkpoint");
-    };
-    let OptimizerDefinition::Distro {
-        compression_decay,
-        compression_chunk,
-        compression_topk,
-        quantize_1bit,
-        ..
-    } = llm.optimizer
-    else {
-        panic!("the genesis rehearsal trains with DisTrO");
-    };
-    let repo_files = download_model_repo_sync(
-        &hub.repo_id.to_string(),
-        hub.revision.map(|revision| revision.to_string()),
-        None,
-        None,
-        false,
-    )
-    .expect("the genesis rehearsal model is downloadable");
-    Recipe {
-        repo_files,
-        max_seq_len: llm.max_seq_len as usize,
-        compression_decay: compression_decay as f64,
-        compression_chunk: compression_chunk as i64,
-        compression_topk: compression_topk as i64,
-        quantize_1bit,
-        lr: llm.lr_schedule.get_lr(llm.lr_schedule.get_warmup_steps()),
-    }
-}
-
-fn load(recipe: &Recipe) -> Box<dyn CausalLM> {
-    let model = auto_model_for_causal_lm_from_pretrained(
-        recipe.repo_files.clone(),
-        Some(Kind::Float),
-        None,
-        Some(Device::Cpu),
-        None,
-        Some(recipe.max_seq_len),
-    )
-    .unwrap();
-    model.prepare_for_training();
-    model
-}
-
-fn distro(recipe: &Recipe, model: &dyn CausalLM) -> Distro {
-    Distro::new(
-        model,
-        recipe.compression_decay,
-        recipe.compression_chunk,
-        recipe.compression_topk,
-        0.0,
-    )
-}
-
-/// What a peer broadcasts for one batch: a real step on `tokens`, as received.
-fn peer_results(recipe: &Recipe, tokens: &[i64]) -> Vec<DistroResult> {
-    peer_results_quantized(recipe, tokens, recipe.quantize_1bit)
-}
-
-fn peer_results_quantized(recipe: &Recipe, tokens: &[i64], quantize: bool) -> Vec<DistroResult> {
-    let model = load(recipe);
-    let mut distro = distro(recipe, &*model);
-    let input = Tensor::from_slice(tokens).reshape([1, tokens.len() as i64]);
-    let (_, loss) = model.forward(&input, Some(&input), None, None, None, None);
-    loss.expect("a forward pass with labels has a loss")
-        .backward();
-    let results = distro.generate(&*model, &[], 0.0, recipe.lr, false);
-    let results = match quantize {
-        true => Trainer::quantize_results(&results),
-        false => results,
-    };
-    results
-        .iter()
-        .map(|result| {
-            DistroResult::try_from(&SerializedDistroResult::try_from(result).unwrap()).unwrap()
-        })
-        .collect()
-}
-
-/// A batch of the model's own vocabulary, a different one per `seed`.
-fn batch(recipe: &Recipe, seed: i64) -> Vec<i64> {
-    let model = load(recipe);
-    let vocab = model
-        .variables()
-        .find(|variable| variable.name().ends_with("embed_tokens.weight"))
-        .expect("the model has a token embedding")
-        .full_tensor_shape()[0];
-    (0..recipe.max_seq_len as i64)
-        .map(|i| (i * 7 + seed) % vocab)
-        .collect()
-}
-
-/// A node as it stands when it applies a round's results: it has trained its
-/// own batch, so its gradients exist, and its optimizer starts from zero.
-/// Training leaves the parameters where they were loaded.
-fn trained_node(recipe: &Recipe) -> (Box<dyn CausalLM>, Distro) {
-    let model = load(recipe);
-    let tokens = batch(recipe, NODE_BATCH_SEED);
-    let input = Tensor::from_slice(&tokens).reshape([1, tokens.len() as i64]);
-    let (_, loss) = model.forward(&input, Some(&input), None, None, None, None);
-    loss.expect("a forward pass with labels has a loss")
-        .backward();
-    let distro = distro(recipe, &*model);
-    (model, distro)
-}
-
-/// The batch the applying node trains on itself, apart from its peers'.
-const NODE_BATCH_SEED: i64 = 5;
-
-/// The model's parameters after a trained node applies `peers`, or the panic
-/// `apply` raised.
-fn applied(recipe: &Recipe, peers: &[Vec<DistroResult>]) -> Result<Vec<Tensor>, String> {
-    let (model, mut distro) = trained_node(recipe);
-    catch_unwind(AssertUnwindSafe(|| distro.apply(&*model, peers, recipe.lr))).map_err(
-        |panic| {
-            panic
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default()
-        },
-    )?;
-    Ok(model
-        .variables()
-        .map(|variable| variable.logical_tensor().copy())
-        .collect())
-}
-
-fn fresh(recipe: &Recipe) -> Vec<Tensor> {
-    load(recipe)
-        .variables()
-        .map(|variable| variable.logical_tensor().copy())
-        .collect()
-}
-
-fn same(a: &[Tensor], b: &[Tensor]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.equal(b))
-}
-
-fn rebuilt(result: &DistroResult, sparse_idx: Tensor, sparse_val: Tensor) -> DistroResult {
-    DistroResult {
-        sparse_idx,
-        sparse_val,
-        xshape: result.xshape.clone(),
-        totalk: result.totalk,
-        stats: None,
-    }
-}
 
 /// One result short.
 fn fewer_results(honest: &[DistroResult]) -> Vec<DistroResult> {
@@ -360,4 +176,54 @@ fn the_expected_encoding_is_the_real_one() {
         };
         assert_eq!(totalk, flat_last, "{}", variable.name());
     }
+}
+
+/// The largest magnitude a value may have, read in fp32 for a variable of
+/// `xshape`, mirroring what the check derives from fp32's range.
+fn safe_bound(result: &DistroResult) -> f32 {
+    let numel: i64 = result.xshape.iter().product();
+    (f32::MAX / numel as f32).sqrt() / 2.0
+}
+
+/// A finite value can still overflow once `apply` sums it through the DCT
+/// decode or squares it under robust aggregation. A peer whose values reach
+/// past fp32's safe range for the variable is skipped; one at that range is
+/// applied and leaves every parameter finite.
+#[test]
+fn values_beyond_the_safe_range_are_skipped_and_values_within_it_stay_finite() {
+    let recipe = genesis_recipe();
+    let honest = peer_results_quantized(&recipe, &batch(&recipe, 3), false);
+    let target = &honest[0];
+    let bound = safe_bound(target);
+
+    let mut beyond = honest.clone();
+    beyond[0] = rebuilt(
+        target,
+        target.sparse_idx.copy(),
+        target.sparse_val.full_like(2.0 * bound as f64),
+    );
+    let mut at_bound = honest.clone();
+    at_bound[0] = rebuilt(
+        target,
+        target.sparse_idx.copy(),
+        target
+            .sparse_val
+            .to_kind(Kind::Float)
+            .full_like(bound as f64),
+    );
+
+    let (model, distro) = trained_node(&recipe);
+    assert!(matches!(
+        distro.check_results(&*model, &beyond),
+        Err(DistroResultMismatch::Values { .. })
+    ));
+    assert_eq!(distro.check_results(&*model, &at_bound), Ok(()));
+
+    let after = applied(&recipe, &[honest, at_bound]).unwrap();
+    assert!(
+        after
+            .iter()
+            .all(|parameter| bool::try_from(parameter.isfinite().all()).unwrap()),
+        "values at the safe bound left a parameter non-finite"
+    );
 }

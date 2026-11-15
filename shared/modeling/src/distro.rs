@@ -248,6 +248,16 @@ impl TransformDCT {
         }
     }
 
+    /// The encoded shape and `totalk` that honest results carry for
+    /// `variable`. `Distro::generate` encodes the full, gathered tensor, so
+    /// this is keyed on the full shape, which is the same on every rank of a
+    /// tensor-parallel group, never on a rank's local shard.
+    pub fn expected_encoding(&self, variable: &dyn Variable) -> Option<(Vec<i64>, i64)> {
+        let encoded = self.encoded_shape(&variable.full_tensor_shape())?;
+        let totalk = *flattened(&encoded).last()?;
+        Some((encoded, totalk))
+    }
+
     /// The shape `encode` gives a tensor of `shape`, or `None` if this
     /// transform has no chunk size for one of its dimensions, which is the
     /// case for a shape no variable of the model has.
@@ -723,7 +733,7 @@ impl Distro {
         }
         for (index, (var, result)) in vars.variables().zip(results).enumerate() {
             let name = var.name().to_string();
-            let Some(expected) = self.transform.encoded_shape(&var.logical_tensor().size()) else {
+            let Some((expected, totalk)) = self.transform.expected_encoding(var.as_ref()) else {
                 return Err(DistroResultMismatch::Unencodable { index, name });
             };
             if result.xshape != expected {
@@ -734,8 +744,6 @@ impl Distro {
                     got: result.xshape.clone(),
                 });
             }
-            let flat = flattened(&expected);
-            let totalk = *flat.last().expect("an encoding has at least one dimension");
             if result.totalk != totalk {
                 return Err(DistroResultMismatch::Totalk {
                     index,
@@ -744,6 +752,7 @@ impl Distro {
                     got: result.totalk,
                 });
             }
+            let flat = flattened(&expected);
             Self::check_sparse(&flat, totalk, result).map_err(|(on_indices, reason)| {
                 match on_indices {
                     true => DistroResultMismatch::Indices {
@@ -770,6 +779,7 @@ impl Distro {
         totalk: i64,
         result: &DistroResult,
     ) -> Result<(), (bool, String)> {
+        let numel: i64 = flat.iter().product();
         let (wire_kind, width) = index_encoding(totalk);
         let sparse_idx = &result.sparse_idx;
         let expected_kind = match wire_kind {
@@ -845,14 +855,27 @@ impl Distro {
         match values.kind() {
             Kind::Bool => Ok(()),
             Kind::Float | Kind::Double | Kind::Half | Kind::BFloat16 => {
-                let finite = values
-                    .f_isfinite()
-                    .and_then(|t| t.f_all())
-                    .and_then(|t| t.f_int64_value(&[]))
+                // Read in fp32 whatever the local model's dtype, so every node
+                // reaches the same verdict. A value is only usable if it stays
+                // finite through what `apply` does with it: the DCT decode
+                // and, under robust aggregation, sums of squares over the
+                // whole variable. Bounding each value by half the square root
+                // of fp32's range over the variable's size keeps both finite.
+                // Honest values are many orders of magnitude below it.
+                let bound = (f32::MAX / numel as f32).sqrt() / 2.0;
+                let largest = values
+                    .f_to_kind(Kind::Float)
+                    .and_then(|t| t.f_abs())
+                    .and_then(|t| t.f_max())
+                    .and_then(|t| t.f_double_value(&[]))
                     .map_err(|error| (false, format!("cannot be read: {error}")))?;
-                match finite {
-                    1 => Ok(()),
-                    _ => Err((false, "are not all finite".to_string())),
+                if largest.is_finite() && largest <= bound as f64 {
+                    Ok(())
+                } else {
+                    Err((
+                        false,
+                        format!("reach {largest:e}, beyond {bound:e} for a variable of {numel} elements"),
+                    ))
                 }
             }
             kind => Err((
@@ -1394,6 +1417,41 @@ mod tests {
             assert!(idx.equal(&roundtripped_idx));
         }
     }
+    /// `generate` encodes the full, gathered tensor, so on a tensor-parallel
+    /// rank a sharded variable's honest results carry the full encoding, not
+    /// its local shard's (wienerlabs/leviathan-net#41).
+    #[test]
+    fn a_sharded_variable_is_expected_in_its_full_encoding() {
+        let sharded = || -> Box<dyn Variable> {
+            Box::new((
+                "sharded".to_string(),
+                Tensor::zeros([64, 96], (Kind::Float, Device::Cpu)),
+                Some(tch::nn::Shard {
+                    dim: 0,
+                    rank: 0,
+                    world_size: 2,
+                }),
+                None::<std::sync::Arc<crate::Communicator>>,
+            ))
+        };
+        let variable = sharded();
+        assert_eq!(variable.full_tensor_shape(), vec![128, 96]);
+
+        let mut transform = TransformDCT::new(Box::new(vec![sharded()].into_iter()), 64);
+        let (expected, totalk) = transform.expected_encoding(variable.as_ref()).unwrap();
+        let full = Tensor::zeros([128, 96], (Kind::Float, Device::Cpu));
+        let encoded = transform.encode(&full);
+        assert_eq!(encoded.size(), expected);
+        let (_, _, xshape, compressed_totalk) = CompressDCT::compress(&encoded, 8);
+        assert_eq!(xshape, expected);
+        assert_eq!(compressed_totalk, totalk);
+        assert_ne!(
+            transform.encoded_shape(&variable.logical_tensor().size()),
+            Some(expected),
+            "the local shard's shape would expect a different encoding"
+        );
+    }
+
     #[test]
     fn test_1bit_matches_non_quant() {
         set_torch_rng_seed();
