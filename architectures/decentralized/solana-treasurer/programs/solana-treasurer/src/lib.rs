@@ -274,4 +274,10 @@ pub enum ProgramError {
 
     #[msg("This participant trains in an epoch that has not been charged yet; withdraw after it ends")]
     EpochNotSettled,
+
+    #[msg("Verdicts and appeals are cast while an epoch is still to be charged")]
+    VotingOutsideEpoch,
+
+    #[msg("A run with a challenge window must give its appeals a deadline")]
+    AppealWindowRequired,
 }

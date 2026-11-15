@@ -226,6 +226,7 @@ pub enum CoordinatorError {
     InvalidCommitteeSelection,
     InvalidCommitteeProof,
     InvalidSlash,
+    SlashOutsideEpoch,
 }
 
 pub enum TickResult {
@@ -378,6 +379,9 @@ impl std::fmt::Display for CoordinatorError {
             CoordinatorError::InvalidCommitteeSelection => write!(f, "Invalid committee selection"),
             CoordinatorError::InvalidCommitteeProof => write!(f, "Invalid committee proof"),
             CoordinatorError::InvalidSlash => write!(f, "Invalid slash"),
+            CoordinatorError::SlashOutsideEpoch => {
+                write!(f, "Slash outside an epoch that will be charged")
+            }
         }
     }
 }
@@ -669,12 +673,35 @@ impl Coordinator {
         }
     }
 
+    /// Whether the clients on this epoch's roster are still to be charged.
+    ///
+    /// Slashed points are charged when an epoch ends: the tick that leaves
+    /// `Cooldown` (or ends a warmup that never filled) charges every client the
+    /// epoch ejected. In these states that tick is still to come. In any other
+    /// the last epoch has been charged, even though its roster stays on the
+    /// account until the next epoch's warmup replaces it.
+    pub fn charges_pending(&self) -> bool {
+        matches!(
+            self.run_state,
+            RunState::Warmup | RunState::RoundTrain | RunState::RoundWitness | RunState::Cooldown
+        )
+    }
+
     /// Marks a client as ejected after a dispute has convicted it. Ejection is
     /// how a fraud verdict reaches the reward layer: an ejected client is moved
     /// into exited_clients at the epoch boundary, where the slashing rate is
     /// applied. Only a currently participating client can be ejected; anyone who
     /// already withdrew or was ejected is untouched.
+    ///
+    /// Only while the epoch is still to be charged. Between epochs the roster of
+    /// the epoch that just ended is still on the account, so an ejection there
+    /// found its client, succeeded, and was never charged: the next warmup
+    /// zeroes the roster, flag and all. A conviction that lands then was lost
+    /// in silence (wienerlabs/leviathan-net#36).
     pub fn eject(&mut self, index: u64) -> std::result::Result<(), CoordinatorError> {
+        if !self.charges_pending() {
+            return Err(CoordinatorError::SlashOutsideEpoch);
+        }
         let index = index as usize;
         if index < self.epoch_state.clients.len() {
             let client = &mut self.epoch_state.clients[index];

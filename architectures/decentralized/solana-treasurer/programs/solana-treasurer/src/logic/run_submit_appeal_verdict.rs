@@ -79,6 +79,15 @@ pub fn run_submit_appeal_verdict_processor(
     let quorum = {
         let account = context.accounts.coordinator_account.load()?;
 
+        // The bench is held to the same epoch as the verifiers. Between epochs
+        // an upheld appeal could not eject the target, while an overturn needs
+        // no ejection at all, so a bench allowed to sit then could only ever
+        // clear: the asymmetry would free the guilty
+        // (wienerlabs/leviathan-net#36).
+        if !account.state.coordinator.charges_pending() {
+            return err!(ProgramError::VotingOutsideEpoch);
+        }
+
         // A tie-breaker sits on a bonded bench for the same reason a verifier
         // does, so it is held to the same bond: what is still standing once
         // convictions are charged and requested withdrawals have left

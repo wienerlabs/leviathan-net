@@ -80,8 +80,12 @@ pub fn run_slash_losing_verifier_processor(
         match found {
             Some(idx) => {
                 let state = coordinator.epoch_state.clients[idx].state;
-                let slashable =
-                    state == ClientState::Healthy || state == ClientState::Dropped;
+                // Ejecting between epochs would land on the ended epoch's
+                // roster and never be charged (wienerlabs/leviathan-net#36),
+                // so a loser is only slashable while its epoch is still to be
+                // charged.
+                let slashable = coordinator.charges_pending()
+                    && (state == ClientState::Healthy || state == ClientState::Dropped);
                 (Some(idx as u64), slashable)
             }
             None => (None, false),

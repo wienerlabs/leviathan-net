@@ -101,6 +101,15 @@ pub fn run_submit_audit_verdict_processor(
     let (current_epoch, current_round, quorum) = {
         let account = context.accounts.coordinator_account.load()?;
 
+        // A conviction is only worth its slash if the slash is charged, and it
+        // is charged only at the end of an epoch the target trained in. Between
+        // epochs the quorum could not eject anyone the ledger would ever see,
+        // so votes are cast while an epoch is still to be charged
+        // (wienerlabs/leviathan-net#36).
+        if !account.state.coordinator.charges_pending() {
+            return err!(ProgramError::VotingOutsideEpoch);
+        }
+
         // A verdict that turns out wrong is paid for out of this bond, at the
         // epoch boundary after an overturn. So the bond that counts is the one
         // still standing then: not what a conviction already charged, and not a

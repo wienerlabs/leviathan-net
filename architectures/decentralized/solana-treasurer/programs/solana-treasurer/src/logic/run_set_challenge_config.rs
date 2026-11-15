@@ -34,6 +34,13 @@ pub fn run_set_challenge_config_processor(
     if params.challenge_window_seconds < 0 || params.appeal_window_seconds < 0 {
         return err!(ProgramError::InvalidParameter);
     }
+    // An appeal with no deadline holds the target's bond for as long as no
+    // bench resolves it, and once the target or the run is gone no bench ever
+    // can. With appeals on, the verdict the verifiers reached has to be able
+    // to finalise eventually (wienerlabs/leviathan-net#36).
+    if params.challenge_window_seconds > 0 && params.appeal_window_seconds == 0 {
+        return err!(ProgramError::AppealWindowRequired);
+    }
     let run = &mut context.accounts.run;
     run.challenge_window_seconds = params.challenge_window_seconds;
     run.tie_breaker_committee_size = params.tie_breaker_committee_size;

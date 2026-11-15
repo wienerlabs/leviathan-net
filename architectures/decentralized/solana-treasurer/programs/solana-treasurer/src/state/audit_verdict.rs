@@ -53,6 +53,18 @@ pub struct AuditVerdict {
 impl AuditVerdict {
     pub const SEEDS_PREFIX: &'static [u8] = b"AuditVerdict";
 
+    /// Who shares the bounty out of the target's forfeited bond: the
+    /// tie-breakers when an appeal upheld the conviction, otherwise the
+    /// verifiers whose quorum convicted it.
+    pub fn bounty_recipients(&self) -> &[Pubkey] {
+        if self.status == VerdictStatus::Upheld && !self.appeal_voters.is_empty()
+        {
+            &self.appeal_voters
+        } else {
+            &self.voters
+        }
+    }
+
     /// The verdict held by the account at a participant's verdict PDA, given
     /// that account's owner and data. An empty account, or one the treasurer
     /// does not own, is no verdict.

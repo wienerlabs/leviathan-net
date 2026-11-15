@@ -116,7 +116,7 @@ This fork carries the layer upstream left as dead code, wired to the reward engi
 
 | Component | State |
 |---|---|
-| Bonded participation (`solana-treasurer`) | `participant_bond_deposit`, `request_withdraw`, `finalize_withdraw` with a challenge window; settlement forfeits slashed collateral into the run vault, and a withdrawal is held while the participant trains in an epoch not yet charged or while its own conviction is pending, so a bond cannot leave before what it owes reaches it (#36) |
+| Bonded participation (`solana-treasurer`) | `participant_bond_deposit`, `request_withdraw`, `finalize_withdraw` with a challenge window; settlement forfeits slashed collateral into the run vault, and a withdrawal is held while the participant trains in an epoch not yet charged or while its own conviction is inside its challenge window or appeal; ejections only land in an epoch that will be charged, and a conviction that can no longer land is charged at the bond on withdrawal, so a bond cannot leave before what it owes reaches it (#36) |
 | Audit lottery (`shared/coordinator`) | `audit_selection` derives verifier-to-target assignments from the round seed, deterministic and replayable; audit pressure scales with `verification_percent` |
 | Dispute and slash (`solana-coordinator`) | `slash_client` convicts a client, ejection carries into `exited_clients` where the slashing rate applies; the `slashed` counter upstream never read now has a live producer |
 | Committee vote (`solana-treasurer`) | bonded verifiers submit verdicts; a two-thirds quorum fires the slash and the forfeited bond pays the voters (`slash_bounty_bps`) |
