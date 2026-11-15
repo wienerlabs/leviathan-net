@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::anyhow;
 use anyhow::Result;
 use psyche_modeling::CompressDCT;
+use psyche_modeling::Distro;
 use psyche_modeling::DistroResult;
 use psyche_network::commitment_record_path;
 use psyche_network::distro_results_from_reader;
@@ -19,6 +20,11 @@ use psyche_verifier::FraudProof;
 pub mod replay;
 
 pub use replay::build_replay_trainer;
+pub use replay::checkpoint_repo_files;
+pub use replay::cold_start_warmup_bounds;
+pub use replay::published_checkpoint;
+pub use replay::read_run_model;
+pub use replay::replay_data_layout;
 pub use replay::parse_assignment_key;
 pub use replay::ReplayAssignment;
 pub use replay::ReplayTrainerConfig;
@@ -217,11 +223,22 @@ pub fn write_dense_dump(path: &Path, dense: &[f32], rows: i64) -> Result<()> {
     Ok(())
 }
 
+/// The dense values a payload's results carry, in the DCT domain the replay is
+/// compared in. A 1-bit payload carries signs packed as booleans, read as the
+/// -1 and +1 that `Distro::apply` applies. Read as numbers they would come out
+/// as 1 for a negative value and 0 for a positive one
+/// (wienerlabs/leviathan-net#47).
 pub fn decompress_results(results: &[DistroResult], device: tch::Device) -> Result<Vec<f32>> {
     let mut dense: Vec<f32> = Vec::new();
     for result in results {
         let sparse_idx = result.sparse_idx.to_device(device);
         let sparse_val = result.sparse_val.to_device(device);
+        let sparse_val = match sparse_val.kind() {
+            tch::Kind::Bool => {
+                Distro::unpack_tensor_sign_from_boolean(sparse_val, tch::Kind::Float)
+            }
+            _ => sparse_val,
+        };
         let decompressed = CompressDCT::decompress(
             &sparse_idx,
             &sparse_val,

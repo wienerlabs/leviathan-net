@@ -7,17 +7,17 @@ use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
 use leviathan_verifier::build_replay_trainer;
+use leviathan_verifier::checkpoint_repo_files;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::published_checkpoint;
+use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
-use psyche_coordinator::model::HttpLLMTrainingDataLocation;
-use psyche_coordinator::model::LLMTrainingDataLocation;
+use psyche_coordinator::model::HubRepo;
 use psyche_coordinator::model::Model;
-use psyche_core::Shuffle;
-use psyche_core::TokenSize;
-use psyche_data_provider::download_model_repo_sync;
+use psyche_coordinator::model::LLM;
 use psyche_data_provider::LocalDataProvider;
 use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::BatchDataCPU;
@@ -51,31 +51,18 @@ struct Args {
     #[arg(long)]
     submitted_dir: PathBuf,
 
-    /// Honest dumps to audit against. Omit it and pass --replay-model to have
-    /// this verifier recompute the reference itself.
+    /// Honest dumps to audit against. Omit it and pass --replay-data-dir to
+    /// have this verifier recompute the reference itself.
     #[arg(long)]
     reference_dir: Option<PathBuf>,
 
-    #[arg(long)]
-    replay_model: Option<String>,
+    /// A local copy of the run's data shards. With it, this verifier replays
+    /// contributions itself, exactly as the run trains them: the checkpoint,
+    /// learning-rate schedule, optimizer, sequence length and data layout all
+    /// come from the run on chain, and so does the step a replay can
+    /// reproduce, the first of a cold-start epoch (wienerlabs/leviathan-net#47).
     #[arg(long)]
     replay_data_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 64)]
-    replay_sequence_length: usize,
-    #[arg(long, default_value_t = 4.0e-4)]
-    replay_lr: f64,
-    #[arg(long, default_value_t = 0.999)]
-    replay_compression_decay: f32,
-    #[arg(long, default_value_t = 8)]
-    replay_compression_topk: u16,
-    #[arg(long, default_value_t = 64)]
-    replay_compression_chunk: u16,
-    /// The step the replay can reproduce: the one trained from the published
-    /// checkpoint with fresh optimizer state, i.e. the first step of the run or
-    /// of an epoch that cold-started from the Hub. Required with
-    /// --replay-model; contributions from other steps are not judged.
-    #[arg(long)]
-    replay_step: Option<u32>,
     #[arg(long, default_value_t = DEFAULT_BAND)]
     band: f32,
     #[arg(long, default_value_t = 8)]
@@ -90,77 +77,76 @@ struct Args {
     verdict: bool,
 }
 
-/// The replay side of the daemon: one model, loaded once, and the run's data.
-/// Each pass gets an engine over the contributions on disk at that moment, so
-/// results that arrive while the daemon runs are judged as they land.
-struct Replayer {
+/// The run's published checkpoint, loaded with the run's own configuration,
+/// and the run's data.
+struct Loaded {
+    checkpoint: HubRepo,
+    /// Lent to each pass's engine and handed back after it.
     trainer: Option<Trainer>,
     provider: LocalDataProvider,
-    step: u32,
+    quantize_1bit: bool,
 }
 
-async fn run_shuffle(
-    endpoint: &mut ToolboxEndpoint,
-    coordinator_account: &Pubkey,
-) -> Result<Shuffle> {
-    let state = get_coordinator_account_state(endpoint, coordinator_account)
-        .await?
-        .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
-    let Model::LLM(llm) = state.coordinator.model;
-    match llm.data_location {
-        LLMTrainingDataLocation::Http(HttpLLMTrainingDataLocation { shuffle, .. }) => Ok(shuffle),
-        other => Err(anyhow!(
-            "the replay reads local shards in HttpDataProvider order and cannot reproduce the run's {other:?} data location"
-        )),
-    }
+/// The replay side of the daemon. Each pass gets an engine over the
+/// contributions on disk at that moment, so results that arrive while the
+/// daemon runs are judged as they land.
+struct Replayer {
+    data_dir: PathBuf,
+    loaded: Option<Loaded>,
 }
 
 impl Replayer {
-    fn new(args: &Args, shuffle: Shuffle) -> Result<Self> {
-        let model = args
-            .replay_model
-            .as_ref()
-            .ok_or_else(|| anyhow!("a replay model is required to recompute references"))?;
-        let data_dir = args
-            .replay_data_dir
-            .as_ref()
-            .ok_or_else(|| anyhow!("--replay-data-dir is required alongside --replay-model"))?;
-        let step = args
-            .replay_step
-            .ok_or_else(|| anyhow!("--replay-step is required alongside --replay-model"))?;
-
-        let repo_files = download_model_repo_sync(&model.to_string(), None, None, None, true)?;
-        let trainer = build_replay_trainer(&ReplayTrainerConfig {
-            repo_files,
-            sequence_length: args.replay_sequence_length,
-            micro_batch_size: 1,
-            learning_rate: args.replay_lr,
-            compression_decay: args.replay_compression_decay,
-            compression_topk: args.replay_compression_topk,
-            compression_chunk: args.replay_compression_chunk,
-            clip_grad_norm: Some(1.0),
-            quantize_1bit: false,
-            device: tch::Device::Cpu,
-            // What the daemon has always replayed in. The network trains in
-            // BFloat16 and that gap is the largest source of honest drift, but
-            // narrowing it is a decision for the calibration harness to inform
-            // rather than a side effect of making the dtype configurable: moving
-            // the verifier's dtype moves what counts as a forgery.
-            kind: tch::Kind::Float,
-        })?;
-
-        let provider = LocalDataProvider::new_from_directory(
+    fn new(data_dir: PathBuf) -> Self {
+        Self {
             data_dir,
-            TokenSize::TwoBytes,
-            args.replay_sequence_length,
-            shuffle,
-        )?;
+            loaded: None,
+        }
+    }
 
-        Ok(Self {
-            trainer: Some(trainer),
-            provider,
-            step,
-        })
+    /// The run as it stands, loaded again if it names another published
+    /// checkpoint, or if a failed replay consumed the trainer.
+    fn load(&mut self, llm: &LLM) -> Result<&mut Loaded> {
+        let checkpoint = published_checkpoint(llm)?;
+        let current = self.loaded.as_ref().is_some_and(|loaded| {
+            loaded.checkpoint == checkpoint && loaded.trainer.is_some()
+        });
+        if !current {
+            let config = ReplayTrainerConfig::for_run(
+                llm,
+                checkpoint_repo_files(&checkpoint)?,
+                tch::Device::Cpu,
+                // What the daemon has always replayed in. The network trains
+                // in BFloat16 and that gap is the largest source of honest
+                // drift, but narrowing it is a decision for the calibration
+                // harness to inform rather than a side effect of making the
+                // dtype configurable: moving the verifier's dtype moves what
+                // counts as a forgery.
+                tch::Kind::Float,
+            );
+            let trainer = build_replay_trainer(&config)?;
+            let (token_size, shuffle) = replay_data_layout(llm)?;
+            let provider = LocalDataProvider::new_from_directory(
+                &self.data_dir,
+                token_size,
+                config.sequence_length,
+                shuffle,
+            )?;
+            println!(
+                "[verifier-daemon] replay engine loaded {} with the run's {:?} data order, quantize_1bit={}",
+                checkpoint.repo_id,
+                shuffle,
+                config.quantize_1bit()
+            );
+            self.loaded = Some(Loaded {
+                checkpoint,
+                trainer: Some(trainer),
+                provider,
+                quantize_1bit: config.quantize_1bit(),
+            });
+        }
+        self.loaded
+            .as_mut()
+            .ok_or_else(|| anyhow!("the replay model did not load"))
     }
 
     async fn engine(
@@ -168,35 +154,45 @@ impl Replayer {
         args: &Args,
         endpoint: &mut ToolboxEndpoint,
         coordinator_account: &Pubkey,
-    ) -> Result<TrainerReplayEngine> {
+    ) -> Result<Option<TrainerReplayEngine>> {
         let state = get_coordinator_account_state(endpoint, coordinator_account)
             .await?
             .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
+        let coordinator = &state.coordinator;
+        // Only the run's first step is trained by every node from the
+        // published checkpoint with fresh state, so only its contributions can
+        // be reproduced here. Past the first epoch there is nothing to replay,
+        // and nothing worth loading (wienerlabs/leviathan-net#48).
+        let Some(replayable) = coordinator.replayable_step() else {
+            return Ok(None);
+        };
+        let Model::LLM(llm) = coordinator.model;
+        let loaded = self.load(&llm)?;
 
         let mut assignments = Vec::new();
         for (key, path) in index_dir(&args.submitted_dir)? {
             let Some((step, batch_id)) = parse_assignment_key(&key) else {
                 continue;
             };
-            if step != self.step {
+            if step != replayable {
                 continue;
             }
             let Some(committer) = parse_committer(&path) else {
                 continue;
             };
-            // The dump names carry the full base58 signer (finding 20), so the
-            // roster is matched on the same, never on the eight-character
-            // `Display` that made every real contribution unmatchable.
-            let Some(index) = state
-                .coordinator
-                .epoch_state
-                .clients
-                .iter()
-                .position(|client| bs58::encode(client.id.signer()).into_string() == committer)
+            // The dump names carry the full base58 signer (finding 20), so
+            // the roster is matched on the same, never on the
+            // eight-character `Display` that made every real contribution
+            // unmatchable.
+            let Some(index) =
+                coordinator.epoch_state.clients.iter().position(|client| {
+                    bs58::encode(client.id.signer()).into_string()
+                        == committer
+                })
             else {
                 continue;
             };
-            let data: Vec<BatchDataCPU> = self
+            let data: Vec<BatchDataCPU> = loaded
                 .provider
                 .get_samples(batch_id)
                 .await?
@@ -211,24 +207,30 @@ impl Replayer {
             assignments.push(ReplayAssignment {
                 target_index: index as u64,
                 step,
+                warmup_lr_between: coordinator
+                    .get_cold_start_warmup_bounds(),
                 batch_id,
                 data,
             });
         }
 
-        let trainer = self
-            .trainer
-            .take()
-            .ok_or_else(|| anyhow!("the replay model was lost in an earlier pass"))?;
-        Ok(TrainerReplayEngine::new(
+        let trainer = loaded.trainer.take().ok_or_else(|| {
+            anyhow!("the replay model was lost in an earlier pass")
+        })?;
+        Ok(Some(TrainerReplayEngine::new(
             trainer,
             assignments,
             tch::Device::Cpu,
-        ))
+            loaded.quantize_1bit,
+        )))
     }
 
+    /// Takes the trainer back after a pass. A replay that failed consumed it,
+    /// and the next pass then loads the checkpoint again.
     fn reclaim(&mut self, engine: TrainerReplayEngine) {
-        self.trainer = engine.into_trainer();
+        if let Some(loaded) = self.loaded.as_mut() {
+            loaded.trainer = engine.into_trainer();
+        }
     }
 }
 
@@ -270,7 +272,6 @@ async fn main() -> Result<()> {
         audit_assigned: args.audit_assigned,
         dry_run: args.dry_run,
         verdict_mode: args.verdict,
-        replay_step: args.replay_step,
     };
 
     println!(
@@ -296,24 +297,23 @@ async fn main() -> Result<()> {
         }
     );
 
-    let mut replayer = match args.replay_model {
-        Some(_) => {
-            let shuffle = run_shuffle(&mut endpoint, &coordinator_account).await?;
-            let replayer = Replayer::new(&args, shuffle)?;
-            println!(
-                "[verifier-daemon] replay engine loaded with the run's {:?} data order, judging step {} contributions",
-                shuffle, replayer.step
-            );
-            Some(replayer)
-        }
-        None => None,
-    };
+    let mut replayer = args.replay_data_dir.clone().map(Replayer::new);
 
     let mut judged: HashSet<String> = HashSet::new();
     loop {
         let engine = match replayer.as_mut() {
             Some(replayer) => match replayer.engine(&args, &mut endpoint, &coordinator_account).await {
-                Ok(engine) => Some(engine),
+                Ok(Some(engine)) => Some(engine),
+                Ok(None) => {
+                    println!(
+                        "[verifier-daemon] the run is past its first epoch, so no contribution can be replayed (wienerlabs/leviathan-net#48)"
+                    );
+                    if args.once {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;
+                    continue;
+                }
                 Err(err) => {
                     eprintln!("[verifier-daemon] cannot prepare this pass: {err:#}");
                     tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;

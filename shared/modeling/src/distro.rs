@@ -999,7 +999,9 @@ impl Distro {
         tensor
     }
 
-    fn unpack_tensor_sign_from_boolean(tensor: Tensor, unpack_kind: Kind) -> Tensor {
+    /// The -1 and +1 a 1-bit payload's packed signs stand for, as `apply`
+    /// reads them: a set bit is a negative value.
+    pub fn unpack_tensor_sign_from_boolean(tensor: Tensor, unpack_kind: Kind) -> Tensor {
         tensor.to_kind(unpack_kind) * -2 + 1
     }
 }

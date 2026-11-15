@@ -53,6 +53,18 @@ fn distro_optimizer() -> OptimizerDefinition {
     }
 }
 
+/// Whether this harness's optimizer sends 1-bit signs, as the engine has to
+/// know to compare a replay with what a node sends.
+fn quantize_1bit() -> bool {
+    matches!(
+        distro_optimizer(),
+        OptimizerDefinition::Distro {
+            quantize_1bit: true,
+            ..
+        }
+    )
+}
+
 fn write_dump(dir: &std::path::Path, key: &str, dense: &[f32]) {
     let rows = 6;
     let x = tch::Tensor::from_slice(dense)
@@ -138,10 +150,12 @@ fn engine_with_assignment(trainer: Trainer) -> TrainerReplayEngine {
         vec![ReplayAssignment {
             target_index: 0,
             step: STEP,
+            warmup_lr_between: None,
             batch_id: BatchId(ClosedInterval::new(0, 0)),
             data: sample_batch(),
         }],
         Device::Cpu,
+        quantize_1bit(),
     )
 }
 
@@ -273,10 +287,12 @@ async fn a_verifier_replays_the_exact_batch_its_target_pulled_from_the_dataset()
         vec![ReplayAssignment {
             target_index: 0,
             step: STEP,
+            warmup_lr_between: None,
             batch_id,
             data,
         }],
         Device::Cpu,
+        quantize_1bit(),
     );
     let summary =
         audit_with_replay(&dir, &engine, DEFAULT_BAND, Device::Cpu).expect("the audit must run");

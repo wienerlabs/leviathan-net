@@ -25,7 +25,10 @@ clap.workspace = true
 tch.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+serde.workspace = true
+toml.workspace = true
 psyche-core.workspace = true
+psyche-coordinator.workspace = true
 psyche-data-provider.workspace = true
 psyche-network.workspace = true
 psyche-modeling.workspace = true
@@ -33,3 +36,4 @@ psyche-verifier.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+bytemuck.workspace = true

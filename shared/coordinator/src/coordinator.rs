@@ -953,6 +953,20 @@ impl Coordinator {
         current_data_start_index * self.get_sequence_length() as u64
     }
 
+    /// The one step whose contributions a replay can reproduce from public
+    /// data: the run's first step. Every node trains it from the run's
+    /// configured checkpoint, with a trainer it has just built and so with
+    /// zeroed DisTrO error feedback (wienerlabs/leviathan-net#47).
+    ///
+    /// No later step qualifies, not even the first of an epoch flagged as a
+    /// cold start. A running node keeps its model and its optimizer through
+    /// cooldown, warmup and pauses rather than reloading the checkpoint, so its
+    /// result depends on the weights it carries and on the error feedback it
+    /// has accumulated privately (wienerlabs/leviathan-net#48).
+    pub fn replayable_step(&self) -> Option<u32> {
+        (self.progress.epoch == 0).then_some(self.epoch_state.start_step)
+    }
+
     pub fn get_cold_start_warmup_bounds(&self) -> Option<(u32, u32)> {
         let Model::LLM(llm) = &self.model;
         let cold_start_warmup_steps = llm.cold_start_warmup_steps;

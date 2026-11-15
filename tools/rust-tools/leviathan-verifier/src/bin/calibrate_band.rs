@@ -23,6 +23,10 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use leviathan_verifier::build_replay_trainer;
+use leviathan_verifier::checkpoint_repo_files;
+use leviathan_verifier::published_checkpoint;
+use leviathan_verifier::read_run_model;
+use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::write_token_dataset;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
@@ -31,7 +35,7 @@ use psyche_core::BatchId;
 use psyche_core::ClosedInterval;
 use psyche_core::Shuffle;
 use psyche_core::TokenSize;
-use psyche_data_provider::download_model_repo_sync;
+use psyche_coordinator::model::LLM;
 use psyche_data_provider::LocalDataProvider;
 use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::BatchDataCPU;
@@ -47,8 +51,12 @@ use psyche_verifier::DEFAULT_SAFETY_FACTOR;
     about = "Measure honest replay drift across device/precision classes and calibrate the tolerance band (issue #7)"
 )]
 struct Args {
+    /// The run configuration whose payloads are calibrated for
+    /// (`config/leviathan/*.toml`). Its checkpoint, learning-rate schedule,
+    /// optimizer and sequence length are what a node trains with and what the
+    /// verifier replays with, 1-bit quantization included.
     #[arg(long)]
-    model: String,
+    run_config: PathBuf,
     /// A tokenized dataset directory. If omitted, a deterministic one is built.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -65,19 +73,9 @@ struct Args {
     target_device: String,
     #[arg(long, default_value = "bf16")]
     target_dtype: String,
-    #[arg(long, default_value_t = 64)]
-    sequence_length: usize,
     /// Vocabulary of the built-in dataset; keep it within the model's embedding table.
     #[arg(long, default_value_t = 30)]
     vocab_size: u16,
-    #[arg(long, default_value_t = 4.0e-4)]
-    lr: f64,
-    #[arg(long, default_value_t = 0.999)]
-    compression_decay: f32,
-    #[arg(long, default_value_t = 8)]
-    compression_topk: u16,
-    #[arg(long, default_value_t = 64)]
-    compression_chunk: u16,
     #[arg(long, default_value_t = DEFAULT_SAFETY_FACTOR)]
     safety_factor: f32,
     /// A label for the target hardware class, echoed into the report (e.g. "rtx3090").
@@ -128,31 +126,24 @@ fn compute_delta(
     step: u32,
     batch_id: BatchId,
     data: Vec<BatchDataCPU>,
-    args: &Args,
+    llm: &LLM,
 ) -> Result<Vec<f32>> {
-    let trainer = build_replay_trainer(&ReplayTrainerConfig {
-        repo_files: repo_files.to_vec(),
-        sequence_length: args.sequence_length,
-        micro_batch_size: 1,
-        learning_rate: args.lr,
-        compression_decay: args.compression_decay,
-        compression_topk: args.compression_topk,
-        compression_chunk: args.compression_chunk,
-        clip_grad_norm: Some(1.0),
-        quantize_1bit: false,
-        device,
-        kind,
-    })
-    .with_context(|| format!("building trainer on {} {kind:?}", device_label(device)))?;
+    let config = ReplayTrainerConfig::for_run(llm, repo_files.to_vec(), device, kind);
+    let trainer = build_replay_trainer(&config)
+        .with_context(|| format!("building trainer on {} {kind:?}", device_label(device)))?;
     let engine = TrainerReplayEngine::new(
         trainer,
         vec![ReplayAssignment {
             target_index: 0,
             step,
+            // Each sample is a fresh trainer's first step, as in a run started
+            // directly, whose first epoch has no cold-start warmup bounds.
+            warmup_lr_between: None,
             batch_id,
             data,
         }],
         device,
+        config.quantize_1bit(),
     );
     engine
         .replay(0)
@@ -177,8 +168,9 @@ async fn main() -> Result<()> {
         args.samples,
     );
 
-    let repo_files = download_model_repo_sync(&args.model, None, None, None, true)
-        .context("downloading the model repo")?;
+    let llm = read_run_model(&args.run_config)?;
+    let repo_files = checkpoint_repo_files(&published_checkpoint(&llm)?)?;
+    let sequence_length = llm.max_seq_len as usize;
 
     // Dataset: use the given one, or build a deterministic corpus with enough
     // sequences for `samples` distinct one-step batches.
@@ -191,7 +183,7 @@ async fn main() -> Result<()> {
             write_token_dataset(
                 &tmp.join("nano.ds"),
                 args.vocab_size,
-                args.sequence_length,
+                sequence_length,
                 args.samples + 8,
                 1234,
             )?;
@@ -199,13 +191,15 @@ async fn main() -> Result<()> {
         }
     };
 
+    // A given dataset is read as the run lays its data out; the built-in one
+    // is written as two-byte tokens in order.
+    let (token_size, shuffle) = match &args.data_dir {
+        Some(_) => replay_data_layout(&llm)?,
+        None => (TokenSize::TwoBytes, Shuffle::DontShuffle),
+    };
     // Load one distinct batch per sample up front (async), then compute deltas.
-    let mut provider = LocalDataProvider::new_from_directory(
-        &data_dir,
-        TokenSize::TwoBytes,
-        args.sequence_length,
-        Shuffle::DontShuffle,
-    )?;
+    let mut provider =
+        LocalDataProvider::new_from_directory(&data_dir, token_size, sequence_length, shuffle)?;
     let mut batches = Vec::with_capacity(args.samples);
     for i in 0..args.samples {
         let batch_id = BatchId(ClosedInterval::new(i as u64, i as u64));
@@ -233,7 +227,7 @@ async fn main() -> Result<()> {
             step,
             batch_id,
             data.clone(),
-            &args,
+            &llm,
         )?;
         let target = compute_delta(
             &repo_files,
@@ -242,7 +236,7 @@ async fn main() -> Result<()> {
             step,
             batch_id,
             data,
-            &args,
+            &llm,
         )?;
         let drift = relative_l2_distance(&target, &reference)
             .map_err(|e| anyhow!("distance on sample {i}: {e:?}"))?;
@@ -260,7 +254,8 @@ async fn main() -> Result<()> {
 
     println!();
     println!("class               {}", args.class);
-    println!("model               {}", args.model);
+    println!("checkpoint          {}", llm.checkpoint);
+    println!("run config          {}", args.run_config.display());
     println!(
         "reference           {} {}",
         device_label(reference_device),
@@ -303,7 +298,7 @@ async fn main() -> Result<()> {
              \"samples\":[{}],\"drift_min\":{},\"drift_mean\":{},\"drift_max\":{},\
              \"safety_factor\":{},\"band\":{}}}\n",
             args.class,
-            args.model,
+            llm.checkpoint,
             device_label(reference_device),
             args.reference_dtype,
             device_label(target_device),

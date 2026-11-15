@@ -36,7 +36,7 @@ check on CPU:
 ```
 cargo build -p leviathan-verifier --bin calibrate-band
 ./target/debug/calibrate-band \
-  --model pefontana/Nano-Llama --samples 8 \
+  --run-config config/leviathan/genesis-rehearsal.toml --samples 8 \
   --reference-device cpu --reference-dtype fp32 \
   --target-device cpu --target-dtype bf16 \
   --class local-cpu-bf16
@@ -76,7 +76,7 @@ Paste into the Nosana dashboard, one market at a time:
         "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
         "SAMPLES": "32"
       },
-      "cmd": ["bash", "-c", "set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update -qq\napt-get install -y -qq --no-install-recommends git curl ca-certificates build-essential pkg-config libssl-dev python3 python3-pip\ncurl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable\n. \"$HOME/.cargo/env\"\npip3 install --quiet torch==2.9.1\nexport LIBTORCH_USE_PYTORCH=1\nTORCH_LIB=$(python3 -c \"import torch,os;print(os.path.join(os.path.dirname(torch.__file__),'lib'))\")\nexport LD_LIBRARY_PATH=\"$TORCH_LIB:${LD_LIBRARY_PATH:-}\"\ngit clone --depth 1 https://github.com/wienerlabs/leviathan-net /opt/leviathan-net\ncd /opt/leviathan-net\ncargo build --release -p leviathan-verifier --bin calibrate-band\nHW=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr ' ' '-')\necho \"[calibrate] hardware class: $HW\"\n./target/release/calibrate-band --model pefontana/Nano-Llama --samples \"${SAMPLES:-32}\" --reference-device cpu --reference-dtype fp32 --target-device cuda --target-dtype bf16 --class \"$HW\" --json-out /tmp/band.json\necho '=== RESULT JSON ==='\ncat /tmp/band.json\n"]
+      "cmd": ["bash", "-c", "set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update -qq\napt-get install -y -qq --no-install-recommends git curl ca-certificates build-essential pkg-config libssl-dev python3 python3-pip\ncurl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable\n. \"$HOME/.cargo/env\"\npip3 install --quiet torch==2.9.1\nexport LIBTORCH_USE_PYTORCH=1\nTORCH_LIB=$(python3 -c \"import torch,os;print(os.path.join(os.path.dirname(torch.__file__),'lib'))\")\nexport LD_LIBRARY_PATH=\"$TORCH_LIB:${LD_LIBRARY_PATH:-}\"\ngit clone --depth 1 https://github.com/wienerlabs/leviathan-net /opt/leviathan-net\ncd /opt/leviathan-net\ncargo build --release -p leviathan-verifier --bin calibrate-band\nHW=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr ' ' '-')\necho \"[calibrate] hardware class: $HW\"\n./target/release/calibrate-band --run-config config/leviathan/genesis-rehearsal.toml --samples \"${SAMPLES:-32}\" --reference-device cpu --reference-dtype fp32 --target-device cuda --target-dtype bf16 --class \"$HW\" --json-out /tmp/band.json\necho '=== RESULT JSON ==='\ncat /tmp/band.json\n"]
     }
   }]
 }
@@ -114,7 +114,28 @@ is not so wide that it hands a cheater room. The 3060 class is the swarm's most
 common and cheapest-to-rent hardware (see `docs/NOSANA.md`), so this covers the
 dominant case; 24 GB classes (3090/4090) are worth adding before mainnet.
 
-Reference config for all rows: `cpu / fp32`. If the verifier policy changes to
+The 3060 Ti row was measured before `calibrate-band` read the run's
+configuration (wienerlabs/leviathan-net#47). It replayed unquantized values at
+a constant learning rate, while every Leviathan configuration sends 1-bit signs
+under a Cosine warmup. Drift over 1-bit signs is a different quantity: an
+honest node and the verifier disagree only where a value near zero lands on
+the other side of it, or a borderline index enters or leaves the top-k. Every
+class has to be measured again with `--run-config` before its band is trusted.
+
+A first measurement under the genesis rehearsal shows why. It was taken on a
+CPU, comparing fp32 with bf16 (`--samples 8`). Seven of eight samples drifted
+by exactly 0, and one by 0.2209, where a few borderline indices left the top-k.
+The calibrated band came out at 1.104, against the 0.05 default. Over 1-bit
+signs, honest drift is not small and smooth. It is zero until an index changes,
+and then it jumps. A band wide enough to cover that jump also lets a node turn
+over a share of its signs, about (band/2)² of them, without being caught. The
+band and the distance used for 1-bit payloads need their own design
+(wienerlabs/leviathan-net#49), and until then the daemon runs in `--dry-run`
+against nodes that train in another dtype than it replays in.
+
+Reference config for all rows: `cpu / fp32`, micro batch 1. A node's micro batch
+size and whether it accumulates gradients in fp32 are its own settings, not
+the run's, so they add to the honest drift the band has to cover as well. If the verifier policy changes to
 replay on a GPU instead, re-run with `--reference-device cuda` and record that
 here — the reference is a policy choice and the band is only meaningful relative
 to it.

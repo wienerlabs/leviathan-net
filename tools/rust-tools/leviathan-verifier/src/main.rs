@@ -6,15 +6,18 @@ use clap::Parser;
 use leviathan_verifier::audit_dirs;
 use leviathan_verifier::audit_with_replay;
 use leviathan_verifier::build_replay_trainer;
+use leviathan_verifier::checkpoint_repo_files;
+use leviathan_verifier::cold_start_warmup_bounds;
+use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::read_run_model;
+use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ContributionOutcome;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
-use psyche_core::Shuffle;
-use psyche_core::TokenSize;
-use psyche_data_provider::download_model_repo_sync;
+use psyche_coordinator::CoordinatorProgress;
 use psyche_data_provider::LocalDataProvider;
 use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::BatchDataCPU;
@@ -30,25 +33,31 @@ struct Args {
     submitted: PathBuf,
 
     /// A directory of honest dumps to compare against. Omit it and pass
-    /// --replay-model instead to have this verifier recompute the reference
+    /// --run-config instead to have this verifier recompute the reference
     /// itself rather than trusting someone else's dumps.
     #[arg(long)]
     reference: Option<PathBuf>,
 
+    /// The run configuration the dumps were trained under
+    /// (`config/leviathan/*.toml`). The replay trains exactly as it says:
+    /// checkpoint, learning-rate schedule, optimizer, sequence length and
+    /// data layout.
     #[arg(long)]
-    replay_model: Option<String>,
+    run_config: Option<PathBuf>,
+    /// A local copy of the run's data shards.
     #[arg(long)]
     replay_data_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 64)]
-    replay_sequence_length: usize,
-    #[arg(long, default_value_t = 4.0e-4)]
-    replay_lr: f64,
-    #[arg(long, default_value_t = 0.999)]
-    replay_compression_decay: f32,
-    #[arg(long, default_value_t = 8)]
-    replay_compression_topk: u16,
-    #[arg(long, default_value_t = 64)]
-    replay_compression_chunk: u16,
+    /// The run's first step, as the coordinator reports it
+    /// (`Coordinator::replayable_step`): a run's first step unless it says
+    /// otherwise. It is the only step a replay can reproduce. Dumps from any
+    /// other step are left alone.
+    #[arg(long)]
+    first_step: Option<u32>,
+    /// Whether the run's first epoch was flagged a cold start, which is when
+    /// it trains within the run's cold-start warmup bounds. A run that was
+    /// paused before its first epoch is; one started directly is not.
+    #[arg(long, default_value_t = false)]
+    cold_start_epoch: bool,
 
     #[arg(long, default_value_t = DEFAULT_BAND)]
     band: f32,
@@ -75,32 +84,29 @@ async fn main() -> Result<()> {
         tch::Device::Cpu
     };
 
-    let summary = match (&args.reference, &args.replay_model) {
+    let summary = match (&args.reference, &args.run_config) {
         (Some(reference), None) => audit_dirs(&args.submitted, reference, args.band, device)?,
-        (None, Some(model)) => {
+        (None, Some(run_config)) => {
             let data_dir = args.replay_data_dir.as_ref().ok_or_else(|| {
                 anyhow!("--replay-data-dir is required to recompute a reference")
             })?;
-            let repo_files = download_model_repo_sync(&model.to_string(), None, None, None, true)?;
-            let trainer = build_replay_trainer(&ReplayTrainerConfig {
-                repo_files,
-                sequence_length: args.replay_sequence_length,
-                micro_batch_size: 1,
-                learning_rate: args.replay_lr,
-                compression_decay: args.replay_compression_decay,
-                compression_topk: args.replay_compression_topk,
-                compression_chunk: args.replay_compression_chunk,
-                clip_grad_norm: Some(1.0),
-                quantize_1bit: false,
+            let first_step = args
+                .first_step
+                .unwrap_or(CoordinatorProgress::default().step);
+            let llm = read_run_model(run_config)?;
+            let config = ReplayTrainerConfig::for_run(
+                &llm,
+                checkpoint_repo_files(&published_checkpoint(&llm)?)?,
                 device,
-                kind: tch::Kind::Float,
-            })?;
-
+                tch::Kind::Float,
+            );
+            let trainer = build_replay_trainer(&config)?;
+            let (token_size, shuffle) = replay_data_layout(&llm)?;
             let mut provider = LocalDataProvider::new_from_directory(
                 data_dir,
-                TokenSize::TwoBytes,
-                args.replay_sequence_length,
-                Shuffle::DontShuffle,
+                token_size,
+                config.sequence_length,
+                shuffle,
             )?;
 
             let mut assignments = Vec::new();
@@ -109,6 +115,12 @@ async fn main() -> Result<()> {
                     println!("skip  {key}: cannot read a step and batch out of this dump name");
                     continue;
                 };
+                if step != first_step {
+                    println!(
+                        "skip  {key}: only the run's first step, {first_step}, can be replayed"
+                    );
+                    continue;
+                }
                 let data: Vec<BatchDataCPU> = provider
                     .get_samples(batch_id)
                     .await?
@@ -123,22 +135,27 @@ async fn main() -> Result<()> {
                 assignments.push(ReplayAssignment {
                     target_index: target_index as u64,
                     step,
+                    warmup_lr_between: args
+                        .cold_start_epoch
+                        .then(|| cold_start_warmup_bounds(&llm, first_step))
+                        .flatten(),
                     batch_id,
                     data,
                 });
             }
 
-            let engine = TrainerReplayEngine::new(trainer, assignments, device);
+            let engine =
+                TrainerReplayEngine::new(trainer, assignments, device, config.quantize_1bit());
             audit_with_replay(&args.submitted, &engine, args.band, device)?
         }
         (Some(_), Some(_)) => {
             return Err(anyhow!(
-                "pass either --reference or --replay-model, not both: they are two different sources of truth"
+                "pass either --reference or --run-config, not both: they are two different sources of truth"
             ));
         }
         (None, None) => {
             return Err(anyhow!(
-                "pass --reference <dir> to compare against honest dumps, or --replay-model <repo> to recompute the reference here"
+                "pass --reference <dir> to compare against honest dumps, or --run-config <toml> to recompute the reference here"
             ));
         }
     };

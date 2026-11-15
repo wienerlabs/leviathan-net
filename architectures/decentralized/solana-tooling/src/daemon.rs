@@ -38,11 +38,6 @@ pub struct AuditConfig {
     pub audit_assigned: bool,
     pub dry_run: bool,
     pub verdict_mode: bool,
-    /// With a replay engine, the one step whose contributions it can reproduce:
-    /// the step trained from the published checkpoint with fresh optimizer
-    /// state. Contributions from any other step are left alone, because judging
-    /// them against that model would convict honest nodes.
-    pub replay_step: Option<u32>,
 }
 
 pub fn hex8(bytes: &[u8; 32]) -> String {
@@ -226,10 +221,12 @@ pub async fn audit_pass(
                 decompress_dump(reference_path, device)?
             }
             (None, Some(engine)) => {
-                if let Some(step) = config.replay_step {
-                    if record.step != step {
-                        continue;
-                    }
+                // A replay reproduces only the first step of a cold-start
+                // epoch, trained from zeroed error feedback, and the run says
+                // which step that is. Judging any other step against it would
+                // convict honest nodes (wienerlabs/leviathan-net#47, #48).
+                if coordinator.replayable_step() != Some(record.step) {
+                    continue;
                 }
                 match engine.replay(index as u64) {
                     Ok(delta) => delta,

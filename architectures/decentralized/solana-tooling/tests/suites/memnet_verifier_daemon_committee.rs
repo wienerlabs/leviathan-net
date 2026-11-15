@@ -346,7 +346,6 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: true,
-        replay_step: None,
     };
 
     for verifier in verifiers.iter().take((quorum - 1) as usize) {

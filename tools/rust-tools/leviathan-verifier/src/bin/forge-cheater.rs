@@ -26,7 +26,12 @@ fn main() -> Result<()> {
     let mut tampered: Vec<SerializedDistroResult> = Vec::new();
     for serialized in distro_results_from_reader(Cursor::new(bytes)) {
         let mut result: DistroResult = (&serialized?).try_into()?;
-        result.sparse_val = result.sparse_val * -5.0;
+        // Sent in the payload's own encoding, as a cheater would: 1-bit signs
+        // turned over, or values flipped and scaled.
+        result.sparse_val = match result.sparse_val.kind() {
+            tch::Kind::Bool => result.sparse_val.logical_not(),
+            _ => result.sparse_val * -5.0,
+        };
         tampered.push((&result).try_into()?);
     }
     let out_bytes = distro_results_to_bytes(&tampered)?;

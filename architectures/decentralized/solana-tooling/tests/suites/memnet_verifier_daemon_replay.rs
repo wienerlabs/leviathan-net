@@ -2,31 +2,26 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use psyche_coordinator::model::Checkpoint;
-use psyche_coordinator::model::HubRepo;
-use psyche_coordinator::model::LLMArchitecture;
-use psyche_coordinator::model::LLMTrainingDataLocation;
-use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_coordinator::model::LLM;
 use psyche_coordinator::CommitteeSelection;
+use psyche_coordinator::Coordinator;
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::SOLANA_MAX_NUM_WITNESSES;
 use psyche_coordinator::WAITING_FOR_MEMBERS_EXTRA_SECONDS;
 use leviathan_verifier::build_replay_trainer;
-use leviathan_verifier::decompress_results;
-use leviathan_verifier::write_dense_dump;
+use leviathan_verifier::checkpoint_repo_files;
+use leviathan_verifier::published_checkpoint;
+use leviathan_verifier::read_run_model;
+use leviathan_verifier::write_results_dump;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_core::BatchId;
-use psyche_core::ConstantLR;
-use psyche_core::LearningRateSchedule;
-use psyche_core::OptimizerDefinition;
-use psyche_data_provider::download_model_repo_sync;
 use psyche_modeling::Batch;
 use psyche_modeling::BatchData;
 use psyche_modeling::BatchDataCPU;
+use psyche_modeling::DistroResult;
 use psyche_modeling::Trainer;
 use tokio_util::sync::CancellationToken;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
@@ -69,11 +64,20 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-const NANO_MODEL: &str = "pefontana/Nano-Llama";
-const NANO_SEQUENCE_LENGTH: usize = 64;
+/// The model of the genesis rehearsal, which this run trains: a 1-bit DisTrO
+/// payload under a Cosine warmup, as every Leviathan configuration has.
+fn genesis_model() -> LLM {
+    read_run_model(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../config/leviathan/genesis-rehearsal.toml"
+    )))
+    .expect("the genesis rehearsal config is readable")
+}
 
-fn nano_batch() -> Vec<BatchDataCPU> {
-    let input_ids: Vec<i32> = (0..NANO_SEQUENCE_LENGTH as i32).map(|i| i % 29).collect();
+/// The samples of a batch, as the suite's dataset holds them.
+fn batch_data(llm: &LLM) -> Vec<BatchDataCPU> {
+    let input_ids: Vec<i32> =
+        (0..llm.max_seq_len as i32).map(|i| i % 29).collect();
     vec![BatchDataCPU {
         input_ids,
         labels: None,
@@ -82,52 +86,63 @@ fn nano_batch() -> Vec<BatchDataCPU> {
     }]
 }
 
-fn nano_trainer() -> Trainer {
-    let repo_files = download_model_repo_sync(&NANO_MODEL.to_string(), None, None, None, true)
-        .expect("the nano model must be in the local hub cache");
-    build_replay_trainer(&ReplayTrainerConfig {
-        repo_files,
-        sequence_length: NANO_SEQUENCE_LENGTH,
-        micro_batch_size: 1,
-        learning_rate: 4.0e-4,
-        compression_decay: 0.999,
-        compression_topk: 8,
-        compression_chunk: 64,
-        clip_grad_norm: Some(1.0),
-        quantize_1bit: false,
-        device: tch::Device::Cpu,
-        // Matches the daemon, so this suite keeps checking what the daemon
-        // actually does rather than a dtype only the test uses.
-        kind: tch::Kind::Float,
-    })
-    .expect("the replay trainer must build")
+/// A trainer built from the run's model, as the client and the daemon build
+/// one.
+fn trainer_for(llm: &LLM) -> (Trainer, ReplayTrainerConfig) {
+    let config = ReplayTrainerConfig::for_run(
+        llm,
+        checkpoint_repo_files(&published_checkpoint(llm).unwrap()).unwrap(),
+        tch::Device::Cpu,
+        // What the daemon replays in.
+        tch::Kind::Float,
+    );
+    (build_replay_trainer(&config).unwrap(), config)
 }
 
-fn nano_train_once(
-    trainer: Trainer,
+/// What a node sends for `batch_id` at the run's first step: trained from a
+/// fresh trainer under the run's model, within the warmup bounds the
+/// coordinator gives, and quantized as the run says.
+fn first_step_payload(
+    llm: &LLM,
+    coordinator: &Coordinator,
     step: u32,
     batch_id: BatchId,
-) -> (Trainer, Vec<f32>) {
+) -> Vec<DistroResult> {
+    let (trainer, config) = trainer_for(llm);
+    let warmup = coordinator.get_cold_start_warmup_bounds();
     let output = trainer
         .train(
             step,
             Batch {
                 id: batch_id,
-                data: BatchData::CPU(nano_batch()),
+                data: BatchData::CPU(batch_data(llm)),
             },
-            None,
-            true,
+            warmup,
+            warmup.is_some(),
             vec![],
             Some(vec![]),
             CancellationToken::new(),
         )
-        .expect("the nano model must train a batch");
-    let results = output
-        .distro_results
-        .clone()
-        .expect("a DisTrO run must produce results");
-    let dense = decompress_results(&results, tch::Device::Cpu).expect("results must decompress");
-    (output.trainer, dense)
+        .expect("the run's model trains a batch");
+    let results = output.distro_results.expect("the run trains with DisTrO");
+    match config.quantize_1bit() {
+        true => Trainer::quantize_results(&results),
+        false => results,
+    }
+}
+
+/// The same payload with every value's sign turned over.
+fn flipped(payload: &[DistroResult]) -> Vec<DistroResult> {
+    payload
+        .iter()
+        .map(|result| DistroResult {
+            sparse_val: match result.sparse_val.kind() {
+                tch::Kind::Bool => result.sparse_val.logical_not(),
+                _ => result.sparse_val.neg(),
+            },
+            ..result.clone()
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -261,23 +276,7 @@ pub async fn run() {
                 total_steps: 100,
                 waiting_for_members_extra_time: WAITING_FOR_MEMBERS_EXTRA_SECONDS as u8,
             }),
-            model: Some(Model::LLM(LLM {
-                architecture: LLMArchitecture::HfLlama,
-                checkpoint: Checkpoint::Dummy(HubRepo::dummy()),
-                max_seq_len: 4096,
-                data_type: LLMTrainingDataType::Pretraining,
-                data_location: LLMTrainingDataLocation::default(),
-                lr_schedule: LearningRateSchedule::Constant(ConstantLR::default()),
-                optimizer: OptimizerDefinition::Distro {
-                    clip_grad_norm: None,
-                    compression_decay: 1.0,
-                    compression_topk: 1,
-                    compression_chunk: 1,
-                    quantize_1bit: false,
-                    weight_decay: None,
-                },
-                cold_start_warmup_steps: 0,
-            })),
+            model: Some(Model::LLM(genesis_model())),
             progress: None,
             epoch_earning_rate_total_shared: Some(4_000),
             epoch_slashing_rate_per_client: Some(SLASHING_RATE),
@@ -431,37 +430,95 @@ pub async fn run() {
         .await
         .unwrap()
         .unwrap();
-    let cheater_index = roster
-        .coordinator
-        .epoch_state
-        .clients
-        .iter()
-        .position(|client| *client.id.signer() == clients[cheater].pubkey().to_bytes())
-        .expect("the cheater must be in the epoch roster") as u64;
 
-    let (_, honest) = nano_train_once(nano_trainer(), step, batch_id);
-    let forged: Vec<f32> = honest.iter().map(|v| -5.0 * v).collect();
-    let forged_dump = scratch("forged").join("forged.vec-postcard");
-    write_dense_dump(&forged_dump, &forged, 6).unwrap();
-    let submitted_dir = scratch("submitted");
-    keep_signed_payload(
-        &submitted_dir,
-        &forged_dump,
-        &clients[cheater],
-        &p2ps[cheater],
-        &run_id,
-        header,
+    // The cheater and an honest node, each with the payload it sent for its
+    // batch of the run's first step and the commitment it signed.
+    let llm = genesis_model();
+    let honest = (cheater + 1) % clients.len();
+    let honest_header = payload_header(
+        &first_round.coordinator,
+        tie_breakers,
+        &identity(&clients[honest], &p2ps[honest]),
     );
+    let submitted_dir = scratch("submitted");
+    let staging = scratch("staging");
+    for (node, node_header, payload) in [
+        (
+            cheater,
+            header,
+            flipped(&first_step_payload(
+                &llm,
+                &first_round.coordinator,
+                step,
+                batch_id,
+            )),
+        ),
+        (
+            honest,
+            honest_header,
+            first_step_payload(
+                &llm,
+                &first_round.coordinator,
+                honest_header.0,
+                honest_header.2,
+            ),
+        ),
+    ] {
+        assert_eq!(
+            node_header.0, step,
+            "both nodes trained the run's first step"
+        );
+        let staged = staging.join(format!("{node}.vec-postcard"));
+        write_results_dump(&staged, &payload).unwrap();
+        keep_signed_payload(
+            &submitted_dir,
+            &staged,
+            &clients[node],
+            &p2ps[node],
+            &run_id,
+            node_header,
+        );
+    }
 
+    // The daemon's engine, built from the run on chain: its model, the step
+    // it can replay and the warmup bounds of that step.
+    let replay_step = roster
+        .coordinator
+        .replayable_step()
+        .expect("the run's first epoch has a replayable step");
+    assert_eq!(replay_step, step);
+    let roster_index = |node: usize| {
+        roster
+            .coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|client| {
+                *client.id.signer() == clients[node].pubkey().to_bytes()
+            })
+            .expect("the node is in the epoch roster") as u64
+    };
+    let (trainer, replay_config) = trainer_for(&llm);
     let engine = TrainerReplayEngine::new(
-        nano_trainer(),
-        vec![ReplayAssignment {
-            target_index: cheater_index,
-            step,
-            batch_id,
-            data: nano_batch(),
-        }],
+        trainer,
+        [(cheater, batch_id), (honest, honest_header.2)]
+            .into_iter()
+            .map(|(node, node_batch)| ReplayAssignment {
+                target_index: roster_index(node),
+                step: replay_step,
+                warmup_lr_between: roster
+                    .coordinator
+                    .get_cold_start_warmup_bounds(),
+                batch_id: node_batch,
+                data: batch_data(&llm),
+            })
+            .collect(),
         tch::Device::Cpu,
+        replay_config.quantize_1bit(),
+    );
+    assert!(
+        replay_config.quantize_1bit(),
+        "the genesis rehearsal sends 1-bit signs"
     );
 
     let config = AuditConfig {
@@ -472,7 +529,6 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
-        replay_step: Some(step),
     };
 
     let mut convicted = HashSet::new();
@@ -490,6 +546,10 @@ pub async fn run() {
 
     assert_eq!(convictions, 1);
     assert!(convicted.contains(&cheater_committer));
+    assert!(
+        !convicted.contains(&clients[honest].pubkey().to_string()),
+        "the honest node was convicted"
+    );
 
     endpoint
         .forward_clock_unix_timestamp(cooldown_time)
