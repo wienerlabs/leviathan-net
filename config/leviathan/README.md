@@ -83,11 +83,19 @@ slashed against the nano model's band:
 mkdir -p data/fineweb-rehearsal
 curl -L -o data/fineweb-rehearsal/00000_00000_shuffled.ds \
   https://huggingface.co/datasets/emozilla/fineweb-10bt-tokenized-datatrove-llama2/resolve/cd477aed05fd5c2efd4b0c6c2459f1537fbd1a30/00000_00000_shuffled.ds
-./target/debug/calibrate-band --model emozilla/llama2-20m-init \
-  --data-dir data/fineweb-rehearsal --sequence-length 512 --samples 32 --class <gpu>
+./target/debug/calibrate-band --run-config config/leviathan/fineweb-rehearsal.toml \
+  --data-dir data/fineweb-rehearsal --samples 32 --class <gpu>
 leviathan-verifier-daemon --run-id leviathan-fineweb ... \
-  --replay-model emozilla/llama2-20m-init --replay-data-dir data/fineweb-rehearsal \
-  --replay-sequence-length 512 --replay-step <first step> --band <calibrated> --dry-run
+  --replay-data-dir data/fineweb-rehearsal --band <calibrated> --dry-run
+```
+
+The daemon reads everything else from the run on chain: the checkpoint and its
+revision, the learning-rate schedule, the optimizer, the sequence length and
+the data layout. It also reads the one step a replay can reproduce, which is the
+run's first, so there is nothing to keep in step with the run by hand
+(wienerlabs/leviathan-net#47):
+
+```
 ```
 
 ## Scaling to 350M and 1B

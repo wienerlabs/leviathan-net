@@ -37,7 +37,7 @@ The combination of bonded contributions, random replay audits and slashing is no
 Three layers, each covering the others' gap:
 
 1. **Robust aggregation bounds damage.** Centered clipping with far-outlier excision caps any contribution's influence radius in the round it happens. Re-validated on real transformer gradients: a 5/16 sign-flip coalition drives naive mean to divergence while clip plus excision holds the honest baseline and admits 3% of malicious contributions.
-2. **Replay audits price lying.** Each contribution is audited with probability p. Local rounds are replayable pure functions of `(checkpoint, seed, data)`, so a mismatch beyond the calibrated tolerance band is a binary fraud proof. On the ALIE run at p = 0.1, all five stealth cheaters were caught at a mean of 9.8 rounds against the 1/p = 10 expectation.
+2. **Replay audits price lying.** Each contribution is audited with probability p. A contribution replayable from `(checkpoint, seed, data)` turns a mismatch beyond the calibrated tolerance band into a binary fraud proof. Under DisTrO that holds for a run's first step only: after it, each node's result also depends on error feedback it accumulates privately (#48). On the ALIE run at p = 0.1, all five stealth cheaters were caught at a mean of 9.8 rounds against the 1/p = 10 expectation.
 3. **Bonds make sybil a cost.** Break-even bond = reward x (1-p)/p. A slashed identity re-enters only by posting a fresh bond, and slashed stake funds the verifiers hunting it. Security is self-funding under attack.
 
 This is economic security with published parameters, never a cryptographic overclaim.
@@ -159,7 +159,7 @@ The same toolbox carries three more live drivers (`--features demo`):
 | `devnet-appeals-demo` | two verifiers convict, the target appeals, two tie-breakers overturn; both verifiers forfeit 200 and the target keeps its full bond |
 | `devnet-bond-gated-claim-demo` | a claim is refused before the bond exists and accepted after; a zero withdraw delay is refused |
 
-And with a real model in the loop: on a bonded devnet run, three nodes posted 500 each and one broadcast a forged gradient through the client's `LEVIATHAN_FAKE_DELTA` test switch. `leviathan-verifier-daemon` replayed the first step: the honest nodes landed at 0.0043 and 0.0031, the cheater at 5.9968 against the 0.05 band. The daemon slashed it on chain with both hashes in the log, the coordinator ejected it, and its withdrawal returned nothing of its 500 bond (#29). That slash went through the run authority; the committee path above is separate.
+And with a real model in the loop: on a bonded devnet run, three nodes posted 500 each and one broadcast a forged gradient through the client's `LEVIATHAN_FAKE_DELTA` test switch. `leviathan-verifier-daemon` replayed the first step: the honest nodes landed at 0.0043 and 0.0031, the cheater at 5.9968 against the 0.05 band. The daemon slashed it on chain with both hashes in the log, the coordinator ejected it, and its withdrawal returned nothing of its 500 bond (#29). That slash went through the run authority; the committee path above is separate. Those distances were measured before the verifier read 1-bit payloads as signs and replayed with the run's own configuration (#47); the daemon suites now replay the genesis rehearsal's 1-bit payloads, with an honest node at 0 and a sign-flipped one at 2.
 
 ## Run a node
 
@@ -171,7 +171,7 @@ curl -fsSL https://raw.githubusercontent.com/wienerlabs/leviathan-net/main/scrip
 
 ## Where it stands
 
-The protocol is live on devnet. Not there yet: the model is a test model (Nano-Llama, 30-token vocabulary); joining needs a per-node authorization from the run's join authority; bonds with real value wait on the external audit (wienerlabs/leviathan#4), so the planned first mainnet stage is bondless ([config/leviathan/mainnet-genesis-bondless.toml](config/leviathan/mainnet-genesis-bondless.toml)); the programs are not deployed on mainnet-beta; the verifier daemon replays a cold-start step; robust aggregation sits behind `LEVIATHAN_ROBUST_AGG` and is off by default. The internal security review is public in [docs/SECURITY_REVIEW_INTERNAL.md](docs/SECURITY_REVIEW_INTERNAL.md).
+The protocol is live on devnet. Not there yet: the model is a test model (Nano-Llama, 30-token vocabulary); joining needs a per-node authorization from the run's join authority; bonds with real value wait on the external audit (wienerlabs/leviathan#4), so the planned first mainnet stage is bondless ([config/leviathan/mainnet-genesis-bondless.toml](config/leviathan/mainnet-genesis-bondless.toml)); the programs are not deployed on mainnet-beta; the verifier daemon can replay only a run's first step (#48); robust aggregation sits behind `LEVIATHAN_ROBUST_AGG` and is off by default. The internal security review is public in [docs/SECURITY_REVIEW_INTERNAL.md](docs/SECURITY_REVIEW_INTERNAL.md).
 
 ## Phones
 

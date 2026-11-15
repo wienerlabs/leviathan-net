@@ -9,7 +9,9 @@
 # pulled from the hub cache on first run.
 set -euo pipefail
 
-MODEL="${MODEL:-pefontana/Nano-Llama}"
+# The run whose training is replayed: its checkpoint, learning-rate schedule,
+# optimizer (1-bit DisTrO), sequence length and data layout.
+RUN_CONFIG="${RUN_CONFIG:-config/leviathan/genesis-rehearsal.toml}"
 VOCAB="${VOCAB:-30}"
 WORK="${WORK:-$(mktemp -d -t leviathan-replay-smoke)}"
 BIN="${BIN:-./target/debug}"
@@ -34,17 +36,17 @@ echo "[smoke] building a dataset the model can actually index"
 
 echo "[smoke] producing one honest contribution"
 "$BIN/nano-contribute" \
-    --model "$MODEL" \
+    --run-config "$RUN_CONFIG" \
     --data-dir "$WORK/data" \
     --out-dir "$WORK/submitted" \
     --committer node0
 
-DUMP_NAME="result-node0-step1-batchB[0, 0].vec-postcard"
+DUMP_NAME=$(cd "$WORK/submitted" && ls result-node0-*.vec-postcard)
 
 echo "[smoke] auditing the honest contribution with no reference dumps"
 "$BIN/leviathan-verifier" \
     --submitted "$WORK/submitted" \
-    --replay-model "$MODEL" \
+    --run-config "$RUN_CONFIG" \
     --replay-data-dir "$WORK/data"
 
 echo "[smoke] forging the same contribution"
@@ -56,7 +58,7 @@ echo "[smoke] auditing the forged contribution, expecting a conviction"
 set +e
 "$BIN/leviathan-verifier" \
     --submitted "$WORK/cheat" \
-    --replay-model "$MODEL" \
+    --run-config "$RUN_CONFIG" \
     --replay-data-dir "$WORK/data"
 STATUS=$?
 set -e

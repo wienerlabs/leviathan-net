@@ -2,14 +2,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use std::path::Path;
+use std::path::PathBuf;
+
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use psyche_coordinator::model::Checkpoint;
+use psyche_coordinator::model::HttpLLMTrainingDataLocation;
+use psyche_coordinator::model::HubRepo;
+use psyche_coordinator::model::LLMTrainingDataLocation;
+use psyche_coordinator::model::Model;
+use psyche_coordinator::model::LLM;
 use psyche_core::Barrier;
 use psyche_core::BatchId;
 use psyche_core::CancellableBarrier;
-use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
 use psyche_core::OptimizerDefinition;
+use psyche_core::Shuffle;
+use psyche_core::TokenSize;
+use psyche_data_provider::download_model_repo_sync;
 use psyche_modeling::auto_model_for_causal_lm_from_pretrained;
 use psyche_modeling::CausalLM;
 use psyche_modeling::LocalTrainer;
@@ -28,6 +40,9 @@ use crate::decompress_results;
 pub struct ReplayAssignment {
     pub target_index: u64,
     pub step: u32,
+    /// The run's cold-start warmup bounds at `step`, which the client trains
+    /// with (`Coordinator::get_cold_start_warmup_bounds`).
+    pub warmup_lr_between: Option<(u32, u32)>,
     pub batch_id: BatchId,
     pub data: Vec<BatchDataCPU>,
 }
@@ -41,17 +56,16 @@ pub fn parse_assignment_key(key: &str) -> Option<(u32, BatchId)> {
     Some((step, batch))
 }
 
+/// What a replay trains with. It has to be what the run trains with: a replay
+/// at another learning rate, with another optimizer or sequence length,
+/// reproduces some other node's work (wienerlabs/leviathan-net#47).
 #[derive(Debug, Clone)]
 pub struct ReplayTrainerConfig {
-    pub repo_files: Vec<std::path::PathBuf>,
+    pub repo_files: Vec<PathBuf>,
     pub sequence_length: usize,
     pub micro_batch_size: usize,
-    pub learning_rate: f64,
-    pub compression_decay: f32,
-    pub compression_topk: u16,
-    pub compression_chunk: u16,
-    pub clip_grad_norm: Option<f32>,
-    pub quantize_1bit: bool,
+    pub lr_schedule: LearningRateSchedule,
+    pub optimizer: OptimizerDefinition,
     pub device: tch::Device,
     /// The dtype the model is loaded and trained in. The real network trains in
     /// `BFloat16`; the verifier historically replayed in `Float` (fp32). The
@@ -60,7 +74,122 @@ pub struct ReplayTrainerConfig {
     pub kind: tch::Kind,
 }
 
+impl ReplayTrainerConfig {
+    /// The replay of a run that trains `llm`: its learning-rate schedule, its
+    /// optimizer and its sequence length, on the checkpoint files `repo_files`.
+    pub fn for_run(
+        llm: &LLM,
+        repo_files: Vec<PathBuf>,
+        device: tch::Device,
+        kind: tch::Kind,
+    ) -> Self {
+        Self {
+            repo_files,
+            sequence_length: llm.max_seq_len as usize,
+            micro_batch_size: 1,
+            lr_schedule: llm.lr_schedule,
+            optimizer: llm.optimizer,
+            device,
+            kind,
+        }
+    }
+
+    /// Whether the run transmits its results as 1-bit signs, which the replay
+    /// has to do too before it is compared with what a node sent.
+    pub fn quantize_1bit(&self) -> bool {
+        matches!(
+            self.optimizer,
+            OptimizerDefinition::Distro {
+                quantize_1bit: true,
+                ..
+            }
+        )
+    }
+}
+
+/// The published checkpoint a cold start trains from: the Hub repository and
+/// revision the run names, directly or as the repository its peers publish to.
+/// A cold start turns a P2P checkpoint back into that Hub one.
+pub fn published_checkpoint(llm: &LLM) -> Result<HubRepo> {
+    match llm.checkpoint {
+        Checkpoint::Hub(hub) | Checkpoint::P2P(hub) => Ok(hub),
+        other => Err(anyhow!(
+            "a replay starts from a published Hub checkpoint, the run names {other}"
+        )),
+    }
+}
+
+/// The files of the published checkpoint `hub`, at its revision.
+pub fn checkpoint_repo_files(hub: &HubRepo) -> Result<Vec<PathBuf>> {
+    download_model_repo_sync(
+        &hub.repo_id.to_string(),
+        hub.revision.map(|revision| revision.to_string()),
+        None,
+        None,
+        true,
+    )
+    .with_context(|| format!("cannot fetch the run's checkpoint {}", hub.repo_id))
+}
+
+/// How the run's training data is laid out: the token size and shuffle of its
+/// Http location. A replay reads the run's shards back from a local copy in
+/// that order, and can reproduce no other kind of data location.
+pub fn replay_data_layout(llm: &LLM) -> Result<(TokenSize, Shuffle)> {
+    match llm.data_location {
+        LLMTrainingDataLocation::Http(HttpLLMTrainingDataLocation {
+            token_size_in_bytes,
+            shuffle,
+            ..
+        }) => Ok((token_size_in_bytes, shuffle)),
+        other => Err(anyhow!(
+            "a replay reads local shards in Http order and cannot reproduce the run's {other:?} data location"
+        )),
+    }
+}
+
+/// The cold-start warmup bounds of a cold-start epoch of `llm` starting at
+/// `start_step`, as `Coordinator::get_cold_start_warmup_bounds` gives them to
+/// the client. The offline tools have no coordinator to ask.
+pub fn cold_start_warmup_bounds(llm: &LLM, start_step: u32) -> Option<(u32, u32)> {
+    (llm.cold_start_warmup_steps != 0)
+        .then(|| (start_step, start_step + llm.cold_start_warmup_steps))
+}
+
+/// A run's model, as a run configuration file states it
+/// (`config/leviathan/*.toml`): what the offline tools replay against.
+pub fn read_run_model(path: &Path) -> Result<LLM> {
+    #[derive(serde::Deserialize)]
+    struct RunFile {
+        model: Model,
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read run config {}", path.display()))?;
+    let run: RunFile = toml::from_str(&text)
+        .with_context(|| format!("cannot parse run config {}", path.display()))?;
+    let Model::LLM(llm) = run.model;
+    Ok(llm)
+}
+
+/// A trainer to replay with, built from the checkpoint as the client builds
+/// its own.
+///
+/// A replay trainer is reused across targets and passes, and only its error
+/// feedback is zeroed between them. DisTrO's weight decay scales the weights
+/// in place on every step, so with it each replay after the first would start
+/// from weights the earlier ones had already decayed. A run with weight decay
+/// is refused rather than replayed on drifting weights.
 pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
+    if let OptimizerDefinition::Distro {
+        weight_decay: Some(weight_decay),
+        ..
+    } = config.optimizer
+    {
+        if weight_decay != 0.0 {
+            return Err(anyhow!(
+                "the run decays its weights ({weight_decay}), which a replay trainer reused across targets cannot reproduce"
+            ));
+        }
+    }
     let model: Box<dyn CausalLM> = auto_model_for_causal_lm_from_pretrained(
         config.repo_files.clone(),
         Some(config.kind),
@@ -77,15 +206,8 @@ pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
             barrier: Arc::new(CancellableBarrier::new(1)) as Arc<dyn Barrier>,
             data_parallel: None,
         },
-        LearningRateSchedule::Constant(ConstantLR::new(config.learning_rate, 0, 0.0)),
-        OptimizerDefinition::Distro {
-            clip_grad_norm: config.clip_grad_norm,
-            compression_decay: config.compression_decay,
-            compression_topk: config.compression_topk,
-            compression_chunk: config.compression_chunk,
-            quantize_1bit: config.quantize_1bit,
-            weight_decay: None,
-        },
+        config.lr_schedule,
+        config.optimizer,
         config.micro_batch_size,
         None,
         false,
@@ -97,13 +219,19 @@ pub struct TrainerReplayEngine {
     trainer: Mutex<Option<Trainer>>,
     assignments: HashMap<u64, ReplayAssignment>,
     device: tch::Device,
+    quantize_1bit: bool,
 }
 
 impl TrainerReplayEngine {
+    /// An engine replaying `assignments` with `trainer`. `quantize_1bit` is
+    /// whether the run sends its results as 1-bit signs
+    /// (`ReplayTrainerConfig::quantize_1bit`), so the replay is compared as
+    /// what a node sends rather than what it computed.
     pub fn new(
         trainer: Trainer,
         assignments: Vec<ReplayAssignment>,
         device: tch::Device,
+        quantize_1bit: bool,
     ) -> Self {
         Self {
             trainer: Mutex::new(Some(trainer)),
@@ -112,6 +240,7 @@ impl TrainerReplayEngine {
                 .map(|a| (a.target_index, a))
                 .collect(),
             device,
+            quantize_1bit,
         }
     }
 
@@ -128,13 +257,15 @@ impl TrainerReplayEngine {
             .take()
             .ok_or_else(|| ReplayError::Backend("replay trainer unavailable".to_string()))?;
 
+        // Trained as the client trains a step with zeroed error feedback: the
+        // run's warmup bounds, and no results of its own from before.
         let output = trainer.train(
             assignment.step,
             Batch {
                 id: assignment.batch_id,
                 data: BatchData::CPU(assignment.data.clone()),
             },
-            None,
+            assignment.warmup_lr_between,
             true,
             vec![],
             Some(vec![]),
@@ -157,6 +288,10 @@ impl TrainerReplayEngine {
                 "replay produced no distro results, the run is not using DisTrO".to_string(),
             )
         })?;
+        let results = match self.quantize_1bit {
+            true => Trainer::quantize_results(&results),
+            false => results,
+        };
 
         decompress_results(&results, self.device)
             .map_err(|e| ReplayError::Backend(format!("cannot decompress replay: {e}")))
