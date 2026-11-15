@@ -6,6 +6,7 @@ use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_coordinator::model::LLM;
 use psyche_coordinator::ClientState;
+use psyche_coordinator::RunState;
 use psyche_coordinator::Committee;
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
@@ -14,6 +15,7 @@ use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
 use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
+use psyche_solana_authorizer::find_authorization;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
@@ -54,7 +56,11 @@ use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::instruction::RunOpenChallenge;
 use psyche_solana_treasurer::logic::RunOpenChallengeParams;
+use psyche_solana_treasurer::state::withdrawal_hold;
+use psyche_solana_treasurer::state::AuditVerdict;
+use psyche_solana_treasurer::state::WithdrawalHold;
 use psyche_solana_treasurer::ProgramError;
+use psyche_solana_coordinator::coordinator_account_from_bytes;
 use solana_sdk::instruction::Instruction;
 
 use super::refusal::refusal_code;
@@ -79,6 +85,7 @@ struct AppealsHarness {
     ticker: Keypair,
     run: Pubkey,
     run_id: String,
+    join_authority: Pubkey,
     coordinator_instance: Pubkey,
     coordinator_account: Pubkey,
     collateral_mint: Pubkey,
@@ -374,6 +381,7 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
         ticker,
         run,
         run_id: run_id.to_string(),
+        join_authority: join_authority.pubkey(),
         coordinator_instance,
         coordinator_account,
         collateral_mint,
@@ -446,6 +454,133 @@ impl AppealsHarness {
         )
         .await
         .unwrap();
+    }
+
+    /// `client_idx` finalizes its pending withdrawal, with no bounty recipients.
+    async fn try_finalize_withdraw(&mut self, client_idx: usize) -> anyhow::Result<()> {
+        let client = self.clients[client_idx].insecure_clone();
+        let collateral = self.clients_collateral[client_idx];
+        process_treasurer_participant_bond_finalize_withdraw(
+            &mut self.endpoint,
+            &self.payer,
+            &client,
+            &collateral,
+            &self.collateral_mint,
+            &self.run,
+            &self.coordinator_account,
+        )
+        .await
+    }
+
+    /// Every client joins the next epoch with the authorization the run's join
+    /// authority granted it, and the run is driven into its first round, paced
+    /// by the run's own config.
+    async fn rejoin_all_and_start_epoch(&mut self) {
+        for client_idx in 0..self.clients.len() {
+            let client = self.clients[client_idx].insecure_clone();
+            let authorization = find_authorization(
+                &self.join_authority,
+                &client.pubkey(),
+                JOIN_RUN_AUTHORIZATION_SCOPE,
+            );
+            process_coordinator_join_run(
+                &mut self.endpoint,
+                &self.payer,
+                &client,
+                &authorization,
+                &self.coordinator_instance,
+                &self.coordinator_account,
+                NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            )
+            .await
+            .unwrap();
+        }
+        let config = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
+            .await
+            .unwrap()
+            .unwrap()
+            .coordinator
+            .config;
+        for seconds in [config.waiting_for_members_extra_time as u64, config.warmup_time] {
+            self.endpoint
+                .forward_clock_unix_timestamp(seconds)
+                .await
+                .unwrap();
+            process_coordinator_tick(
+                &mut self.endpoint,
+                &self.payer,
+                &self.ticker,
+                &self.coordinator_instance,
+                &self.coordinator_account,
+            )
+            .await
+            .unwrap();
+        }
+        let state = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.coordinator.run_state, RunState::RoundTrain);
+    }
+
+    /// Where `key` sits in the current epoch's roster.
+    async fn roster_index_of(&mut self, key: &Pubkey) -> u64 {
+        get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
+            .await
+            .unwrap()
+            .unwrap()
+            .coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|c| *c.id.signer() == key.to_bytes())
+            .expect("the client is in this epoch's roster") as u64
+    }
+
+    /// The verifiers whose votes convicted the target, as bounty recipients.
+    fn convicting_verifier_collaterals(&self) -> Vec<Pubkey> {
+        self.verifiers
+            .iter()
+            .take(self.verifier_quorum as usize)
+            .map(|(client_idx, _)| self.clients_collateral[*client_idx])
+            .collect()
+    }
+
+    /// The hold run-manager reads before it sends a finalize: the run's
+    /// coordinator account and the client's own verdict account, decoded the
+    /// way the treasurer decodes them.
+    async fn observed_hold(&mut self, client_idx: usize) -> Option<WithdrawalHold> {
+        let user = self.clients[client_idx].pubkey();
+        let coordinator = self
+            .endpoint
+            .get_account(&self.coordinator_account)
+            .await
+            .unwrap()
+            .unwrap();
+        let verdict = self
+            .endpoint
+            .get_account(&find_audit_verdict(&self.run, &user))
+            .await
+            .unwrap();
+        let own_verdict = match verdict {
+            Some(account) => AuditVerdict::from_pda_account(&account.owner, &account.data).unwrap(),
+            None => None,
+        };
+        withdrawal_hold(
+            coordinator_account_from_bytes(&coordinator.data).unwrap(),
+            own_verdict.as_ref(),
+            &user,
+        )
+    }
+
+    async fn collateral_of(&mut self, client_idx: usize) -> u64 {
+        let account = self.clients_collateral[client_idx];
+        self.endpoint
+            .get_spl_token_account(&account)
+            .await
+            .unwrap()
+            .unwrap()
+            .amount
     }
 
     async fn client_state(&mut self, key: &Pubkey) -> Option<ClientState> {
@@ -928,4 +1063,147 @@ pub async fn a_challenge_against_another_runs_coordinator_is_refused() {
     process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
         .await
         .unwrap();
+}
+
+
+/// A conviction waiting out its challenge window has not reached the ledger, so
+/// a target whose withdrawal delay elapses meanwhile does not leave with its
+/// bond. The conviction still lands once the target is back in an epoch, and
+/// settlement then forfeits what it owes (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn a_target_cannot_leave_while_its_conviction_is_pending() {
+    let mut h = setup("Leviathan appeals pending leave", 98).await;
+    let target_idx = h.target_client_idx;
+    let target_key = h.target_key;
+    h.request_withdraw(target_idx, BOND).await;
+    h.reach_verifier_quorum().await;
+
+    // The epoch ends and is charged with the target never ejected, and the
+    // withdrawal delay elapses.
+    h.settle_epoch().await;
+    h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    assert_eq!(h.slashed_of(&target_key).await, 0);
+    assert_eq!(
+        h.observed_hold(target_idx).await,
+        Some(WithdrawalHold::ConvictionPending)
+    );
+    assert_eq!(
+        refusal_code(h.try_finalize_withdraw(target_idx).await),
+        treasurer_refusal(ProgramError::ConvictionPending),
+        "a target left with its whole bond while its conviction was pending"
+    );
+
+    settle_the_pending_conviction(&mut h).await;
+}
+
+/// The same holds while the target's appeal is open: it does not get to leave
+/// on the strength of having asked for one (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn a_challenged_target_cannot_leave_until_the_appeal_resolves() {
+    let mut h = setup("Leviathan appeals open leave", 99).await;
+    let target_idx = h.target_client_idx;
+    let target = h.clients[target_idx].insecure_clone();
+    h.request_withdraw(target_idx, BOND).await;
+    h.reach_verifier_quorum().await;
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
+        .await
+        .unwrap();
+
+    h.settle_epoch().await;
+    h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    assert_eq!(
+        h.observed_hold(target_idx).await,
+        Some(WithdrawalHold::ConvictionPending)
+    );
+    assert_eq!(
+        refusal_code(h.try_finalize_withdraw(target_idx).await),
+        treasurer_refusal(ProgramError::ConvictionPending),
+        "a target left with its whole bond while its appeal was open"
+    );
+
+    // No bench resolves it, so past the appeal window the conviction the
+    // verifiers reached finalises as it would have.
+    h.endpoint
+        .forward_clock_unix_timestamp(APPEAL_WINDOW as u64)
+        .await
+        .unwrap();
+    settle_the_pending_conviction(&mut h).await;
+}
+
+/// An innocent target whose appeal overturns the conviction is not held at
+/// all: it leaves with its whole bond (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn an_overturned_target_leaves_with_its_whole_bond() {
+    let mut h = setup("Leviathan appeals cleared leave", 100).await;
+    let target_idx = h.target_client_idx;
+    let target = h.clients[target_idx].insecure_clone();
+    h.request_withdraw(target_idx, BOND).await;
+    h.reach_verifier_quorum().await;
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
+        .await
+        .unwrap();
+    let quorum = h.tie_breaker_quorum as usize;
+    let bench: Vec<usize> = h.tie_breakers.iter().take(quorum).map(|(i, _)| *i).collect();
+    for client_idx in bench {
+        h.cast_appeal(client_idx, true).await.unwrap();
+    }
+
+    h.settle_epoch().await;
+    h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    assert_eq!(h.observed_hold(target_idx).await, None);
+    let before = h.collateral_of(target_idx).await;
+    h.try_finalize_withdraw(target_idx).await.unwrap();
+    assert_eq!(h.collateral_of(target_idx).await - before, BOND);
+}
+
+/// The target comes back for the next epoch, the pending conviction finalises
+/// against it there, the epoch charges it, and only then does the withdrawal
+/// settle: the forfeit stays in the vault and the target gets the rest.
+async fn settle_the_pending_conviction(h: &mut AppealsHarness) {
+    let target_idx = h.target_client_idx;
+    let target_key = h.target_key;
+    h.rejoin_all_and_start_epoch().await;
+    let target_index = h.roster_index_of(&target_key).await;
+    process_treasurer_run_finalize_slash(
+        &mut h.endpoint,
+        &h.payer,
+        &h.run,
+        &h.coordinator_account,
+        &h.run_id,
+        &target_key,
+        target_index,
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.client_state(&target_key).await, Some(ClientState::Ejected));
+    assert_eq!(
+        h.observed_hold(target_idx).await,
+        Some(WithdrawalHold::EpochNotSettled)
+    );
+    assert_eq!(
+        refusal_code(h.try_finalize_withdraw(target_idx).await),
+        treasurer_refusal(ProgramError::EpochNotSettled),
+        "the target left before the epoch that charges its conviction ended"
+    );
+
+    h.settle_epoch().await;
+    assert_eq!(h.slashed_of(&target_key).await, SLASHING_RATE);
+    assert_eq!(h.observed_hold(target_idx).await, None);
+    let target = h.clients[target_idx].insecure_clone();
+    let target_collateral = h.clients_collateral[target_idx];
+    let voters = h.convicting_verifier_collaterals();
+    let before = h.collateral_of(target_idx).await;
+    process_treasurer_participant_bond_finalize_withdraw_with_voters(
+        &mut h.endpoint,
+        &h.payer,
+        &target,
+        &target_collateral,
+        &h.collateral_mint,
+        &h.run,
+        &h.coordinator_account,
+        &voters,
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.collateral_of(target_idx).await - before, BOND - SLASHING_RATE);
 }

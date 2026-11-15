@@ -10,7 +10,9 @@ use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
+use crate::state::WithdrawalHold;
 use crate::state::coordinator_slashed_points;
+use crate::state::withdrawal_hold;
 
 #[derive(Accounts)]
 #[instruction(params: ParticipantBondFinalizeWithdrawParams)]
@@ -91,10 +93,38 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let user_key = context.accounts.user.key();
     let run_key = context.accounts.run.key();
 
-    let participant_slashed_points = coordinator_slashed_points(
-        &*context.accounts.coordinator_account.load()?,
-        &user_key,
-    );
+    // The verdict is read from the account at its own PDA, which the caller
+    // cannot substitute or leave out. An account with no data there is the
+    // only thing that counts as "no verdict".
+    let own_verdict = {
+        let info = context.accounts.audit_verdict.to_account_info();
+        let data = info.try_borrow_data()?;
+        AuditVerdict::from_pda_account(info.owner, &data)?
+    };
+
+    let (participant_slashed_points, hold) = {
+        let coordinator_account = context.accounts.coordinator_account.load()?;
+        (
+            coordinator_slashed_points(&coordinator_account, &user_key),
+            withdrawal_hold(&coordinator_account, own_verdict.as_ref(), &user_key),
+        )
+    };
+
+    // The withdrawal delay is there so a cheater cannot leave between the fraud
+    // and the conviction, and it only works if the conviction can reach the
+    // bond first. It cannot while it waits out a challenge window or an appeal,
+    // or while the epoch it would be charged in is still running: settling now
+    // would find nothing owed and pay the whole bond out
+    // (wienerlabs/leviathan-net#36).
+    match hold {
+        Some(WithdrawalHold::ConvictionPending) => {
+            return err!(ProgramError::ConvictionPending)
+        },
+        Some(WithdrawalHold::EpochNotSettled) => {
+            return err!(ProgramError::EpochNotSettled)
+        },
+        None => {},
+    }
 
     let participant = &mut context.accounts.participant;
     let run = &mut context.accounts.run;
@@ -138,20 +168,6 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
 
     if bounty_amount > 0 {
-        // The verdict is read from the account at its own PDA, which the caller
-        // cannot substitute or leave out. An account with no data there is the
-        // only thing that counts as "no verdict".
-        let own_verdict = {
-            let info = context.accounts.audit_verdict.to_account_info();
-            if info.data_is_empty() || info.owner != &crate::ID {
-                None
-            } else {
-                Some(AuditVerdict::try_deserialize(
-                    &mut &info.try_borrow_data()?[..],
-                )?)
-            }
-        };
-
         let voters: Vec<Pubkey> = if let Some(verdict) = own_verdict.as_ref() {
             if verdict.status == VerdictStatus::Upheld
                 && !verdict.appeal_voters.is_empty()

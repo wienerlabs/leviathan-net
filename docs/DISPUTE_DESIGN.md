@@ -141,6 +141,18 @@ confirms both directions: a tie-breaker earns its share whether the verdict is
 overturned or upheld, while a cleared target still recovers its full bond and a
 convicted one still forfeits.
 
+A conviction that waits out a challenge window or an appeal has not reached the
+ledger yet, and settlement only forfeits what the ledger charges. So while the
+target's verdict is `SlashPending` or `Challenged`, its bond withdrawal is held,
+however long ago the withdrawal delay elapsed (wienerlabs/leviathan-net#36).
+Without that, a free challenge was a free exit: open it, let the delay run out,
+leave with the whole bond. The same hold covers the epoch itself, because a
+slash is charged only at the epoch boundary. A conviction still finalises once
+the target is back in an epoch's roster (`run_finalize_slash` takes its current
+index), and the withdrawal then settles what it owes. A target that never comes
+back cannot finalise its withdrawal either, so the bond stays in the vault
+rather than leaving with the cheater.
+
 One refinement remains, optional and priced: an explicit challenge bond so a
 frivolous appeal has a cost of its own. It is additive on top of the shipped
 lifecycle and needs an economic parameter, so it is a deliberate choice rather

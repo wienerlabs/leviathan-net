@@ -1,3 +1,4 @@
+mod bonded_run;
 mod memnet_authorizer_full_cycle;
 mod memnet_coordinator_data_layout;
 mod memnet_coordinator_full_round;
@@ -23,6 +24,7 @@ mod memnet_treasurer_full_epoch;
 mod memnet_treasurer_join_gate;
 mod memnet_treasurer_slash_accounting_order;
 mod memnet_treasurer_slash_settle;
+mod memnet_treasurer_withdraw_hold;
 mod refusal;
 #[cfg(feature = "daemon")]
 mod memnet_verifier_daemon;

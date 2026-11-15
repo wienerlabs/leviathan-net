@@ -268,4 +268,10 @@ pub enum ProgramError {
 
     #[msg("This run is not gated by its own bond; join it through its join authority")]
     RunNotBondGated,
+
+    #[msg("A conviction against this participant is still pending; withdraw once it resolves")]
+    ConvictionPending,
+
+    #[msg("This participant trains in an epoch that has not been charged yet; withdraw after it ends")]
+    EpochNotSettled,
 }

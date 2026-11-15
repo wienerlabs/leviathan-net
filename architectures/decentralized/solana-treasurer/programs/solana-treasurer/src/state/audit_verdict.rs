@@ -53,6 +53,19 @@ pub struct AuditVerdict {
 impl AuditVerdict {
     pub const SEEDS_PREFIX: &'static [u8] = b"AuditVerdict";
 
+    /// The verdict held by the account at a participant's verdict PDA, given
+    /// that account's owner and data. An empty account, or one the treasurer
+    /// does not own, is no verdict.
+    pub fn from_pda_account(
+        owner: &Pubkey,
+        data: &[u8],
+    ) -> Result<Option<AuditVerdict>> {
+        if data.is_empty() || owner != &crate::ID {
+            return Ok(None);
+        }
+        Ok(Some(AuditVerdict::try_deserialize(&mut &data[..])?))
+    }
+
     pub fn space_with_discriminator() -> usize {
         8 + 1 // bump
             + 32 // run

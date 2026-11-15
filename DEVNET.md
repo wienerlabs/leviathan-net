@@ -94,6 +94,14 @@ yet settled and withdrawals already requested) on each join, and the coordinator
 refuses a direct join. `run-manager can-join` and `bond-status` report that
 committed bond, and whether joins, votes and claims are open to it.
 
+A withdrawal waits out its delay and then one more thing: it cannot be finalized
+while the node is training in an epoch that has not been charged yet, or while a
+conviction against it is still in its challenge window or appeal. A slash only
+reaches the ledger at the epoch boundary, and a bond that left before that would
+owe nothing. Finalize between epochs; `bond-status` says whether the withdrawal
+is held and why, and `bond-withdraw-finalize` checks the same thing before it
+sends anything.
+
 The wallet needs a little devnet SOL for transaction fees. Override `RUN_ID`,
 `RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed.
 
