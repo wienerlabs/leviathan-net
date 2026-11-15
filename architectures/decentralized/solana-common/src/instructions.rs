@@ -117,6 +117,44 @@ pub fn coordinator_join_run(
     )
 }
 
+/// Joins the next epoch of a run whose join authority is the treasurer `run`
+/// itself. The treasurer checks the bond the node has committed and opens the
+/// node's join authorization only for this join, so a bond-gated run is joined
+/// this way every epoch (wienerlabs/leviathan-net#34).
+pub fn treasurer_participant_join_run(
+    run: &Pubkey,
+    coordinator_instance: &Pubkey,
+    coordinator_account: &Pubkey,
+    payer: &Pubkey,
+    client_id: psyche_core::NodeIdentity,
+) -> Instruction {
+    let user = Pubkey::new_from_array(*client_id.signer());
+    let participant = psyche_solana_treasurer::find_participant(run, &user);
+    let authorization = psyche_solana_authorizer::find_authorization(
+        run,
+        &user,
+        psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE,
+    );
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::ParticipantJoinRunAccounts {
+            payer: *payer,
+            user,
+            run: *run,
+            participant,
+            authorization,
+            coordinator_instance: *coordinator_instance,
+            coordinator_account: *coordinator_account,
+            authorizer_program: psyche_solana_authorizer::ID,
+            coordinator_program: psyche_solana_coordinator::ID,
+            system_program: system_program::ID,
+        },
+        psyche_solana_treasurer::instruction::ParticipantJoinRun {
+            params: psyche_solana_treasurer::logic::ParticipantJoinRunParams { client_id },
+        },
+    )
+}
+
 pub fn coordinator_tick(
     coordinator_instance: &Pubkey,
     coordinator_account: &Pubkey,

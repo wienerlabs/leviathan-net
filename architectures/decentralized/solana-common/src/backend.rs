@@ -13,6 +13,7 @@ use anchor_client::{
         rpc_response::Response as RpcResponse,
     },
     solana_sdk::{
+        account::Account,
         commitment_config::CommitmentConfig,
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
@@ -279,14 +280,30 @@ impl SolanaBackend {
     ) -> Result<Signature> {
         let coordinator_instance_state =
             self.get_coordinator_instance(&coordinator_instance).await?;
-        let authorization =
-            Self::find_join_authorization(&coordinator_instance_state.join_authority, authorizer);
-        let instruction = instructions::coordinator_join_run(
+        let join_authority = coordinator_instance_state.join_authority;
+        let join_authority_account = self.get_account(&join_authority).await?;
+        let instruction = if Self::is_bond_gated_run(
+            &join_authority,
             &coordinator_instance,
-            &coordinator_account,
-            &authorization,
-            id,
-        );
+            join_authority_account.as_ref(),
+        )? {
+            info!("Run {join_authority} gates joins on the bond, joining through the treasurer");
+            instructions::treasurer_participant_join_run(
+                &join_authority,
+                &coordinator_instance,
+                &coordinator_account,
+                &self.get_payer(),
+                id,
+            )
+        } else {
+            let authorization = Self::find_join_authorization(&join_authority, authorizer);
+            instructions::coordinator_join_run(
+                &coordinator_instance,
+                &coordinator_account,
+                &authorization,
+                id,
+            )
+        };
         // send() polls Solana until the tx is confirmed; we cancel early and let the
         // caller retry on the next epoch. The public devnet RPC frequently needs more
         // than a few seconds to confirm, so the deadline is env-tunable and defaults
@@ -395,6 +412,33 @@ impl SolanaBackend {
             repo,
         );
         self.spawn_scheduled_send("Checkpoint", &[instruction], &[], RpcCallType::Checkpoint);
+    }
+
+    /// Whether `join_authority`, holding `join_authority_account`, is a
+    /// treasurer `Run` that gates `coordinator_instance` on its own bond.
+    ///
+    /// Such a run is its own join authority, and admits a node only through the
+    /// treasurer's `participant_join_run`, which checks the committed bond on
+    /// every join and leaves the join authorization inactive at rest. Joining it
+    /// with the coordinator's `join_run` directly is refused
+    /// (wienerlabs/leviathan-net#34). Any other join authority, a wallet or a
+    /// treasurer run gated by an outside key, is joined directly.
+    pub fn is_bond_gated_run(
+        join_authority: &Pubkey,
+        coordinator_instance: &Pubkey,
+        join_authority_account: Option<&Account>,
+    ) -> Result<bool> {
+        let Some(account) = join_authority_account else {
+            return Ok(false);
+        };
+        if account.owner != psyche_solana_treasurer::ID {
+            return Ok(false);
+        }
+        let run = psyche_solana_treasurer::state::Run::try_deserialize(&mut account.data.as_slice())
+            .map_err(|error| {
+                anyhow!("join authority {join_authority} is a treasurer account but not a run: {error}")
+            })?;
+        Ok(run.join_authority == *join_authority && run.coordinator_instance == *coordinator_instance)
     }
 
     pub fn find_join_authorization(join_authority: &Pubkey, authorizer: Option<Pubkey>) -> Pubkey {
@@ -525,6 +569,21 @@ impl SolanaBackend {
         let address = *address;
         self.rpc_with_fallback("get_balance", |coord| async move {
             coord.rpc().get_balance(&address).await.map_err(Into::into)
+        })
+        .await
+    }
+
+    /// The account at `address` with its owner, or `None` if nothing lives there.
+    pub async fn get_account(&self, address: &Pubkey) -> Result<Option<Account>> {
+        let address = *address;
+        self.rpc_with_fallback("get_account", |coord| async move {
+            let commitment = coord.rpc().commitment();
+            coord
+                .rpc()
+                .get_account_with_commitment(&address, commitment)
+                .await
+                .map(|response| response.value)
+                .map_err(Into::into)
         })
         .await
     }

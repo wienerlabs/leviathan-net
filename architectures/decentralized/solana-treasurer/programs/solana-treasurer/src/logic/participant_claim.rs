@@ -8,6 +8,7 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use crate::ProgramError;
 use crate::state::Participant;
 use crate::state::Run;
+use crate::state::coordinator_slashed_points;
 
 #[derive(Accounts)]
 #[instruction(params: ParticipantClaimParams)]
@@ -65,24 +66,31 @@ pub fn participant_claim_processor(
     context: Context<ParticipantClaimAccounts>,
     params: ParticipantClaimParams,
 ) -> Result<()> {
-    if context.accounts.participant.bond_amount < context.accounts.run.bond_minimum_amount {
-        return err!(ProgramError::BondBelowMinimum);
-    }
+    let user_key = context.accounts.user.key();
+    let (participant_earned_points, participant_slashed_points) = {
+        let coordinator_account = context.accounts.coordinator_account.load()?;
+        let earned = coordinator_account
+            .state
+            .clients_state
+            .clients
+            .iter()
+            .find(|client| *client.id.signer() == user_key.to_bytes())
+            .map(|client| client.earned)
+            .unwrap_or(0);
+        (earned, coordinator_slashed_points(&coordinator_account, &user_key))
+    };
 
-    let mut participant_earned_points = 0;
-    for client in context
+    // Nothing is taken without something left to slash, and a bond a conviction
+    // has already charged is not something left: it is only still counted in
+    // `bond_amount` because settlement waits for the participant to withdraw
+    // (wienerlabs/leviathan-net#34).
+    if context
         .accounts
-        .coordinator_account
-        .load()?
-        .state
-        .clients_state
-        .clients
-        .iter()
+        .participant
+        .unforfeited_bond(participant_slashed_points)
+        < context.accounts.run.bond_minimum_amount
     {
-        if *client.id.signer() == context.accounts.user.key().to_bytes() {
-            participant_earned_points = client.earned;
-            break;
-        }
+        return err!(ProgramError::BondBelowMinimum);
     }
 
     let participant = &mut context.accounts.participant;

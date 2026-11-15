@@ -42,7 +42,7 @@ Because each phone casts at most one vote of plus or minus one per parameter and
 | Tally | `CompressDCT::batch_decompress` takes the scatter-mean of the same plus-minus-one votes; Multitude keeps it as integers |
 | Equal share | `instance_state.rs`: `earning_rate_total_shared / finishers` |
 | Bounty | the treasurer's `slash_bounty_bps` |
-| Bond-gated claim | `participant_claim` refuses a participant whose bond is below the minimum |
+| Bond-gated claim | `participant_claim` refuses a participant whose unforfeited bond (posted, less convictions not yet settled) is below the minimum |
 | Cheating economics | `leviathan-indexer`'s `assess_security`, mirrored in `economics.rs` |
 | Band calibration | `calibrate-band`, with `calibrate_band` and `DEFAULT_SAFETY_FACTOR` from `psyche-verifier` |
 | Cheater switch | the client's `LEVIATHAN_FAKE_DELTA`, here `adversary::Behavior` |

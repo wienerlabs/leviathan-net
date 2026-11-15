@@ -10,6 +10,7 @@ use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
+use crate::state::coordinator_slashed_points;
 
 #[derive(Accounts)]
 #[instruction(params: ParticipantBondFinalizeWithdrawParams)]
@@ -90,21 +91,10 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let user_key = context.accounts.user.key();
     let run_key = context.accounts.run.key();
 
-    let mut participant_slashed_points = 0;
-    for client in context
-        .accounts
-        .coordinator_account
-        .load()?
-        .state
-        .clients_state
-        .clients
-        .iter()
-    {
-        if *client.id.signer() == context.accounts.user.key().to_bytes() {
-            participant_slashed_points = client.slashed;
-            break;
-        }
-    }
+    let participant_slashed_points = coordinator_slashed_points(
+        &*context.accounts.coordinator_account.load()?,
+        &user_key,
+    );
 
     let participant = &mut context.accounts.participant;
     let run = &mut context.accounts.run;
@@ -119,8 +109,8 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
         return err!(ProgramError::WithdrawDelayNotElapsed);
     }
 
-    let unsettled_slashed_points = participant_slashed_points
-        .saturating_sub(participant.bond_settled_slashed_points);
+    let unsettled_slashed_points =
+        participant.unsettled_slashed_points(participant_slashed_points);
     let forfeited_amount =
         unsettled_slashed_points.min(participant.bond_amount);
     participant.bond_settled_slashed_points += forfeited_amount;

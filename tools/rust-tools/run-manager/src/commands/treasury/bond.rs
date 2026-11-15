@@ -5,7 +5,51 @@ use async_trait::async_trait;
 use clap::Args;
 
 use crate::{SolanaBackend, instructions};
+use anchor_client::solana_sdk::pubkey::Pubkey;
 use psyche_solana_rpc::utils::native_amount_to_ui_amount;
+use psyche_solana_treasurer::state::{Participant, Run, coordinator_slashed_points};
+
+/// What the treasurer will count of this bond, read from chain: a conviction
+/// the bond has not paid yet already holds part of it, and a requested
+/// withdrawal is on its way out. Claims are checked against what a slash could
+/// still take; joins and votes against what stays behind new work
+/// (wienerlabs/leviathan-net#34).
+async fn report_bond_standing(
+    backend: &SolanaBackend,
+    run_state: &Run,
+    participant: &Participant,
+    user: &Pubkey,
+    decimals: u8,
+) -> Result<()> {
+    let coordinator_account = backend
+        .get_coordinator_account(&run_state.coordinator_account)
+        .await?;
+    let slashed_points = coordinator_slashed_points(&coordinator_account, user);
+    let unforfeited = participant.unforfeited_bond(slashed_points);
+    let committed = participant.committed_bond(slashed_points);
+    println!(
+        "Unsettled slashed points: {}",
+        participant.unsettled_slashed_points(slashed_points)
+    );
+    println!(
+        "Unforfeited bond: {}",
+        native_amount_to_ui_amount(unforfeited, decimals)
+    );
+    println!(
+        "Committed bond: {}",
+        native_amount_to_ui_amount(committed, decimals)
+    );
+    let open = |bond: u64| {
+        if bond >= run_state.bond_minimum_amount {
+            "open"
+        } else {
+            "closed, below the run bond minimum"
+        }
+    };
+    println!("Claims: {}", open(unforfeited));
+    println!("Joins and votes: {}", open(committed));
+    Ok(())
+}
 
 #[derive(Debug, Clone, Args)]
 #[command()]
@@ -95,12 +139,7 @@ impl Command for CommandBondDeposit {
             "Bond amount now: {}",
             native_amount_to_ui_amount(participant.bond_amount, decimals)
         );
-        if participant.bond_amount >= run_state.bond_minimum_amount {
-            println!("This wallet now meets the run bond minimum");
-        } else {
-            println!("This wallet is still below the run bond minimum");
-        }
-        Ok(())
+        report_bond_standing(&backend, &run_state, &participant, &user, decimals).await
     }
 }
 
@@ -171,12 +210,7 @@ impl Command for CommandBondStatus {
             "Settled slashed points: {}",
             participant.bond_settled_slashed_points
         );
-        if participant.bond_amount >= run_state.bond_minimum_amount {
-            println!("Status: meets the run bond minimum");
-        } else {
-            println!("Status: below the run bond minimum");
-        }
-        Ok(())
+        report_bond_standing(&backend, &run_state, &participant, &user, decimals).await
     }
 }
 

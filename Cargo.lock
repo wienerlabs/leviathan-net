@@ -7697,13 +7697,16 @@ dependencies = [
  "psyche-solana-coordinator",
  "psyche-solana-distributor",
  "psyche-solana-mining-pool",
+ "psyche-solana-rpc",
  "psyche-solana-treasurer",
  "psyche-verifier",
+ "serde",
  "solana-sdk",
  "solana_toolbox_endpoint",
  "tch",
  "tokio",
  "tokio-util 0.7.18",
+ "toml 0.8.23",
 ]
 
 [[package]]
