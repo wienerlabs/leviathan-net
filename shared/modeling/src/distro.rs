@@ -2,6 +2,7 @@ use crate::{CausalLM, StableVariableIterator, Variable};
 
 use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
 use tch::{COptimizer, Device, Kind, Tensor};
+use tracing::warn;
 
 pub struct TransformDCT {
     shape_dict: HashMap<i64, i64>,
@@ -247,6 +248,37 @@ impl TransformDCT {
         }
     }
 
+    /// The encoded shape and `totalk` that honest results carry for
+    /// `variable`. `Distro::generate` encodes the full, gathered tensor, so
+    /// this is keyed on the full shape, which is the same on every rank of a
+    /// tensor-parallel group, never on a rank's local shard.
+    pub fn expected_encoding(&self, variable: &dyn Variable) -> Option<(Vec<i64>, i64)> {
+        let encoded = self.encoded_shape(&variable.full_tensor_shape())?;
+        let totalk = *flattened(&encoded).last()?;
+        Some((encoded, totalk))
+    }
+
+    /// The shape `encode` gives a tensor of `shape`, or `None` if this
+    /// transform has no chunk size for one of its dimensions, which is the
+    /// case for a shape no variable of the model has.
+    pub fn encoded_shape(&self, shape: &[i64]) -> Option<Vec<i64>> {
+        let ndim = shape.len();
+        match ndim {
+            0 => None,
+            1 => {
+                let n1 = *self.shape_dict.get(&shape[0])?;
+                Some(vec![shape[0] / n1, n1])
+            }
+            _ => {
+                let n1 = *self.shape_dict.get(&shape[ndim - 2])?;
+                let n2 = *self.shape_dict.get(&shape[ndim - 1])?;
+                let mut encoded = shape[..ndim - 2].to_vec();
+                encoded.extend([shape[ndim - 2] / n1, shape[ndim - 1] / n2, n1, n2]);
+                Some(encoded)
+            }
+        }
+    }
+
     pub fn encode(&mut self, x: &Tensor) -> Tensor {
         let _no_grad = tch::no_grad_guard();
         let shape = x.size();
@@ -434,6 +466,69 @@ fn decompress_idx(max_value: i64, idx: &Tensor) -> Tensor {
     .to_kind(Kind::Int64)
 }
 
+/// The shape `CompressDCT::compress` scatters into for an encoded tensor of
+/// shape `encoded`: the last two dimensions of a 2D+ encoding flattened.
+fn flattened(encoded: &[i64]) -> Vec<i64> {
+    let ndim = encoded.len();
+    if ndim > 2 {
+        let mut flat = encoded[..ndim - 2].to_vec();
+        flat.push(encoded[ndim - 2] * encoded[ndim - 1]);
+        flat
+    } else {
+        encoded.to_vec()
+    }
+}
+
+/// The index width `compress_idx` sends for `totalk`, and the dtype it reads
+/// back as.
+fn index_encoding(totalk: i64) -> (Kind, i64) {
+    if totalk <= 256 {
+        (Kind::Uint8, 1)
+    } else if totalk <= 65536 {
+        (Kind::UInt16, 2)
+    } else if totalk <= 4294967296 {
+        (Kind::UInt32, 4)
+    } else {
+        (Kind::Int64, 8)
+    }
+}
+
+/// Why a peer's results do not fit the local model, so that applying them
+/// would index past them or fail inside libtorch (wienerlabs/leviathan-net#41).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DistroResultMismatch {
+    #[error("{got} results for a model with {expected} variables")]
+    Count { expected: usize, got: usize },
+    #[error("variable {index} ({name}) has a shape the transform cannot encode")]
+    Unencodable { index: usize, name: String },
+    #[error("variable {index} ({name}): xshape {got:?}, the model encodes it as {expected:?}")]
+    Shape {
+        index: usize,
+        name: String,
+        expected: Vec<i64>,
+        got: Vec<i64>,
+    },
+    #[error("variable {index} ({name}): totalk {got}, the model encodes it with {expected}")]
+    Totalk {
+        index: usize,
+        name: String,
+        expected: i64,
+        got: i64,
+    },
+    #[error("variable {index} ({name}): indices {reason}")]
+    Indices {
+        index: usize,
+        name: String,
+        reason: String,
+    },
+    #[error("variable {index} ({name}): values {reason}")]
+    Values {
+        index: usize,
+        name: String,
+        reason: String,
+    },
+}
+
 struct State {
     delta: Box<dyn Variable>,
 }
@@ -615,8 +710,202 @@ impl Distro {
         ret
     }
 
+    /// Checks one peer's results against the local model, read from the
+    /// model itself: one result per variable, each with the encoded shape and
+    /// `totalk` that variable's own encoding has, indices that decode under
+    /// that `totalk` and stay inside it, in the shape the encoding scatters
+    /// into, and as many finite values or 1-bit signs as indices.
+    ///
+    /// A commitment hash proves a payload is the one its trainer signed, not
+    /// that it fits the model, and `apply` indexes and scatters with what is
+    /// in it (wienerlabs/leviathan-net#41).
+    pub fn check_results(
+        &self,
+        vars: &dyn CausalLM,
+        results: &[DistroResult],
+    ) -> Result<(), DistroResultMismatch> {
+        let expected_count = vars.variables().count();
+        if results.len() != expected_count {
+            return Err(DistroResultMismatch::Count {
+                expected: expected_count,
+                got: results.len(),
+            });
+        }
+        for (index, (var, result)) in vars.variables().zip(results).enumerate() {
+            let name = var.name().to_string();
+            let Some((expected, totalk)) = self.transform.expected_encoding(var.as_ref()) else {
+                return Err(DistroResultMismatch::Unencodable { index, name });
+            };
+            if result.xshape != expected {
+                return Err(DistroResultMismatch::Shape {
+                    index,
+                    name,
+                    expected,
+                    got: result.xshape.clone(),
+                });
+            }
+            if result.totalk != totalk {
+                return Err(DistroResultMismatch::Totalk {
+                    index,
+                    name,
+                    expected: totalk,
+                    got: result.totalk,
+                });
+            }
+            let flat = flattened(&expected);
+            Self::check_sparse(&flat, totalk, result).map_err(|(on_indices, reason)| {
+                match on_indices {
+                    true => DistroResultMismatch::Indices {
+                        index,
+                        name: name.clone(),
+                        reason,
+                    },
+                    false => DistroResultMismatch::Values {
+                        index,
+                        name: name.clone(),
+                        reason,
+                    },
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The sparse half of `check_results`: `Err((true, _))` for the indices,
+    /// `Err((false, _))` for the values. Every tensor operation here is the
+    /// fallible one, because the input is a stranger's.
+    fn check_sparse(
+        flat: &[i64],
+        totalk: i64,
+        result: &DistroResult,
+    ) -> Result<(), (bool, String)> {
+        let numel: i64 = flat.iter().product();
+        let (wire_kind, width) = index_encoding(totalk);
+        let sparse_idx = &result.sparse_idx;
+        let expected_kind = match wire_kind {
+            Kind::Int64 => Kind::Int64,
+            _ => Kind::Uint8,
+        };
+        if sparse_idx.kind() != expected_kind {
+            return Err((
+                true,
+                format!(
+                    "are {:?}, totalk {totalk} sends {:?}",
+                    sparse_idx.kind(),
+                    expected_kind
+                ),
+            ));
+        }
+        let wire_shape = sparse_idx.size();
+        let Some(&wire_last) = wire_shape.last() else {
+            return Err((true, "have no dimensions".to_string()));
+        };
+        if expected_kind == Kind::Uint8 && wire_last % width != 0 {
+            return Err((
+                true,
+                format!("are {wire_last} bytes, not a whole number of {width}-byte indices"),
+            ));
+        }
+        let decoded = match wire_kind {
+            Kind::Uint8 | Kind::Int64 => sparse_idx.shallow_clone(),
+            kind => sparse_idx
+                .f_contiguous()
+                .and_then(|idx| idx.f_view_dtype(kind))
+                .map_err(|error| (true, format!("do not decode: {error}")))?,
+        };
+        let decoded = decoded
+            .f_to_kind(Kind::Int64)
+            .map_err(|error| (true, format!("do not decode: {error}")))?;
+        let shape = decoded.size();
+        let k = *shape.last().expect("checked to have a dimension above");
+        if shape.len() != flat.len() || shape[..shape.len() - 1] != flat[..flat.len() - 1] {
+            return Err((
+                true,
+                format!("have shape {shape:?}, the encoding scatters into {flat:?}"),
+            ));
+        }
+        if k == 0 || k > totalk {
+            return Err((
+                true,
+                format!("number {k} per row, the encoding has {totalk}"),
+            ));
+        }
+        let lowest = decoded
+            .f_min()
+            .and_then(|t| t.f_int64_value(&[]))
+            .map_err(|error| (true, format!("cannot be read: {error}")))?;
+        let highest = decoded
+            .f_max()
+            .and_then(|t| t.f_int64_value(&[]))
+            .map_err(|error| (true, format!("cannot be read: {error}")))?;
+        if lowest < 0 || highest >= totalk {
+            return Err((
+                true,
+                format!("reach {lowest}..={highest}, outside 0..{totalk}"),
+            ));
+        }
+
+        let values = &result.sparse_val;
+        if values.size() != shape {
+            return Err((
+                false,
+                format!("have shape {:?}, the indices {shape:?}", values.size()),
+            ));
+        }
+        match values.kind() {
+            Kind::Bool => Ok(()),
+            Kind::Float | Kind::Double | Kind::Half | Kind::BFloat16 => {
+                // Read in fp32 whatever the local model's dtype, so every node
+                // reaches the same verdict. A value is only usable if it stays
+                // finite through what `apply` does with it: the DCT decode
+                // and, under robust aggregation, sums of squares over the
+                // whole variable. Bounding each value by half the square root
+                // of fp32's range over the variable's size keeps both finite.
+                // Honest values are many orders of magnitude below it.
+                let bound = (f32::MAX / numel as f32).sqrt() / 2.0;
+                let largest = values
+                    .f_to_kind(Kind::Float)
+                    .and_then(|t| t.f_abs())
+                    .and_then(|t| t.f_max())
+                    .and_then(|t| t.f_double_value(&[]))
+                    .map_err(|error| (false, format!("cannot be read: {error}")))?;
+                if largest.is_finite() && largest <= bound as f64 {
+                    Ok(())
+                } else {
+                    Err((
+                        false,
+                        format!("reach {largest:e}, beyond {bound:e} for a variable of {numel} elements"),
+                    ))
+                }
+            }
+            kind => Err((
+                false,
+                format!("are {kind:?}, neither floating point nor 1-bit signs"),
+            )),
+        }
+    }
+
     pub fn apply(&mut self, vars: &dyn CausalLM, results: &[Vec<DistroResult>], lr: f64) {
         let _no_grad = tch::no_grad_guard();
+
+        // Every honest node holds the same model, so every one skips the same
+        // peers and the replicas stay identical. A peer that does not fit is
+        // never indexed, and decoding uses the shapes checked against the
+        // local model, not whatever the first peer sent
+        // (wienerlabs/leviathan-net#41).
+        let results: Vec<&Vec<DistroResult>> = results
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(peer, peer_results)| match self.check_results(vars, peer_results) {
+                    Ok(()) => Some(peer_results),
+                    Err(mismatch) => {
+                        warn!(peer, %mismatch, "skipping DisTrO results that do not fit the model");
+                        None
+                    }
+                },
+            )
+            .collect();
         if results.is_empty() {
             return;
         }
@@ -646,20 +935,18 @@ impl Distro {
                 })
                 .collect::<Vec<_>>();
 
+            // Every accepted peer was checked to carry exactly the local
+            // encoding of this variable, so any of them names it.
+            let xshape = &results[0][index].xshape;
+            let totalk = results[0][index].totalk;
+
             // Decode grad from all nodes
             let decompressed = if robust {
                 let per: Vec<Tensor> = indicies
                     .iter()
                     .zip(values.iter())
                     .map(|(idx, val)| {
-                        CompressDCT::decompress(
-                            idx,
-                            val,
-                            &results[0][index].xshape,
-                            results[0][index].totalk,
-                            val_kind,
-                            device,
-                        )
+                        CompressDCT::decompress(idx, val, xshape, totalk, val_kind, device)
                     })
                     .collect();
                 let shape = per[0].size();
@@ -669,14 +956,7 @@ impl Distro {
                 let center = leviathan_robust_aggregate(&flat, 3.0, 3);
                 center.reshape(shape.as_slice()).to_kind(val_kind)
             } else {
-                CompressDCT::batch_decompress(
-                    &indicies,
-                    &values,
-                    &results[0][index].xshape,
-                    results[0][index].totalk,
-                    val_kind,
-                    device,
-                )
+                CompressDCT::batch_decompress(&indicies, &values, xshape, totalk, val_kind, device)
             };
 
             // Set the gradients!!!
@@ -1137,6 +1417,41 @@ mod tests {
             assert!(idx.equal(&roundtripped_idx));
         }
     }
+    /// `generate` encodes the full, gathered tensor, so on a tensor-parallel
+    /// rank a sharded variable's honest results carry the full encoding, not
+    /// its local shard's (wienerlabs/leviathan-net#41).
+    #[test]
+    fn a_sharded_variable_is_expected_in_its_full_encoding() {
+        let sharded = || -> Box<dyn Variable> {
+            Box::new((
+                "sharded".to_string(),
+                Tensor::zeros([64, 96], (Kind::Float, Device::Cpu)),
+                Some(tch::nn::Shard {
+                    dim: 0,
+                    rank: 0,
+                    world_size: 2,
+                }),
+                None::<std::sync::Arc<crate::Communicator>>,
+            ))
+        };
+        let variable = sharded();
+        assert_eq!(variable.full_tensor_shape(), vec![128, 96]);
+
+        let mut transform = TransformDCT::new(Box::new(vec![sharded()].into_iter()), 64);
+        let (expected, totalk) = transform.expected_encoding(variable.as_ref()).unwrap();
+        let full = Tensor::zeros([128, 96], (Kind::Float, Device::Cpu));
+        let encoded = transform.encode(&full);
+        assert_eq!(encoded.size(), expected);
+        let (_, _, xshape, compressed_totalk) = CompressDCT::compress(&encoded, 8);
+        assert_eq!(xshape, expected);
+        assert_eq!(compressed_totalk, totalk);
+        assert_ne!(
+            transform.encoded_shape(&variable.logical_tensor().size()),
+            Some(expected),
+            "the local shard's shape would expect a different encoding"
+        );
+    }
+
     #[test]
     fn test_1bit_matches_non_quant() {
         set_torch_rng_seed();
