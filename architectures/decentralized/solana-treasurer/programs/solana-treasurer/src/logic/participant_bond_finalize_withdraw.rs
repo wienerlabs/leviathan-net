@@ -10,7 +10,10 @@ use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
+use crate::state::WithdrawalHold;
+use crate::state::WithdrawalStanding;
 use crate::state::coordinator_slashed_points;
+use crate::state::withdrawal_standing;
 
 #[derive(Accounts)]
 #[instruction(params: ParticipantBondFinalizeWithdrawParams)]
@@ -64,7 +67,12 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
     /// the branch that pays an unchecked recipient, and take the whole bounty
     /// itself (wienerlabs/leviathan#15, finding 2). The address is derived here,
     /// so an empty account at it means there really is no verdict.
+    ///
+    /// Writable because a conviction that ran out its windows without reaching
+    /// the ledger is settled here, and recorded as upheld
+    /// (wienerlabs/leviathan-net#36).
     #[account(
+        mut,
         seeds = [
             AuditVerdict::SEEDS_PREFIX,
             run.key().as_ref(),
@@ -91,10 +99,50 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let user_key = context.accounts.user.key();
     let run_key = context.accounts.run.key();
 
-    let participant_slashed_points = coordinator_slashed_points(
-        &*context.accounts.coordinator_account.load()?,
-        &user_key,
-    );
+    // The verdict is read from the account at its own PDA, which the caller
+    // cannot substitute or leave out. An account with no data there is the
+    // only thing that counts as "no verdict".
+    let mut own_verdict = {
+        let info = context.accounts.audit_verdict.to_account_info();
+        let data = info.try_borrow_data()?;
+        AuditVerdict::from_pda_account(info.owner, &data)?
+    };
+
+    let now = Clock::get()?.unix_timestamp;
+    let (participant_slashed_points, slashing_rate, standing) = {
+        let coordinator_account = context.accounts.coordinator_account.load()?;
+        (
+            coordinator_slashed_points(&coordinator_account, &user_key),
+            coordinator_account
+                .state
+                .clients_state
+                .current_epoch_rates
+                .slashing_rate_per_client,
+            withdrawal_standing(
+                &context.accounts.run,
+                &coordinator_account,
+                own_verdict.as_ref(),
+                &user_key,
+                now,
+            ),
+        )
+    };
+
+    // The withdrawal delay is there so a cheater cannot leave between the fraud
+    // and the conviction, and it only works if the conviction can reach the
+    // bond first. It cannot while it is still inside its challenge window or
+    // appeal, or while the epoch it would be charged in is still running:
+    // settling then would find nothing owed and pay the whole bond out
+    // (wienerlabs/leviathan-net#36).
+    let settle_conviction = match standing {
+        WithdrawalStanding::Held(WithdrawalHold::ConvictionPending) => {
+            return err!(ProgramError::ConvictionPending)
+        },
+        WithdrawalStanding::Held(WithdrawalHold::EpochNotSettled) => {
+            return err!(ProgramError::EpochNotSettled)
+        },
+        WithdrawalStanding::Free { settle_conviction } => settle_conviction,
+    };
 
     let participant = &mut context.accounts.participant;
     let run = &mut context.accounts.run;
@@ -105,16 +153,41 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
 
     let unlock_unix_timestamp = participant.bond_withdraw_requested_at
         + participant.bond_withdraw_delay_snapshot;
-    if Clock::get()?.unix_timestamp < unlock_unix_timestamp {
+    if now < unlock_unix_timestamp {
         return err!(ProgramError::WithdrawDelayNotElapsed);
     }
 
     let unsettled_slashed_points =
         participant.unsettled_slashed_points(participant_slashed_points);
-    let forfeited_amount =
-        unsettled_slashed_points.min(participant.bond_amount);
-    participant.bond_settled_slashed_points += forfeited_amount;
-    participant.bond_amount -= forfeited_amount;
+    let ledger_forfeit = unsettled_slashed_points.min(participant.bond_amount);
+    participant.bond_settled_slashed_points += ledger_forfeit;
+    participant.bond_amount -= ledger_forfeit;
+
+    // A conviction that ran out its windows but never reached the ledger, and
+    // now never can, because the participant is not in an epoch that will be
+    // charged: it left, the run halted, or nobody finalised it in time. It is
+    // charged here at the rate the ledger would have charged, so it is neither
+    // lost nor left holding the bond forever, and recorded as upheld so it is
+    // never charged twice. The ledger never saw it, so it is not counted as a
+    // settled point.
+    let conviction_forfeit = if settle_conviction {
+        let forfeit = slashing_rate.min(participant.bond_amount);
+        participant.bond_amount -= forfeit;
+        if let Some(verdict) = own_verdict.as_mut() {
+            verdict.status = VerdictStatus::Upheld;
+            let info = context.accounts.audit_verdict.to_account_info();
+            let mut data = info.try_borrow_mut_data()?;
+            verdict.try_serialize(&mut &mut data[..])?;
+        }
+        msg!(
+            "finalize_withdraw: settled a conviction that never reached the ledger, forfeit {}",
+            forfeit
+        );
+        forfeit
+    } else {
+        0
+    };
+    let forfeited_amount = ledger_forfeit + conviction_forfeit;
 
     let payout_amount = participant
         .bond_withdraw_pending_amount
@@ -138,28 +211,8 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
 
     if bounty_amount > 0 {
-        // The verdict is read from the account at its own PDA, which the caller
-        // cannot substitute or leave out. An account with no data there is the
-        // only thing that counts as "no verdict".
-        let own_verdict = {
-            let info = context.accounts.audit_verdict.to_account_info();
-            if info.data_is_empty() || info.owner != &crate::ID {
-                None
-            } else {
-                Some(AuditVerdict::try_deserialize(
-                    &mut &info.try_borrow_data()?[..],
-                )?)
-            }
-        };
-
         let voters: Vec<Pubkey> = if let Some(verdict) = own_verdict.as_ref() {
-            if verdict.status == VerdictStatus::Upheld
-                && !verdict.appeal_voters.is_empty()
-            {
-                verdict.appeal_voters.clone()
-            } else {
-                verdict.voters.clone()
-            }
+            verdict.bounty_recipients().to_vec()
         } else if let Some(appeal) = context.accounts.appeal_verdict.as_ref() {
             if appeal.run != run_key {
                 return err!(ProgramError::InvalidParameter);

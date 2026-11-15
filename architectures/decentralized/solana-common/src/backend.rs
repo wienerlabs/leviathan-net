@@ -14,6 +14,7 @@ use anchor_client::{
     },
     solana_sdk::{
         account::Account,
+        clock::Clock,
         commitment_config::CommitmentConfig,
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
@@ -571,6 +572,17 @@ impl SolanaBackend {
             coord.rpc().get_balance(&address).await.map_err(Into::into)
         })
         .await
+    }
+
+    /// The cluster's clock, read from the Clock sysvar: the time the programs
+    /// see, not this machine's.
+    pub async fn get_clock(&self) -> Result<Clock> {
+        let clock_sysvar = anchor_client::solana_sdk::sysvar::clock::ID;
+        self.get_account(&clock_sysvar)
+            .await?
+            .ok_or_else(|| anyhow!("the clock sysvar is not readable"))?
+            .deserialize_data::<Clock>()
+            .map_err(|error| anyhow!("Unable to decode the clock sysvar: {error}"))
     }
 
     /// The account at `address` with its owner, or `None` if nothing lives there.

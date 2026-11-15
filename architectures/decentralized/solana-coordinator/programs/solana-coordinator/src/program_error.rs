@@ -77,6 +77,9 @@ pub enum ProgramError {
 
     #[msg("run_id must be 32 bytes or less")]
     RunIdInvalidLength,
+
+    #[msg("Coordinator error: Slash outside an epoch that will be charged")]
+    CoordinatorErrorSlashOutsideEpoch,
 }
 
 impl From<CoordinatorError> for ProgramError {
@@ -115,6 +118,9 @@ impl From<CoordinatorError> for ProgramError {
             },
             CoordinatorError::InvalidSlash => {
                 ProgramError::CoordinatorErrorInvalidSlash
+            },
+            CoordinatorError::SlashOutsideEpoch => {
+                ProgramError::CoordinatorErrorSlashOutsideEpoch
             },
         }
     }

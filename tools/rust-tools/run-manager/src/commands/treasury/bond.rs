@@ -7,7 +7,52 @@ use clap::Args;
 use crate::{SolanaBackend, instructions};
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use psyche_solana_rpc::utils::native_amount_to_ui_amount;
-use psyche_solana_treasurer::state::{Participant, Run, coordinator_slashed_points};
+use anchor_client::solana_sdk::instruction::AccountMeta;
+use psyche_solana_treasurer::state::{
+    AuditVerdict, Participant, Run, VerdictStatus, WithdrawalHold, WithdrawalStanding,
+    coordinator_slashed_points, withdrawal_standing,
+};
+
+/// How `user`'s withdrawal stands, read from chain exactly the way the
+/// treasurer reads it at finalize: the run, its coordinator, `user`'s own audit
+/// verdict, and the cluster clock (wienerlabs/leviathan-net#36). Also returns
+/// the verdict, which names the bounty recipients a settlement pays.
+async fn current_withdrawal_standing(
+    backend: &SolanaBackend,
+    run_address: &Pubkey,
+    run_state: &Run,
+    user: &Pubkey,
+) -> Result<(WithdrawalStanding, Option<AuditVerdict>)> {
+    let coordinator_account = backend
+        .get_coordinator_account(&run_state.coordinator_account)
+        .await?;
+    let verdict_address = psyche_solana_treasurer::find_audit_verdict(run_address, user);
+    let own_verdict = match backend.get_account(&verdict_address).await? {
+        Some(account) => AuditVerdict::from_pda_account(&account.owner, &account.data)
+            .map_err(|error| anyhow!("Unable to decode the audit verdict: {error}"))?,
+        None => None,
+    };
+    let now = backend.get_clock().await?.unix_timestamp;
+    let standing = withdrawal_standing(
+        run_state,
+        &coordinator_account,
+        own_verdict.as_ref(),
+        user,
+        now,
+    );
+    Ok((standing, own_verdict))
+}
+
+fn describe_withdrawal_hold(hold: WithdrawalHold) -> &'static str {
+    match hold {
+        WithdrawalHold::ConvictionPending => {
+            "a conviction against this wallet is still inside its challenge window or appeal; it can be finalized once that closes"
+        },
+        WithdrawalHold::EpochNotSettled => {
+            "this wallet trains in an epoch that has not been charged yet; it can be finalized once the epoch ends"
+        },
+    }
+}
 
 /// What the treasurer will count of this bond, read from chain: a conviction
 /// the bond has not paid yet already holds part of it, and a requested
@@ -139,7 +184,26 @@ impl Command for CommandBondDeposit {
             "Bond amount now: {}",
             native_amount_to_ui_amount(participant.bond_amount, decimals)
         );
-        report_bond_standing(&backend, &run_state, &participant, &user, decimals).await
+        report_bond_standing(&backend, &run_state, &participant, &user, decimals).await?;
+        if participant.bond_withdraw_pending_amount > 0 {
+            match current_withdrawal_standing(&backend, &run_address, &run_state, &user).await?.0 {
+                WithdrawalStanding::Held(hold) => {
+                    println!("Withdrawal: held, {}", describe_withdrawal_hold(hold))
+                },
+                WithdrawalStanding::Free { settle_conviction } => {
+                    println!(
+                        "Withdrawal: not held; finalizable once {} seconds have passed since it was requested",
+                        participant.bond_withdraw_delay_snapshot
+                    );
+                    if settle_conviction {
+                        println!(
+                            "Finalizing settles this wallet's conviction against its bond: it ran out its windows without reaching the ledger"
+                        );
+                    }
+                },
+            }
+        }
+        Ok(())
     }
 }
 
@@ -296,12 +360,47 @@ impl Command for CommandBondWithdrawFinalize {
             .await?
             .decimals;
 
-        let instruction = instructions::treasurer_participant_bond_finalize_withdraw(
+        let (standing, own_verdict) =
+            current_withdrawal_standing(&backend, &run_address, &run_state, &user).await?;
+        let settle_conviction = match standing {
+            WithdrawalStanding::Held(hold) => {
+                return Err(anyhow!(
+                    "The withdrawal is held: {}",
+                    describe_withdrawal_hold(hold)
+                ));
+            },
+            WithdrawalStanding::Free { settle_conviction } => settle_conviction,
+        };
+
+        let mut instruction = instructions::treasurer_participant_bond_finalize_withdraw(
             treasurer_index,
             &run_state.collateral_mint,
             &run_state.coordinator_account,
             &user,
         );
+        // A settlement that forfeits anything pays the bounty to the voters the
+        // verdict names, each through its own collateral account, in the
+        // verdict's order. Settling a conviction here marks it upheld first, so
+        // its recipients are read as upheld.
+        if run_state.slash_bounty_bps > 0 {
+            if let Some(mut verdict) = own_verdict {
+                if settle_conviction {
+                    verdict.status = VerdictStatus::Upheld;
+                }
+                for recipient in verdict.bounty_recipients() {
+                    instruction.accounts.push(AccountMeta::new(
+                        associated_token::get_associated_token_address(
+                            recipient,
+                            &run_state.collateral_mint,
+                        ),
+                        false,
+                    ));
+                }
+            }
+        }
+        if settle_conviction {
+            println!("Settling this wallet's conviction against its bond as part of the withdrawal");
+        }
         let signature = backend
             .send_and_retry("Bond withdraw finalize", &[instruction], &[])
             .await?;

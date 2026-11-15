@@ -13,7 +13,10 @@ use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
 use crate::state::MAX_APPEAL_VOTERS;
+use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
+use crate::state::committee_matches_roster;
+use crate::state::conviction_landing;
 use crate::ProgramError;
 
 #[derive(Accounts)]
@@ -76,7 +79,7 @@ pub fn run_submit_appeal_verdict_processor(
     let appellate_key = context.accounts.appellate.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
-    let quorum = {
+    let (quorum, landing) = {
         let account = context.accounts.coordinator_account.load()?;
 
         // A tie-breaker sits on a bonded bench for the same reason a verifier
@@ -94,6 +97,11 @@ pub fn run_submit_appeal_verdict_processor(
 
         let coordinator = &account.state.coordinator;
 
+        // A seat is only a seat on the roster it was drawn over.
+        if !committee_matches_roster(coordinator) {
+            return err!(ProgramError::CommitteeNotDrawnForRoster);
+        }
+
         let appellate_index = coordinator
             .epoch_state
             .clients
@@ -108,18 +116,16 @@ pub fn run_submit_appeal_verdict_processor(
             return err!(ProgramError::NotTieBreaker);
         }
 
-        let target_client = coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .nth(params.target_index as usize)
-            .ok_or_else(|| error!(ProgramError::TargetMismatch))?;
-        if *target_client.id.signer() != params.target.to_bytes() {
-            return err!(ProgramError::TargetMismatch);
-        }
+        // The bench may sit whenever its seats are drawn, between epochs and
+        // with the target off the roster included: its appeal window runs on
+        // the clock either way. An upheld ruling that cannot eject the target
+        // into an epoch that will charge it is recorded as due instead
+        // (wienerlabs/leviathan-net#36).
+        let landing =
+            conviction_landing(coordinator, &params.target, params.target_index)?;
 
         let tie_breaker_nodes = selection.get_num_tie_breaker_nodes();
-        (2u64 * tie_breaker_nodes).div_ceil(3).max(1)
+        ((2u64 * tie_breaker_nodes).div_ceil(3).max(1), landing)
     };
 
     let should_slash;
@@ -175,9 +181,18 @@ pub fn run_submit_appeal_verdict_processor(
             should_slash = false;
             msg!("appeal_verdict: overturned, verifiers forfeit their bonds");
         } else if (verdict.uphold_count as u64) >= quorum {
-            verdict.status = VerdictStatus::Upheld;
-            should_slash = true;
-            msg!("appeal_verdict: upheld, target slash finalizes");
+            match landing {
+                Landing::Eject(_) => {
+                    verdict.status = VerdictStatus::Upheld;
+                    should_slash = true;
+                    msg!("appeal_verdict: upheld, target slash finalizes");
+                },
+                Landing::Due => {
+                    verdict.status = VerdictStatus::Due;
+                    should_slash = false;
+                    msg!("appeal_verdict: upheld outside a charging epoch, conviction due");
+                },
+            }
         } else {
             should_slash = false;
         }

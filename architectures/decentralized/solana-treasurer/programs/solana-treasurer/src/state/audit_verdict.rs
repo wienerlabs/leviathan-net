@@ -13,6 +13,12 @@ pub enum VerdictStatus {
     Challenged,
     Upheld,
     Overturned,
+    /// The conviction stands, but could not eject the target into an epoch
+    /// that will charge it when it was reached: it was ruled between epochs,
+    /// in a warmup, or with the target off the roster. It lands through
+    /// `run_finalize_slash` once the target is in such an epoch, or is charged
+    /// against the bond when the target withdraws (wienerlabs/leviathan-net#36).
+    Due,
 }
 
 #[account]
@@ -52,6 +58,32 @@ pub struct AuditVerdict {
 
 impl AuditVerdict {
     pub const SEEDS_PREFIX: &'static [u8] = b"AuditVerdict";
+
+    /// Who shares the bounty out of the target's forfeited bond: the
+    /// tie-breakers when an appeal upheld the conviction, otherwise the
+    /// verifiers whose quorum convicted it.
+    pub fn bounty_recipients(&self) -> &[Pubkey] {
+        let stands =
+            matches!(self.status, VerdictStatus::Upheld | VerdictStatus::Due);
+        if stands && !self.appeal_voters.is_empty() {
+            &self.appeal_voters
+        } else {
+            &self.voters
+        }
+    }
+
+    /// The verdict held by the account at a participant's verdict PDA, given
+    /// that account's owner and data. An empty account, or one the treasurer
+    /// does not own, is no verdict.
+    pub fn from_pda_account(
+        owner: &Pubkey,
+        data: &[u8],
+    ) -> Result<Option<AuditVerdict>> {
+        if data.is_empty() || owner != &crate::ID {
+            return Ok(None);
+        }
+        Ok(Some(AuditVerdict::try_deserialize(&mut &data[..])?))
+    }
 
     pub fn space_with_discriminator() -> usize {
         8 + 1 // bump
@@ -97,7 +129,9 @@ impl AuditVerdict {
             VerdictStatus::Overturned => {
                 self.settled_count as usize >= self.voters.len()
             },
-            VerdictStatus::SlashPending | VerdictStatus::Challenged => false,
+            VerdictStatus::SlashPending
+            | VerdictStatus::Challenged
+            | VerdictStatus::Due => false,
         }
     }
 

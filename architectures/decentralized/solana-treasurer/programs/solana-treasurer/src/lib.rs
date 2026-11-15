@@ -268,4 +268,19 @@ pub enum ProgramError {
 
     #[msg("This run is not gated by its own bond; join it through its join authority")]
     RunNotBondGated,
+
+    #[msg("A conviction against this participant is still pending; withdraw once it resolves")]
+    ConvictionPending,
+
+    #[msg("This participant trains in an epoch that has not been charged yet; withdraw after it ends")]
+    EpochNotSettled,
+
+    #[msg("The target is not in an epoch that would charge its conviction yet")]
+    TargetNotInChargingEpoch,
+
+    #[msg("The committee in force was not drawn over the current roster; vote once a round draws one")]
+    CommitteeNotDrawnForRoster,
+
+    #[msg("A run with a challenge window must give its appeals a deadline")]
+    AppealWindowRequired,
 }
