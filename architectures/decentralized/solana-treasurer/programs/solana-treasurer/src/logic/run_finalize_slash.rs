@@ -9,6 +9,8 @@ use psyche_solana_coordinator::SlashClientParams;
 use crate::state::AuditVerdict;
 use crate::state::Run;
 use crate::state::VerdictStatus;
+use crate::state::Landing;
+use crate::state::conviction_landing;
 use crate::ProgramError;
 
 #[derive(Accounts)]
@@ -67,6 +69,15 @@ pub fn run_finalize_slash_processor(
     let appeal_window_seconds = context.accounts.run.appeal_window_seconds;
 
     let target_index = params.target_index;
+    let landing = {
+        let account = context.accounts.coordinator_account.load()?;
+        conviction_landing(
+            &account.state.coordinator,
+            &context.accounts.audit_verdict.target,
+            target_index,
+        )?
+    };
+
     let batch_start;
     let batch_end;
     let committed_hash;
@@ -92,29 +103,30 @@ pub fn run_finalize_slash_processor(
                     return err!(ProgramError::AppealWindowOpen);
                 }
             },
+            // Already standing; it only waits for an epoch that will charge it.
+            VerdictStatus::Due => {},
             _ => return err!(ProgramError::VerdictNotPending),
         }
-        verdict.status = VerdictStatus::Upheld;
+        match landing {
+            Landing::Eject(_) => verdict.status = VerdictStatus::Upheld,
+            // Finalising where no ejection would be charged (between epochs, in
+            // a warmup, or with the target off the roster) used to eject onto a
+            // roster nobody charges and lose the conviction. It is recorded as
+            // due instead, to land in a later epoch or at the target's
+            // withdrawal (wienerlabs/leviathan-net#36).
+            Landing::Due => {
+                if verdict.status == VerdictStatus::Due {
+                    return err!(ProgramError::TargetNotInChargingEpoch);
+                }
+                verdict.status = VerdictStatus::Due;
+                msg!("finalize_slash: target not in a charging epoch, conviction due");
+                return Ok(());
+            },
+        }
         batch_start = verdict.batch_start;
         batch_end = verdict.batch_end;
         committed_hash = verdict.committed_hash;
         replayed_hash = verdict.replayed_hash;
-    }
-
-    {
-        let account = context.accounts.coordinator_account.load()?;
-        let coordinator = &account.state.coordinator;
-        let target_client = coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .nth(target_index as usize)
-            .ok_or_else(|| error!(ProgramError::TargetMismatch))?;
-        if *target_client.id.signer()
-            != context.accounts.audit_verdict.target.to_bytes()
-        {
-            return err!(ProgramError::TargetMismatch);
-        }
     }
 
     let run = &context.accounts.run;

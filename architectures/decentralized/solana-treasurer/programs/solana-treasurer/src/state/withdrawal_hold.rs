@@ -62,7 +62,9 @@ pub fn withdrawal_standing(
     let pending = own_verdict.filter(|verdict| {
         matches!(
             verdict.status,
-            VerdictStatus::SlashPending | VerdictStatus::Challenged
+            VerdictStatus::SlashPending
+                | VerdictStatus::Challenged
+                | VerdictStatus::Due
         )
     });
     if let Some(verdict) = pending {
@@ -70,12 +72,13 @@ pub fn withdrawal_standing(
             VerdictStatus::SlashPending => {
                 now < verdict.pending_since_unix + run.challenge_window_seconds
             },
-            _ => {
+            VerdictStatus::Challenged => {
                 run.appeal_window_seconds == 0
                     || now
                         < verdict.challenged_since_unix
                             + run.appeal_window_seconds
             },
+            _ => false,
         };
         if window_open {
             return WithdrawalStanding::Held(WithdrawalHold::ConvictionPending);

@@ -677,13 +677,27 @@ impl Coordinator {
     ///
     /// Slashed points are charged when an epoch ends: the tick that leaves
     /// `Cooldown` (or ends a warmup that never filled) charges every client the
-    /// epoch ejected. In these states that tick is still to come. In any other
-    /// the last epoch has been charged, even though its roster stays on the
-    /// account until the next epoch's warmup replaces it.
+    /// epoch ejected. In these states that tick may still come, so whatever the
+    /// roster does here may still cost it. In any other the last epoch has been
+    /// charged, even though its roster stays on the account until the next
+    /// epoch's warmup replaces it.
     pub fn charges_pending(&self) -> bool {
         matches!(
             self.run_state,
             RunState::Warmup | RunState::RoundTrain | RunState::RoundWitness | RunState::Cooldown
+        )
+    }
+
+    /// Whether an ejection now is certain to be charged.
+    ///
+    /// From `RoundTrain`, `RoundWitness` and `Cooldown` every way out of the
+    /// epoch passes through `Cooldown`'s end, which charges it, a pending pause
+    /// included. `Warmup` is not one of them: pausing there goes straight to
+    /// `Paused` with no charge at all.
+    pub fn ejections_charged(&self) -> bool {
+        matches!(
+            self.run_state,
+            RunState::RoundTrain | RunState::RoundWitness | RunState::Cooldown
         )
     }
 
@@ -693,13 +707,14 @@ impl Coordinator {
     /// applied. Only a currently participating client can be ejected; anyone who
     /// already withdrew or was ejected is untouched.
     ///
-    /// Only while the epoch is still to be charged. Between epochs the roster of
-    /// the epoch that just ended is still on the account, so an ejection there
-    /// found its client, succeeded, and was never charged: the next warmup
-    /// zeroes the roster, flag and all. A conviction that lands then was lost
-    /// in silence (wienerlabs/leviathan-net#36).
+    /// Only when the ejection is certain to be charged. Between epochs the
+    /// roster of the epoch that just ended is still on the account, so an
+    /// ejection there found its client, succeeded, and was wiped uncharged by
+    /// the next warmup; an ejection in a warmup that was then paused was never
+    /// charged either. A conviction landed that way was lost in silence
+    /// (wienerlabs/leviathan-net#36).
     pub fn eject(&mut self, index: u64) -> std::result::Result<(), CoordinatorError> {
-        if !self.charges_pending() {
+        if !self.ejections_charged() {
             return Err(CoordinatorError::SlashOutsideEpoch);
         }
         let index = index as usize;

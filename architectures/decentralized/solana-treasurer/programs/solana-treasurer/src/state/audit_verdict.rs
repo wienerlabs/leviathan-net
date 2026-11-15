@@ -13,6 +13,12 @@ pub enum VerdictStatus {
     Challenged,
     Upheld,
     Overturned,
+    /// The conviction stands, but could not eject the target into an epoch
+    /// that will charge it when it was reached: it was ruled between epochs,
+    /// in a warmup, or with the target off the roster. It lands through
+    /// `run_finalize_slash` once the target is in such an epoch, or is charged
+    /// against the bond when the target withdraws (wienerlabs/leviathan-net#36).
+    Due,
 }
 
 #[account]
@@ -57,8 +63,9 @@ impl AuditVerdict {
     /// tie-breakers when an appeal upheld the conviction, otherwise the
     /// verifiers whose quorum convicted it.
     pub fn bounty_recipients(&self) -> &[Pubkey] {
-        if self.status == VerdictStatus::Upheld && !self.appeal_voters.is_empty()
-        {
+        let stands =
+            matches!(self.status, VerdictStatus::Upheld | VerdictStatus::Due);
+        if stands && !self.appeal_voters.is_empty() {
             &self.appeal_voters
         } else {
             &self.voters
@@ -122,7 +129,9 @@ impl AuditVerdict {
             VerdictStatus::Overturned => {
                 self.settled_count as usize >= self.voters.len()
             },
-            VerdictStatus::SlashPending | VerdictStatus::Challenged => false,
+            VerdictStatus::SlashPending
+            | VerdictStatus::Challenged
+            | VerdictStatus::Due => false,
         }
     }
 

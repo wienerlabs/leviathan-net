@@ -146,26 +146,33 @@ target's ejection when the epoch ends, and settlement forfeits it when the
 target withdraws (wienerlabs/leviathan-net#36). Three rules keep the first
 step from being skipped:
 
-- **Ejections only land in an epoch that will be charged.** Between epochs the
+- **Ejections only land where the charge is certain.** Between epochs the
   roster of the epoch that just ended is still on the account, so an ejection
-  there used to succeed and was then wiped, uncharged, by the next warmup. The
-  coordinator now refuses it, and verdict and appeal votes are cast during an
-  epoch too. The bench in particular has to be: between epochs it could
-  overturn, which needs no ejection, but never uphold.
+  there used to succeed and was then wiped, uncharged, by the next warmup. A
+  warmup that is paused skips the charge as well. The coordinator now ejects
+  only in `RoundTrain`, `RoundWitness` and `Cooldown`, every exit from which
+  passes through the charge. Votes are still cast whenever the committee is
+  drawn, so the bench can rule between epochs in either direction. A ruling
+  that needs an ejection where none would be charged (an upheld appeal, an
+  immediate quorum, or a finalisation) is recorded as `Due`: the conviction
+  stands and waits to be charged.
 - **A pending conviction holds the bond.** While the target's verdict is inside
   its challenge window or appeal, its withdrawal is held however long ago its
   delay elapsed. Without that, a free challenge was a free exit: open it, let
   the delay run out, and leave with the whole bond. The epoch itself holds the
   bond the same way.
 - **A conviction that can no longer land is settled at the bond.** Once its
-  windows have closed, a conviction finalises through `run_finalize_slash` in
-  any epoch where the target is on the roster. A target that walked away (its
-  epoch ended, the run halted, or it simply never came back) would otherwise
-  hold its bond forever with nothing able to finalise against it. Its
-  withdrawal charges the conviction directly, at the run's slashing rate, pays
-  the convicting verifiers their bounty, and records the verdict as upheld, so
-  it is charged exactly once. For the same reason a run with a challenge window
-  must give appeals a deadline (`appeal_window_seconds > 0`).
+  windows have closed, or once it is `Due`, a conviction finalises through
+  `run_finalize_slash` in any epoch where the target is on the roster and an
+  ejection is certain to be charged. A target that walked away (its epoch
+  ended, the run halted, or it simply never came back) would otherwise hold its
+  bond forever with nothing able to finalise against it. Its withdrawal charges
+  the conviction directly, at the run's slashing rate at that time, pays the
+  bounty to whoever ruled it, and records the verdict as upheld, so it is
+  charged exactly once. For the same reason a run with a challenge window must
+  give appeals a deadline (`appeal_window_seconds > 0`). The windows are read
+  from the run as they stand, so the run authority changing them moves the
+  deadlines of disputes in flight, as it always has.
 
 One refinement remains, optional and priced: an explicit challenge bond so a
 frivolous appeal has a cost of its own. It is additive on top of the shipped

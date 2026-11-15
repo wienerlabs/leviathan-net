@@ -13,7 +13,9 @@ use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
 use crate::state::MAX_VERDICT_VOTERS;
+use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
+use crate::state::conviction_landing;
 use crate::ProgramError;
 
 /// The smallest verifier committee a slash may come out of.
@@ -98,17 +100,8 @@ pub fn run_submit_audit_verdict_processor(
     let verifier_key = context.accounts.verifier.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
-    let (current_epoch, current_round, quorum) = {
+    let (current_epoch, current_round, quorum, landing) = {
         let account = context.accounts.coordinator_account.load()?;
-
-        // A conviction is only worth its slash if the slash is charged, and it
-        // is charged only at the end of an epoch the target trained in. Between
-        // epochs the quorum could not eject anyone the ledger would ever see,
-        // so votes are cast while an epoch is still to be charged
-        // (wienerlabs/leviathan-net#36).
-        if !account.state.coordinator.charges_pending() {
-            return err!(ProgramError::VotingOutsideEpoch);
-        }
 
         // A verdict that turns out wrong is paid for out of this bond, at the
         // epoch boundary after an overturn. So the bond that counts is the one
@@ -171,7 +164,12 @@ pub fn run_submit_audit_verdict_processor(
             .current_round()
             .ok_or_else(|| error!(ProgramError::VerifierNotAssigned))?
             .height;
-        (coordinator.progress.epoch, current_round, quorum)
+        // Where an immediate conviction would land, decided now while the
+        // coordinator is loaded. The target was just checked to be at
+        // `target_index`.
+        let landing =
+            conviction_landing(coordinator, &params.target, params.target_index)?;
+        (coordinator.progress.epoch, current_round, quorum, landing)
     };
 
     let should_slash;
@@ -248,8 +246,21 @@ pub fn run_submit_audit_verdict_processor(
                 should_slash = false;
                 msg!("audit_verdict: quorum reached, slash pending challenge window");
             } else {
-                verdict.status = VerdictStatus::Upheld;
-                should_slash = true;
+                match landing {
+                    Landing::Eject(_) => {
+                        verdict.status = VerdictStatus::Upheld;
+                        should_slash = true;
+                    },
+                    // Reached where no ejection would be charged: the
+                    // conviction stands and is recorded as due, instead of
+                    // ejecting the target onto a roster nobody will charge
+                    // (wienerlabs/leviathan-net#36).
+                    Landing::Due => {
+                        verdict.status = VerdictStatus::Due;
+                        should_slash = false;
+                        msg!("audit_verdict: quorum reached outside a charging epoch, conviction due");
+                    },
+                }
             }
         } else {
             should_slash = false;

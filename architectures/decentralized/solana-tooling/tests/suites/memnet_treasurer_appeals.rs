@@ -69,7 +69,6 @@ use psyche_solana_treasurer::state::WithdrawalHold;
 use psyche_solana_treasurer::state::WithdrawalStanding;
 use psyche_solana_treasurer::ProgramError;
 use psyche_solana_coordinator::coordinator_account_from_bytes;
-use psyche_solana_coordinator::ProgramError as CoordinatorProgramError;
 use solana_sdk::instruction::Instruction;
 
 use super::refusal::refusal_code;
@@ -87,6 +86,14 @@ const APPEAL_WINDOW: i64 = 10_000;
 const EPOCH_TIME: u64 = 300;
 const COMMITTED: [u8; 32] = [0xAA; 32];
 const REPLAYED: [u8; 32] = [0xBB; 32];
+
+struct CommitteeNow {
+    verifiers: Vec<(usize, u64)>,
+    tie_breakers: Vec<(usize, u64)>,
+    trainers: Vec<(usize, u64)>,
+    verifier_quorum: usize,
+    tie_breaker_quorum: usize,
+}
 
 struct AppealsHarness {
     endpoint: ToolboxEndpoint,
@@ -484,9 +491,9 @@ impl AppealsHarness {
     }
 
     /// Every client joins the next epoch with the authorization the run's join
-    /// authority granted it, and the run is driven into its first round, paced
-    /// by the run's own config.
-    async fn rejoin_all_and_start_epoch(&mut self) {
+    /// authority granted it, and the run is ticked into that epoch's warmup,
+    /// paced by the run's own config.
+    async fn rejoin_all(&mut self) {
         for client_idx in 0..self.clients.len() {
             let client = self.clients[client_idx].insecure_clone();
             let authorization = find_authorization(
@@ -506,32 +513,45 @@ impl AppealsHarness {
             .await
             .unwrap();
         }
-        let config = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
+        // The last join already ticks the run into its warmup once enough
+        // clients are pending; tick it there otherwise.
+        for _ in 0..8 {
+            match self.run_state().await {
+                RunState::Warmup => return,
+                RunState::WaitingForMembers => {
+                    let config = self.config().await;
+                    self.tick_after(config.waiting_for_members_extra_time as u64).await;
+                },
+                other => panic!("the run left for {other} instead of its warmup"),
+            }
+        }
+        panic!("the run never reached its warmup");
+    }
+
+    /// As `rejoin_all`, and on through the warmup into the first round.
+    async fn rejoin_all_and_start_epoch(&mut self) {
+        self.rejoin_all().await;
+        let config = self.config().await;
+        self.tick_after(config.warmup_time).await;
+        assert_eq!(self.run_state().await, RunState::RoundTrain);
+    }
+
+    async fn config(&mut self) -> CoordinatorConfig {
+        get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
             .await
             .unwrap()
             .unwrap()
             .coordinator
-            .config;
-        for seconds in [config.waiting_for_members_extra_time as u64, config.warmup_time] {
-            self.endpoint
-                .forward_clock_unix_timestamp(seconds)
-                .await
-                .unwrap();
-            process_coordinator_tick(
-                &mut self.endpoint,
-                &self.payer,
-                &self.ticker,
-                &self.coordinator_instance,
-                &self.coordinator_account,
-            )
-            .await
-            .unwrap();
-        }
-        let state = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
+            .config
+    }
+
+    async fn run_state(&mut self) -> RunState {
+        get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
             .await
             .unwrap()
-            .unwrap();
-        assert_eq!(state.coordinator.run_state, RunState::RoundTrain);
+            .unwrap()
+            .coordinator
+            .run_state
     }
 
     async fn tick_after(&mut self, seconds: u64) {
@@ -554,13 +574,37 @@ impl AppealsHarness {
     /// witness reports the roster each round, so the clients finish Healthy and
     /// the ended epoch's roster stays on the account into `WaitingForMembers`.
     async fn finish_epoch_with_witnesses(&mut self) {
-        let start = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
+        let start = self.epoch().await;
+        self.advance_with_witnesses(|coordinator| {
+            coordinator.progress.epoch > start
+                && coordinator.run_state == RunState::WaitingForMembers
+        })
+        .await;
+    }
+
+    /// Runs the epoch the same way up to its `Cooldown`, the last state in
+    /// which its ejections are charged. The committee drawn for the last round
+    /// is still the one in force there, and stays in force into
+    /// `WaitingForMembers` until the next epoch's first round draws another.
+    async fn advance_to_cooldown_with_witnesses(&mut self) {
+        self.advance_with_witnesses(|coordinator| coordinator.run_state == RunState::Cooldown)
+            .await;
+    }
+
+    async fn epoch(&mut self) -> u16 {
+        get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
             .await
             .unwrap()
             .unwrap()
             .coordinator
             .progress
-            .epoch;
+            .epoch
+    }
+
+    async fn advance_with_witnesses<F>(&mut self, done: F)
+    where
+        F: Fn(&psyche_coordinator::Coordinator) -> bool,
+    {
         for _ in 0..1_000 {
             let state = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
                 .await
@@ -568,9 +612,7 @@ impl AppealsHarness {
                 .unwrap();
             let coordinator = state.coordinator;
             let config = coordinator.config;
-            if coordinator.progress.epoch > start
-                && coordinator.run_state == RunState::WaitingForMembers
-            {
+            if done(&coordinator) {
                 return;
             }
             match coordinator.run_state {
@@ -633,7 +675,134 @@ impl AppealsHarness {
                 halted => panic!("the run halted in {halted}"),
             }
         }
-        panic!("epoch {start} never ended");
+        panic!("the run never got where it was driven");
+    }
+
+    /// The committee in force for the current round, as harness indices:
+    /// verifiers, tie-breakers and trainers, with the two quorums the treasurer
+    /// will require.
+    async fn committee_now(&mut self) -> CommitteeNow {
+        let state = get_coordinator_account_state(&mut self.endpoint, &self.coordinator_account)
+            .await
+            .unwrap()
+            .unwrap();
+        // The tie-breaker count is the run's, as the treasurer reads it.
+        let tie_breakers = get_run(&mut self.endpoint, &self.run)
+            .await
+            .unwrap()
+            .unwrap()
+            .tie_breaker_committee_size;
+        let selection = CommitteeSelection::from_coordinator_with_tie_breakers(
+            &state.coordinator,
+            0,
+            tie_breakers,
+        )
+        .unwrap();
+        let mut committee = CommitteeNow {
+            verifiers: vec![],
+            tie_breakers: vec![],
+            trainers: vec![],
+            verifier_quorum: (2 * selection.get_num_verifier_nodes()).div_ceil(3).max(2) as usize,
+            tie_breaker_quorum: (2 * selection.get_num_tie_breaker_nodes()).div_ceil(3).max(1)
+                as usize,
+        };
+        for (index, client) in state.coordinator.epoch_state.clients.iter().enumerate() {
+            let Some(client_idx) = self
+                .clients
+                .iter()
+                .position(|k| k.pubkey().to_bytes() == *client.id.signer())
+            else {
+                continue;
+            };
+            match selection.get_committee(index as u64).committee {
+                Committee::Verifier => committee.verifiers.push((client_idx, index as u64)),
+                Committee::TieBreaker => committee.tie_breakers.push((client_idx, index as u64)),
+                Committee::Trainer => committee.trainers.push((client_idx, index as u64)),
+            }
+        }
+        committee
+    }
+
+    /// `voter` votes to convict `target`, a client at roster index
+    /// `target_index`, with the suite's evidence.
+    async fn convict_by(&mut self, voter: usize, target: usize, target_index: u64) -> anyhow::Result<()> {
+        let verifier = self.clients[voter].insecure_clone();
+        let target_key = self.clients[target].pubkey();
+        process_treasurer_run_submit_audit_verdict(
+            &mut self.endpoint,
+            &self.payer,
+            &verifier,
+            &self.run,
+            &self.coordinator_account,
+            &self.run_id,
+            &target_key,
+            target_index,
+            0,
+            4,
+            COMMITTED,
+            REPLAYED,
+        )
+        .await
+    }
+
+    /// `appellate` rules on `target`'s appeal.
+    async fn rule_by(
+        &mut self,
+        appellate: usize,
+        target: usize,
+        target_index: u64,
+        overturn: bool,
+    ) -> anyhow::Result<()> {
+        let appellate = self.clients[appellate].insecure_clone();
+        let target_key = self.clients[target].pubkey();
+        process_treasurer_run_submit_appeal_verdict(
+            &mut self.endpoint,
+            &self.payer,
+            &appellate,
+            &self.run,
+            &self.coordinator_account,
+            &self.run_id,
+            &target_key,
+            target_index,
+            overturn,
+        )
+        .await
+    }
+
+    async fn verdict_status_of(&mut self, target: usize) -> VerdictStatus {
+        let key = self.clients[target].pubkey();
+        let account = self
+            .endpoint
+            .get_account(&find_audit_verdict(&self.run, &key))
+            .await
+            .unwrap()
+            .unwrap();
+        AuditVerdict::from_pda_account(&account.owner, &account.data)
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    async fn finalize_withdraw_paying(
+        &mut self,
+        client_idx: usize,
+        recipients: &[usize],
+    ) -> anyhow::Result<()> {
+        let client = self.clients[client_idx].insecure_clone();
+        let collateral = self.clients_collateral[client_idx];
+        let recipient_collaterals: Vec<Pubkey> =
+            recipients.iter().map(|i| self.clients_collateral[*i]).collect();
+        process_treasurer_participant_bond_finalize_withdraw_with_voters(
+            &mut self.endpoint,
+            &self.payer,
+            &client,
+            &collateral,
+            &self.collateral_mint,
+            &self.run,
+            &self.coordinator_account,
+            &recipient_collaterals,
+        )
+        .await
     }
 
     /// Where `key` sits in the current epoch's roster.
@@ -1432,10 +1601,9 @@ pub async fn an_overturned_target_leaves_with_its_whole_bond() {
     assert_eq!(h.collateral_of(target_idx).await - before, BOND);
 }
 
-/// A conviction finalised between epochs would be ejected onto the ended
-/// epoch's roster and never charged. The coordinator refuses that ejection, so
-/// the conviction stays due, and the target's withdrawal settles it against the
-/// bond instead (wienerlabs/leviathan-net#36).
+/// A conviction finalised between epochs used to be ejected onto the ended
+/// epoch's roster and never charged. It is recorded as due instead, and the
+/// target's withdrawal settles it against the bond (wienerlabs/leviathan-net#36).
 #[tokio::test]
 pub async fn a_conviction_finalised_after_its_epoch_still_reaches_the_bond() {
     let mut h = setup("Leviathan appeals late finalise", 101).await;
@@ -1450,11 +1618,35 @@ pub async fn a_conviction_finalised_after_its_epoch_still_reaches_the_bond() {
         .await
         .unwrap();
 
+    process_treasurer_run_finalize_slash(
+        &mut h.endpoint,
+        &h.payer,
+        &h.run,
+        &h.coordinator_account,
+        &h.run_id,
+        &target_key,
+        h.target_index,
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.verdict_status().await, VerdictStatus::Due);
+    assert_eq!(
+        h.client_state(&target_key).await,
+        Some(ClientState::Healthy),
+        "the target was ejected onto a roster nobody will charge"
+    );
+    // Nothing more can land between epochs. Sent by another payer, so it is a
+    // transaction of its own and not a replay of the first.
+    let keeper = Keypair::new();
+    h.endpoint
+        .request_airdrop(&keeper.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
     assert_eq!(
         refusal_code(
             process_treasurer_run_finalize_slash(
                 &mut h.endpoint,
-                &h.payer,
+                &keeper,
                 &h.run,
                 &h.coordinator_account,
                 &h.run_id,
@@ -1463,10 +1655,12 @@ pub async fn a_conviction_finalised_after_its_epoch_still_reaches_the_bond() {
             )
             .await
         ),
-        u32::from(CoordinatorProgramError::CoordinatorErrorSlashOutsideEpoch),
-        "an ejection between epochs would never be charged"
+        treasurer_refusal(ProgramError::TargetNotInChargingEpoch),
     );
-    assert_eq!(h.verdict_status().await, VerdictStatus::SlashPending);
+    assert_eq!(
+        h.observed_standing(target_idx).await,
+        WithdrawalStanding::Free { settle_conviction: true }
+    );
 
     h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
     let before = h.collateral_of(target_idx).await;
@@ -1475,43 +1669,197 @@ pub async fn a_conviction_finalised_after_its_epoch_still_reaches_the_bond() {
     assert_eq!(h.verdict_status().await, VerdictStatus::Upheld);
 }
 
-/// A verdict is cast while an epoch is still to be charged: a quorum completed
-/// between epochs could not eject anyone the ledger would ever see
+/// The bench sits whenever its seats are drawn, between epochs too, so an
+/// innocent target's appeal window is not spent waiting for an epoch: a bench
+/// that overturns between epochs clears it, and it leaves with its whole bond
 /// (wienerlabs/leviathan-net#36).
 #[tokio::test]
-pub async fn verdict_votes_wait_for_an_epoch() {
-    let mut h = setup("Leviathan appeals late verdict", 103).await;
-    let (first, _) = h.verifiers[0];
-    let (second, _) = h.verifiers[1];
-    h.cast_verdict(first).await.unwrap();
-    h.finish_epoch_with_witnesses().await;
-    assert_eq!(
-        refusal_code(h.cast_verdict(second).await),
-        treasurer_refusal(ProgramError::VotingOutsideEpoch),
-    );
-}
-
-/// The bench is held to the same epoch, on both sides: between epochs it could
-/// otherwise only ever clear, since upholding needs an ejection and
-/// overturning does not (wienerlabs/leviathan-net#36).
-#[tokio::test]
-pub async fn appeal_votes_wait_for_an_epoch() {
-    let mut h = setup("Leviathan appeals late bench", 106).await;
-    let target = h.clients[h.target_client_idx].insecure_clone();
-    h.reach_verifier_quorum().await;
-    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
+pub async fn the_bench_can_overturn_between_epochs() {
+    let mut h = setup("Leviathan appeals late overturn", 103).await;
+    h.advance_to_cooldown_with_witnesses().await;
+    let committee = h.committee_now().await;
+    let (target, target_index) = committee.trainers[0];
+    h.request_withdraw(target, BOND).await;
+    for (voter, _) in committee.verifiers.iter().take(committee.verifier_quorum) {
+        h.convict_by(*voter, target, target_index).await.unwrap();
+    }
+    let target_wallet = h.clients[target].insecure_clone();
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target_wallet, &h.run)
         .await
         .unwrap();
     h.finish_epoch_with_witnesses().await;
 
-    let (tie_breaker, _) = h.tie_breakers[0];
-    for overturn in [true, false] {
-        assert_eq!(
-            refusal_code(h.cast_appeal(tie_breaker, overturn).await),
-            treasurer_refusal(ProgramError::VotingOutsideEpoch),
-        );
+    for (appellate, _) in committee.tie_breakers.iter().take(committee.tie_breaker_quorum) {
+        h.rule_by(*appellate, target, target_index, true).await.unwrap();
     }
-    assert_eq!(h.verdict_status().await, VerdictStatus::Challenged);
+    assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Overturned);
+
+    h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    let before = h.collateral_of(target).await;
+    h.try_finalize_withdraw(target).await.unwrap();
+    assert_eq!(h.collateral_of(target).await - before, BOND);
+}
+
+/// A bench that upholds between epochs cannot eject the target into an epoch
+/// that will charge it, so the conviction is recorded as due rather than lost
+/// on the ended epoch's roster, and the target's withdrawal settles it, paying
+/// the tie-breakers who ruled (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn an_appeal_upheld_between_epochs_settles_at_withdrawal() {
+    let mut h = setup("Leviathan appeals late uphold", 106).await;
+    h.advance_to_cooldown_with_witnesses().await;
+    let committee = h.committee_now().await;
+    let (target, target_index) = committee.trainers[0];
+    let target_key = h.clients[target].pubkey();
+    h.request_withdraw(target, BOND).await;
+    for (voter, _) in committee.verifiers.iter().take(committee.verifier_quorum) {
+        h.convict_by(*voter, target, target_index).await.unwrap();
+    }
+    let target_wallet = h.clients[target].insecure_clone();
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target_wallet, &h.run)
+        .await
+        .unwrap();
+    h.finish_epoch_with_witnesses().await;
+
+    let bench: Vec<usize> = committee
+        .tie_breakers
+        .iter()
+        .take(committee.tie_breaker_quorum)
+        .map(|(i, _)| *i)
+        .collect();
+    for appellate in &bench {
+        h.rule_by(*appellate, target, target_index, false).await.unwrap();
+    }
+    assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Due);
+    assert_eq!(h.client_state(&target_key).await, Some(ClientState::Healthy));
+
+    h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    assert_eq!(
+        h.observed_standing(target).await,
+        WithdrawalStanding::Free { settle_conviction: true }
+    );
+    let mut bench_before = vec![];
+    for appellate in &bench {
+        bench_before.push(h.collateral_of(*appellate).await);
+    }
+    let before = h.collateral_of(target).await;
+    h.finalize_withdraw_paying(target, &bench).await.unwrap();
+    assert_eq!(h.collateral_of(target).await - before, BOND - SLASHING_RATE);
+    assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Upheld);
+    let share =
+        (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64 / bench.len() as u64;
+    for (appellate, before) in bench.iter().zip(bench_before) {
+        assert_eq!(h.collateral_of(*appellate).await - before, share);
+    }
+}
+
+/// With no challenge window a quorum convicts at once. Reached between epochs
+/// it cannot eject the target into a charged epoch, so it is recorded as due
+/// and settled at the target's withdrawal (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn a_verdict_quorum_reached_between_epochs_is_due() {
+    let mut h = setup("Leviathan appeals late quorum", 107).await;
+    let main_authority = h.main_authority.insecure_clone();
+    process_treasurer_run_set_challenge_config(
+        &mut h.endpoint,
+        &h.payer,
+        &main_authority,
+        &h.run,
+        0,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+    h.finish_epoch_with_witnesses().await;
+    let committee = h.committee_now().await;
+    let (target, target_index) = committee.trainers[0];
+    let target_key = h.clients[target].pubkey();
+    h.request_withdraw(target, BOND).await;
+    let voters: Vec<usize> = committee
+        .verifiers
+        .iter()
+        .take(committee.verifier_quorum)
+        .map(|(i, _)| *i)
+        .collect();
+    for voter in &voters {
+        h.convict_by(*voter, target, target_index).await.unwrap();
+    }
+    assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Due);
+    assert_eq!(h.client_state(&target_key).await, Some(ClientState::Healthy));
+
+    h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    let before = h.collateral_of(target).await;
+    h.finalize_withdraw_paying(target, &voters).await.unwrap();
+    assert_eq!(h.collateral_of(target).await - before, BOND - SLASHING_RATE);
+}
+
+/// A conviction finalised in a warmup is not ejected, because pausing a warmup
+/// skips the charge, so a pause there cannot shed it: it stays due and the
+/// target's withdrawal from the paused run settles it
+/// (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn a_paused_warmup_cannot_shed_a_conviction() {
+    let mut h = setup("Leviathan appeals paused warmup", 108).await;
+    let target_idx = h.target_client_idx;
+    let target_key = h.target_key;
+    h.request_withdraw(target_idx, BOND).await;
+    h.reach_verifier_quorum().await;
+    h.settle_epoch().await;
+    h.endpoint
+        .forward_clock_unix_timestamp((CHALLENGE_WINDOW + 5) as u64)
+        .await
+        .unwrap();
+
+    h.rejoin_all().await;
+    assert_eq!(
+        h.observed_standing(target_idx).await,
+        WithdrawalStanding::Held(WithdrawalHold::EpochNotSettled)
+    );
+    let target_index = h.roster_index_of(&target_key).await;
+    process_treasurer_run_finalize_slash(
+        &mut h.endpoint,
+        &h.payer,
+        &h.run,
+        &h.coordinator_account,
+        &h.run_id,
+        &target_key,
+        target_index,
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.verdict_status().await, VerdictStatus::Due);
+    assert_eq!(h.client_state(&target_key).await, Some(ClientState::Healthy));
+
+    let main_authority = h.main_authority.insecure_clone();
+    process_treasurer_run_update(
+        &mut h.endpoint,
+        &h.payer,
+        &main_authority,
+        &h.run,
+        &h.coordinator_instance,
+        &h.coordinator_account,
+        RunUpdateParams {
+            metadata: None,
+            config: None,
+            model: None,
+            progress: None,
+            epoch_earning_rate_total_shared: None,
+            epoch_slashing_rate_per_client: None,
+            paused: Some(true),
+            client_version: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.run_state().await, RunState::Paused);
+    assert_eq!(
+        h.observed_standing(target_idx).await,
+        WithdrawalStanding::Free { settle_conviction: true }
+    );
+    let before = h.collateral_of(target_idx).await;
+    h.finalize_target_withdrawal().await.unwrap();
+    assert_eq!(h.collateral_of(target_idx).await - before, BOND - SLASHING_RATE);
 }
 
 /// A losing verifier cannot be ejected between epochs either: the crank keeps

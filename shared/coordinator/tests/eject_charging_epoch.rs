@@ -17,21 +17,39 @@ fn coordinator_in(run_state: RunState) -> Box<Coordinator> {
 }
 
 #[test]
-fn an_ejection_lands_while_the_epoch_is_still_to_be_charged() {
+fn an_ejection_lands_where_it_is_certain_to_be_charged() {
     for run_state in [
-        RunState::Warmup,
         RunState::RoundTrain,
         RunState::RoundWitness,
         RunState::Cooldown,
     ] {
         let mut coordinator = coordinator_in(run_state);
         assert!(coordinator.charges_pending(), "{run_state}");
+        assert!(coordinator.ejections_charged(), "{run_state}");
         coordinator.eject(0).unwrap();
         assert_eq!(
             coordinator.epoch_state.clients[0].state,
             ClientState::Ejected
         );
     }
+}
+
+#[test]
+fn an_ejection_in_a_warmup_is_refused_though_the_epoch_is_still_to_be_charged() {
+    // A warmup that is paused goes straight to `Paused`, never through the
+    // charge, so an ejection there could be lost. The roster's charges are
+    // still to come, which is what holds its bonds, but no ejection lands yet.
+    let mut coordinator = coordinator_in(RunState::Warmup);
+    assert!(coordinator.charges_pending());
+    assert!(!coordinator.ejections_charged());
+    assert!(matches!(
+        coordinator.eject(0),
+        Err(CoordinatorError::SlashOutsideEpoch)
+    ));
+    assert_eq!(
+        coordinator.epoch_state.clients[0].state,
+        ClientState::Healthy
+    );
 }
 
 #[test]
@@ -46,6 +64,7 @@ fn an_ejection_between_epochs_is_refused() {
     ] {
         let mut coordinator = coordinator_in(run_state);
         assert!(!coordinator.charges_pending(), "{run_state}");
+        assert!(!coordinator.ejections_charged(), "{run_state}");
         assert!(matches!(
             coordinator.eject(0),
             Err(CoordinatorError::SlashOutsideEpoch)
