@@ -16,7 +16,6 @@ use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::WAITING_FOR_MEMBERS_EXTRA_SECONDS;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
@@ -39,7 +38,19 @@ use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
+use psyche_solana_tooling::get_accounts::get_run;
 use solana_sdk::signer::Signer;
+
+use super::signed_payload::fixture;
+use super::signed_payload::identity;
+use super::signed_payload::keep_reference;
+use super::signed_payload::keep_signed_payload;
+use super::signed_payload::payload_digest;
+use super::signed_payload::payload_header;
+use psyche_solana_treasurer::find_audit_verdict;
+use psyche_solana_treasurer::state::AuditVerdict;
+use super::signed_payload::FRAUD_PAYLOAD;
+use super::signed_payload::HONEST_PAYLOAD;
 
 const RUN_ID: &str = "Leviathan daemon committee";
 const BOND: u64 = 500;
@@ -50,14 +61,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
-}
-
-fn place_fixture(dir: &PathBuf, fixture: &str, committer: &str) {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/daemon")
-        .join(fixture);
-    let name = format!("result-{committer}-step1-batchB[0, 1].vec-postcard");
-    fs::copy(source, dir.join(name)).unwrap();
 }
 
 #[tokio::test]
@@ -75,6 +78,7 @@ pub async fn run() {
     let join_authority = Keypair::new();
     let ticker = Keypair::new();
     let clients: Vec<Keypair> = (0..6).map(|_| Keypair::new()).collect();
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let warmup_time = 10;
 
     for client in &clients {
@@ -208,7 +212,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -234,7 +238,7 @@ pub async fn run() {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
@@ -298,11 +302,41 @@ pub async fn run() {
     let target_key = target.expect("no trainer target found");
     assert!(verifiers.len() as u64 >= quorum);
 
-    let target_committer = target_key.to_string();
+    // The target's payload for the batch it was assigned in the round under
+    // way, kept with what it signed for it, and the honest result for that
+    // batch the verifiers compare it to.
+    let target = clients
+        .iter()
+        .position(|k| k.pubkey() == target_key)
+        .unwrap();
+    let tie_breakers = get_run(&mut endpoint, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .tie_breaker_committee_size;
+    let header = payload_header(
+        &state.coordinator,
+        tie_breakers,
+        &identity(&clients[target], &p2ps[target]),
+    );
+    // The run every commitment here is made in, as the coordinator names it.
+    let run_id = String::from(&state.coordinator.run_id);
     let submitted_dir = scratch("submitted");
     let reference_dir = scratch("reference");
-    place_fixture(&reference_dir, "honest.vec-postcard", &target_committer);
-    place_fixture(&submitted_dir, "fraud.vec-postcard", &target_committer);
+    keep_reference(
+        &reference_dir,
+        &fixture(HONEST_PAYLOAD),
+        &clients[target],
+        header,
+    );
+    let kept = keep_signed_payload(
+        &submitted_dir,
+        &fixture(FRAUD_PAYLOAD),
+        &clients[target],
+        &p2ps[target],
+        &run_id,
+        header,
+    );
 
     let config = AuditConfig {
         run_id: RUN_ID.to_string(),
@@ -376,6 +410,38 @@ pub async fn run() {
         target_state_after,
         Some(ClientState::Ejected),
         "the quorum verdict ejects the target"
+    );
+
+    // What the chain recorded is what the target signed: the record kept with
+    // its payload, whose results digest is the sha256 of the dump itself
+    // (wienerlabs/leviathan-net#43).
+    let record = psyche_network::CommitmentRecord::from_bytes(
+        &fs::read(psyche_network::commitment_record_path(&kept)).unwrap(),
+    )
+    .unwrap();
+    let verdict_account = endpoint
+        .get_account(&find_audit_verdict(&run, &target_key))
+        .await
+        .unwrap()
+        .unwrap();
+    let verdict = AuditVerdict::from_pda_account(
+        &verdict_account.owner,
+        &verdict_account.data,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(verdict.committed_hash, record.data_hash);
+    assert_eq!(
+        (verdict.evidence.step, verdict.evidence.trainer_nonce),
+        (record.step, record.trainer_nonce)
+    );
+    assert_eq!(
+        (verdict.batch_start, verdict.batch_end),
+        (record.batch_id.0.start, record.batch_id.0.end)
+    );
+    assert_eq!(
+        verdict.evidence.results_digest,
+        payload_digest(FRAUD_PAYLOAD)
     );
 
     let mut target_slashed = 0;

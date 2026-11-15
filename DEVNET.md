@@ -62,6 +62,13 @@ cannot be read by the new ones. The old deployment's upgrade authority
 programs were redeployed under ids this repository controls rather than upgraded
 in place. The previous deployment and its runs are abandoned, not migrated.
 
+The same holds for the next deployment. A verdict now records the payload the
+target signed (`AuditVerdict::evidence`). Convictions also carry a new account,
+the instructions sysvar, and require the target's signature in the same
+transaction (wienerlabs/leviathan-net#43). So verdicts written by the current
+programs cannot be read by the next ones, and a client built from this
+repository cannot convict through the current programs.
+
 ## Run a node
 
 If you have nothing set up yet, one line fetches everything, checks your

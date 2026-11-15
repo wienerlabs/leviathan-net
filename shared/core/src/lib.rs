@@ -14,6 +14,7 @@ mod interval_tree;
 mod lcg;
 mod merkle_tree;
 mod node_identity;
+mod payload_commitment;
 mod running_average;
 mod serde_utils;
 mod sha256;
@@ -41,6 +42,9 @@ pub use interval_tree::{ClosedInterval, IntervalTree};
 pub use lcg::LCG;
 pub use merkle_tree::{HashWrapper as MerkleRoot, MerkleTree, OwnedProof, Proof};
 pub use node_identity::NodeIdentity;
+pub use payload_commitment::{
+    PAYLOAD_COMMITMENT_DOMAIN, payload_commitment_hash, payload_commitment_run,
+};
 pub use running_average::RunningAverage;
 pub use serde_utils::{
     serde_deserialize_optional_string, serde_deserialize_string, serde_deserialize_vec_to_array,

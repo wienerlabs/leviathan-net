@@ -11,13 +11,13 @@ use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::WAITING_FOR_MEMBERS_EXTRA_SECONDS;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
+use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
@@ -36,14 +36,18 @@ use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
+use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use solana_sdk::signer::Signer;
+
+use super::signed_payload::identity;
+use super::signed_payload::replayed_digest;
+use super::signed_payload::signed_payload;
+use super::signed_payload::FRAUD_PAYLOAD;
 
 const RUN_ID: &str = "Leviathan committee slash";
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
 const BOUNTY_BPS: u16 = 5_000;
-const COMMITTED: [u8; 32] = [0xAA; 32];
-const REPLAYED: [u8; 32] = [0xBB; 32];
 
 #[tokio::test]
 pub async fn run() {
@@ -60,6 +64,7 @@ pub async fn run() {
     let join_authority = Keypair::new();
     let ticker = Keypair::new();
     let clients: Vec<Keypair> = (0..6).map(|_| Keypair::new()).collect();
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let warmup_time = 10;
 
     let collateral_mint = endpoint
@@ -198,7 +203,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -224,7 +229,7 @@ pub async fn run() {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
@@ -287,6 +292,22 @@ pub async fn run() {
     }
 
     let (target_key, target_index) = target.expect("no trainer target found");
+    let cheater = clients
+        .iter()
+        .position(|k| k.pubkey() == target_key)
+        .unwrap();
+    let tie_breakers = get_run(&mut endpoint, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .tie_breaker_committee_size;
+    let commitment = signed_payload(
+        &state.coordinator,
+        tie_breakers,
+        &identity(&clients[cheater], &p2ps[cheater]),
+        &p2ps[cheater],
+        FRAUD_PAYLOAD,
+    );
     assert!(
         verifiers.len() as u64 >= quorum,
         "not enough verifiers ({}) for quorum {}",
@@ -295,9 +316,18 @@ pub async fn run() {
     );
 
     for (verifier, _) in verifiers.iter().take((quorum - 1) as usize) {
-        cast_verdict(&mut endpoint, &payer, verifier, &run, &coordinator_account, &target_key, target_index)
-            .await
-            .unwrap();
+        cast_verdict(
+            &mut endpoint,
+            &payer,
+            verifier,
+            &run,
+            &coordinator_account,
+            &target_key,
+            target_index,
+            &commitment,
+        )
+        .await
+        .unwrap();
     }
 
     let mid = get_coordinator_account_state(&mut endpoint, &coordinator_account)
@@ -321,21 +351,53 @@ pub async fn run() {
         .iter()
         .find(|k| k.pubkey() == target_key)
         .expect("target is a trainer, use it as the non-verifier");
-    cast_verdict(&mut endpoint, &payer, non_verifier, &run, &coordinator_account, &target_key, target_index)
-        .await
-        .expect_err("a non-verifier must be rejected");
+    cast_verdict(
+        &mut endpoint,
+        &payer,
+        non_verifier,
+        &run,
+        &coordinator_account,
+        &target_key,
+        target_index,
+        &commitment,
+    )
+    .await
+    .expect_err("a non-verifier must be rejected");
 
-    cast_verdict(&mut endpoint, &payer, verifiers[0].0, &run, &coordinator_account, &target_key, target_index)
-        .await
-        .expect_err("a duplicate verdict must be rejected");
+    cast_verdict(
+        &mut endpoint,
+        &payer,
+        verifiers[0].0,
+        &run,
+        &coordinator_account,
+        &target_key,
+        target_index,
+        &commitment,
+    )
+    .await
+    .expect_err("a duplicate verdict must be rejected");
 
     let unbonded = Keypair::new();
-    process_treasurer_participant_create(&mut endpoint, &payer, &unbonded, &run)
-        .await
-        .unwrap();
-    cast_verdict(&mut endpoint, &payer, &unbonded, &run, &coordinator_account, &target_key, target_index)
-        .await
-        .expect_err("an unbonded verifier must be rejected before it can vote");
+    process_treasurer_participant_create(
+        &mut endpoint,
+        &payer,
+        &unbonded,
+        &run,
+    )
+    .await
+    .unwrap();
+    cast_verdict(
+        &mut endpoint,
+        &payer,
+        &unbonded,
+        &run,
+        &coordinator_account,
+        &target_key,
+        target_index,
+        &commitment,
+    )
+    .await
+    .expect_err("an unbonded verifier must be rejected before it can vote");
 
     cast_verdict(
         &mut endpoint,
@@ -345,6 +407,7 @@ pub async fn run() {
         &coordinator_account,
         &target_key,
         target_index,
+        &commitment,
     )
     .await
     .unwrap();
@@ -477,6 +540,7 @@ async fn cast_verdict(
     coordinator_account: &Pubkey,
     target: &Pubkey,
     target_index: u64,
+    commitment: &SignedCommitment,
 ) -> anyhow::Result<()> {
     process_treasurer_run_submit_audit_verdict(
         endpoint,
@@ -487,10 +551,8 @@ async fn cast_verdict(
         RUN_ID,
         target,
         target_index,
-        0,
-        4,
-        COMMITTED,
-        REPLAYED,
+        commitment,
+        replayed_digest(),
     )
     .await
 }

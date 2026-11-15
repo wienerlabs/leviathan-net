@@ -23,8 +23,15 @@ fn participant_is_the_length_the_web_decoder_expects() {
     assert_eq!(Participant::space_with_discriminator(), 65);
 }
 
-/// Mirrors `VERDICT_LAYOUT_BY_SIZE` in the same file.
+/// Mirrors `VERDICT_LAYOUT_BY_SIZE` in the same file, which stops at 4328
+/// (`appealsWithDeadline`). This is a fourth generation, 40 bytes longer.
+/// The verdict records the payload the target signed: `evidence` (step u32,
+/// trainer nonce u32, results digest 32 bytes) sits between `batch_end` and
+/// `pending_since_unix` (wienerlabs/leviathan-net#43). A decoder has to learn
+/// 4368 before it reads accounts from the deployment carrying it. Read with
+/// the 4328 layout, `evidence` lands in `pending_since_unix` and every field
+/// after it.
 #[test]
 fn audit_verdict_is_the_length_the_web_decoder_expects() {
-    assert_eq!(AuditVerdict::space_with_discriminator(), 4328);
+    assert_eq!(AuditVerdict::space_with_discriminator(), 4368);
 }

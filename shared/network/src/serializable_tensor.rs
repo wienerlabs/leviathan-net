@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use tch::{Device, Kind, TchError, Tensor};
 
@@ -25,42 +24,6 @@ impl SerializableTensor {
             SerializableTensorData::Full(items) => items,
             SerializableTensorData::OneBit(items) => items,
         }
-    }
-
-    /// Feeds every field into a commitment hash.
-    ///
-    /// The bytes alone do not say how they are to be read, and the fields that
-    /// do say - the shape, the dtype, which of the two encodings this is - decide
-    /// what gradient comes out the other end. A commitment that leaves them out
-    /// does not bind what the receiver computes (wienerlabs/leviathan#15,
-    /// finding 26).
-    ///
-    /// The destructuring is the point: adding a field to this struct without
-    /// deciding whether it belongs in the commitment will not compile.
-    pub fn hash_into(&self, hasher: &mut Sha256) {
-        let SerializableTensor {
-            dims,
-            kind,
-            requires_grad,
-            data,
-        } = self;
-
-        hasher.update((dims.len() as u64).to_be_bytes());
-        for dim in dims {
-            hasher.update(dim.to_be_bytes());
-        }
-        hasher.update([crate::serializable_kind::kind_to_u8(&kind.clone().into_inner())]);
-        hasher.update([u8::from(*requires_grad)]);
-
-        // The encoding tag matters as much as the bytes: the same buffer read as
-        // packed bits and as raw values is two different tensors.
-        let (tag, bytes) = match data {
-            SerializableTensorData::Full(bytes) => (0u8, bytes),
-            SerializableTensorData::OneBit(bytes) => (1u8, bytes),
-        };
-        hasher.update([tag]);
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
     }
 }
 

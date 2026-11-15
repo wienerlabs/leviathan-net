@@ -1,4 +1,4 @@
-use psyche_core::BatchId;
+use psyche_core::{payload_commitment_hash, payload_commitment_run, BatchId};
 use psyche_modeling::DistroResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,51 +32,63 @@ pub struct TransmittableDistroResult {
 impl TransmittableDistroResult {
     /// The hash a sender signs and a receiver checks a download against.
     ///
-    /// It has to cover everything that decides what gradient comes out of this
-    /// payload, not only the tensor bytes: the shape, the dtype and the
-    /// encoding say how the bytes are read, and `xshape` and `totalk` are what
-    /// `CompressDCT::decompress` rebuilds with. Leaving them out let a sender
-    /// commit to one payload and hand over another that decompressed
-    /// differently and still verified (wienerlabs/leviathan#15, finding 26).
+    /// It is `payload_commitment_hash` over the run `run_id`, this payload's
+    /// step, nonce and batch, and the digest of its results. With the run in
+    /// it, a signature made in one run convicts in no other. The header is kept apart from
+    /// the results so the chain can rebuild the hash from a few dozen bytes. It
+    /// can then check that a conviction names a payload the target signed for
+    /// exactly that step and batch (wienerlabs/leviathan-net#43).
     ///
-    /// Lengths go in ahead of anything variable, so one run of bytes divided
-    /// into results one way cannot hash the same as the same run divided
-    /// another way.
-    ///
-    /// Both structs are destructured rather than read field by field: a new
-    /// field is then a compile error here, not a silent hole in the commitment.
-    pub fn comptue_hash(&self) -> [u8; 32] {
+    /// The struct is destructured rather than read field by field: a new field
+    /// is then a compile error here, not a silent hole in the commitment.
+    pub fn comptue_hash(&self, run_id: &str) -> Result<[u8; 32], postcard::Error> {
         let TransmittableDistroResult {
             step,
             trainer_nonce,
             batch_id,
             distro_results,
         } = self;
-
-        let mut hasher = Sha256::new();
-        hasher.update(step.to_be_bytes());
-        hasher.update(trainer_nonce.to_be_bytes());
-        hasher.update(batch_id.0.start.to_be_bytes());
-        hasher.update(batch_id.0.end.to_be_bytes());
-        hasher.update((distro_results.len() as u64).to_be_bytes());
-
-        for result in distro_results {
-            let SerializedDistroResult {
-                sparse_idx,
-                sparse_val,
-                xshape,
-                totalk,
-            } = result;
-            sparse_idx.hash_into(&mut hasher);
-            sparse_val.hash_into(&mut hasher);
-            hasher.update((xshape.len() as u64).to_be_bytes());
-            for dim in xshape {
-                hasher.update(dim.to_be_bytes());
-            }
-            hasher.update(totalk.to_be_bytes());
-        }
-        hasher.finalize().into()
+        Ok(payload_commitment_hash(
+            &payload_commitment_run(run_id),
+            *step,
+            *trainer_nonce,
+            batch_id.0.start,
+            batch_id.0.end,
+            &results_digest(distro_results)?,
+        ))
     }
+
+    /// The digest of this payload's results, as its commitment covers them.
+    pub fn results_digest(&self) -> Result<[u8; 32], postcard::Error> {
+        results_digest(&self.distro_results)
+    }
+}
+
+/// The digest a payload commitment takes of the results: the sha256 of their
+/// wire encoding, which is the same bytes `distro_results_to_bytes` writes and
+/// a payload dump holds.
+///
+/// The encoding carries every field. That covers the bytes, and also the
+/// fields that say how the bytes are read: the shape, the dtype, the encoding
+/// tag, `xshape` and `totalk`, which are what `CompressDCT::decompress`
+/// rebuilds with. A hash that left those out let a sender commit to one
+/// payload and hand over another that decompressed differently and still
+/// verified (wienerlabs/leviathan#15, finding 26). A field added to a result
+/// later is covered without anyone having to remember it.
+///
+/// Each result's encoding is self-delimiting, so one run of bytes divided into
+/// results one way cannot read back as the same run divided another way. And
+/// because the digest is of the dump bytes themselves, anyone holding a dump
+/// can check it against a conviction recorded on chain with nothing but
+/// sha256.
+pub fn results_digest(
+    distro_results: &[SerializedDistroResult],
+) -> Result<[u8; 32], postcard::Error> {
+    let mut hasher = Sha256::new();
+    for result in distro_results {
+        hasher = postcard::to_io(result, hasher)?;
+    }
+    Ok(hasher.finalize().into())
 }
 
 #[derive(Debug, Error)]
@@ -333,6 +345,7 @@ mod commitment_binding_tests {
     }
 
     const VALUES: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    const RUN: &str = "leviathan commitment binding";
 
     fn one_result(dims: &[i64], xshape: Vec<u16>, totalk: u32) -> TransmittableDistroResult {
         payload(vec![SerializedDistroResult {
@@ -348,17 +361,27 @@ mod commitment_binding_tests {
     #[test]
     fn shape_changes_the_commitment() {
         assert_ne!(
-            one_result(&[4], vec![2, 2], 4).comptue_hash(),
-            one_result(&[2, 2], vec![2, 2], 4).comptue_hash(),
+            one_result(&[4], vec![2, 2], 4).comptue_hash(RUN).unwrap(),
+            one_result(&[2, 2], vec![2, 2], 4)
+                .comptue_hash(RUN)
+                .unwrap(),
         );
     }
 
     /// So do the two fields `CompressDCT::decompress` actually rebuilds with.
     #[test]
     fn xshape_and_totalk_change_the_commitment() {
-        let base = one_result(&[4], vec![2, 2], 4).comptue_hash();
-        assert_ne!(base, one_result(&[4], vec![4, 1], 4).comptue_hash());
-        assert_ne!(base, one_result(&[4], vec![2, 2], 9999).comptue_hash());
+        let base = one_result(&[4], vec![2, 2], 4).comptue_hash(RUN).unwrap();
+        assert_ne!(
+            base,
+            one_result(&[4], vec![4, 1], 4).comptue_hash(RUN).unwrap()
+        );
+        assert_ne!(
+            base,
+            one_result(&[4], vec![2, 2], 9999)
+                .comptue_hash(RUN)
+                .unwrap()
+        );
     }
 
     /// And how a run of bytes is divided into results, which the length
@@ -380,7 +403,10 @@ mod commitment_binding_tests {
                 totalk: 4,
             },
         ]);
-        assert_ne!(one.comptue_hash(), two.comptue_hash());
+        assert_ne!(
+            one.comptue_hash(RUN).unwrap(),
+            two.comptue_hash(RUN).unwrap()
+        );
     }
 
     /// The encoding tag is covered too: the same buffer read as packed bits and
@@ -404,7 +430,7 @@ mod commitment_binding_tests {
             xshape: vec![2, 2],
             totalk: 4,
         }]);
-        assert_ne!(a.comptue_hash(), b.comptue_hash());
+        assert_ne!(a.comptue_hash(RUN).unwrap(), b.comptue_hash(RUN).unwrap());
     }
 
     /// The bytes are still covered, and the step and batch bounds still are.
@@ -413,23 +439,78 @@ mod commitment_binding_tests {
         let a = one_result(&[4], vec![2, 2], 4);
         let mut b = one_result(&[4], vec![2, 2], 4);
         b.distro_results[0].sparse_idx = tensor(&[1.0, 2.0, 3.0, 5.0], &[4]);
-        assert_ne!(a.comptue_hash(), b.comptue_hash());
+        assert_ne!(a.comptue_hash(RUN).unwrap(), b.comptue_hash(RUN).unwrap());
 
         let mut c = one_result(&[4], vec![2, 2], 4);
         c.step = 8;
-        assert_ne!(a.comptue_hash(), c.comptue_hash());
+        assert_ne!(a.comptue_hash(RUN).unwrap(), c.comptue_hash(RUN).unwrap());
 
         let mut d = one_result(&[4], vec![2, 2], 4);
         d.batch_id = BatchId(ClosedInterval::new(0, 4));
-        assert_ne!(a.comptue_hash(), d.comptue_hash());
+        assert_ne!(a.comptue_hash(RUN).unwrap(), d.comptue_hash(RUN).unwrap());
+    }
+
+    /// What a sender signs is the payload commitment over this payload's header
+    /// and results digest, the same hash the chain rebuilds from those fields.
+    #[test]
+    fn the_commitment_is_the_payload_commitment_over_header_and_digest() {
+        let payload = one_result(&[4], vec![2, 2], 4);
+        let digest = results_digest(&payload.distro_results).unwrap();
+        assert_eq!(
+            payload.comptue_hash(RUN).unwrap(),
+            payload_commitment_hash(
+                &payload_commitment_run(RUN),
+                payload.step,
+                payload.trainer_nonce,
+                payload.batch_id.0.start,
+                payload.batch_id.0.end,
+                &digest,
+            )
+        );
+        assert_eq!(payload.results_digest().unwrap(), digest);
+    }
+
+    /// The same payload committed in another run is another commitment.
+    #[test]
+    fn the_run_changes_the_commitment() {
+        let payload = one_result(&[4], vec![2, 2], 4);
+        assert_ne!(
+            payload.comptue_hash(RUN).unwrap(),
+            payload.comptue_hash("another run").unwrap()
+        );
+    }
+
+    /// The results digest is the sha256 of the dump bytes, so a dump on disk
+    /// can be checked against a conviction with sha256 alone.
+    #[test]
+    fn the_results_digest_is_the_sha256_of_the_dump_bytes() {
+        let payload = payload(vec![
+            one_result(&[4], vec![2, 2], 4).distro_results.remove(0),
+            one_result(&[2, 2], vec![4, 1], 4).distro_results.remove(0),
+        ]);
+        let dump = distro_results_to_bytes(&payload.distro_results).unwrap();
+        assert_eq!(
+            payload.results_digest().unwrap(),
+            <[u8; 32]>::from(Sha256::digest(&dump))
+        );
+    }
+
+    /// The nonce is in the header the signature covers, not in the digest.
+    #[test]
+    fn the_nonce_changes_the_commitment() {
+        let a = one_result(&[4], vec![2, 2], 4);
+        let mut b = one_result(&[4], vec![2, 2], 4);
+        b.trainer_nonce += 1;
+        assert_ne!(a.comptue_hash(RUN).unwrap(), b.comptue_hash(RUN).unwrap());
+        assert_eq!(a.results_digest().unwrap(), b.results_digest().unwrap());
     }
 
     /// Identical payloads still agree, or a sender could not commit to its own.
     #[test]
     fn the_same_payload_still_hashes_the_same() {
         assert_eq!(
-            one_result(&[4], vec![2, 2], 4).comptue_hash(),
-            one_result(&[4], vec![2, 2], 4).comptue_hash(),
+            one_result(&[4], vec![2, 2], 4).comptue_hash(RUN).unwrap(),
+            one_result(&[4], vec![2, 2], 4).comptue_hash(RUN).unwrap(),
         );
     }
 }

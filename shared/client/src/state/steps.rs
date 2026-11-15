@@ -8,7 +8,7 @@ use psyche_coordinator::{Committee, Coordinator, RunState, Witness, WitnessProof
 use psyche_core::{IntegrationTestLogMarker, MerkleRoot, MerkleTree, NodeIdentity, sha256};
 use psyche_event_sourcing::event;
 use psyche_modeling::{DistroResult, Trainer};
-use psyche_network::{BlobTicket, Hash, P2PEndpointInfo, TransmittableDistroResult};
+use psyche_network::{BlobTicket, CommitmentRecord, Hash, P2PEndpointInfo, TransmittableDistroResult};
 use psyche_watcher::OpportunisticData;
 use std::{
     fmt,
@@ -538,6 +538,8 @@ impl StepStateMachine {
         distro_result: TransmittableDistroResult,
         self_result: Option<Vec<DistroResult>>,
     ) {
+        // The run the payload's commitment is bound to.
+        let run_id = String::from(&self.coordinator_state.run_id);
         let (round_state, current_round) =
             if self.current_round.distro_result_blob_downloaded(&hash) {
                 trace!(
@@ -616,13 +618,28 @@ impl StepStateMachine {
         };
         tokio::spawn(async move {
             // verify that the result matches the commitment
-            let (distro_hash, distro_result) =
-                tokio::task::spawn_blocking(move || (distro_result.comptue_hash(), distro_result))
-                    .await
-                    .unwrap();
+            let (distro_hash, distro_result) = tokio::task::spawn_blocking(move || {
+                (distro_result.comptue_hash(&run_id), distro_result)
+            })
+            .await
+            .unwrap();
 
+            let distro_hash = match distro_hash {
+                Ok(distro_hash) => distro_hash,
+                Err(err) => {
+                    debug!(
+                        from = %from,
+                        batch_id = %batch_id,
+                        "Distro result could not be hashed for its commitment: {err}",
+                    );
+                    return;
+                }
+            };
             if distro_hash != commitment.data_hash {
-                debug!(
+                // A payload that does not match what its sender signed is either
+                // forged or from a client speaking another commitment format,
+                // which is worth seeing rather than dropping in silence.
+                warn!(
                     from = %from,
                     batch_id = %batch_id,
                     "Distro result failed commitment hash verification",
@@ -631,7 +648,17 @@ impl StepStateMachine {
             }
 
             if let Some(dir) = write_gradients_dir {
-                if let Err(err) = write_gradients_to_disk(dir, from, distro_result.clone()).await {
+                // The signature was checked against the peer's p2p key when the
+                // broadcast arrived, and the payload has just matched the hash
+                // it signs. Kept together, they are what a verifier convicts on.
+                let record = CommitmentRecord::new(
+                    &distro_result,
+                    commitment.data_hash,
+                    commitment.signature,
+                );
+                if let Err(err) =
+                    write_gradients_to_disk(dir, from, distro_result.clone(), Some(record)).await
+                {
                     error!("Failed to write a received distro result to disk: {err:#}");
                 }
             }

@@ -11,7 +11,6 @@ use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::CoordinatorAccount;
@@ -31,7 +30,6 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_par
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_slash_bounty;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_update;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
@@ -39,6 +37,9 @@ use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+
+use super::signed_payload::identity;
+use super::signed_payload::slash_on_signed_payload;
 
 const RUN_ID: &str = "Leviathan bounty split";
 const BOND: u64 = 500;
@@ -65,6 +66,7 @@ pub async fn run() {
     for _ in 0..4 {
         clients.push(Keypair::new());
     }
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let cheater = 0usize;
     let warmup_time = 10;
     let round_witness_time = 10;
@@ -213,7 +215,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -239,7 +241,7 @@ pub async fn run() {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
@@ -307,7 +309,7 @@ pub async fn run() {
             .unwrap();
     }
 
-    process_treasurer_run_slash(
+    slash_on_signed_payload(
         &mut endpoint,
         &payer,
         &main_authority,
@@ -315,6 +317,8 @@ pub async fn run() {
         &coordinator_account,
         RUN_ID,
         cheater as u64,
+        &clients[cheater],
+        &p2ps[cheater],
     )
     .await
     .unwrap();

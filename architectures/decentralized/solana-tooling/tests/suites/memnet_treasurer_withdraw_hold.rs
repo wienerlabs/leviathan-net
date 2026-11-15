@@ -5,7 +5,6 @@
 //! training in an epoch may still be charged for it until that epoch ends.
 
 use psyche_coordinator::RunState;
-use psyche_solana_coordinator::ProgramError as CoordinatorProgramError;
 use psyche_solana_treasurer::ProgramError;
 
 use super::bonded_run::Harness;
@@ -184,7 +183,14 @@ pub async fn a_pause_after_an_ejection_still_charges_it() {
 }
 
 /// A warmup that is paused goes straight to `Paused` with no charge, so no
-/// ejection lands in a warmup at all (wienerlabs/leviathan-net#36).
+/// ejection may land in a warmup at all (wienerlabs/leviathan-net#36).
+///
+/// A conviction is made on a payload the target signed in the current epoch
+/// (wienerlabs/leviathan-net#43), and nothing has been trained in it during
+/// its warmup. So the last payload the subject signed, in the epoch before,
+/// is refused as outside it before any ejection is attempted. The coordinator
+/// refuses an ejection in a warmup regardless
+/// (`shared/coordinator/tests/eject_charging_epoch.rs`).
 #[tokio::test]
 pub async fn no_ejection_lands_in_a_warmup() {
     let mut harness =
@@ -192,9 +198,17 @@ pub async fn no_ejection_lands_in_a_warmup() {
     for node in 0..NODES {
         harness.join(node).await.unwrap();
     }
+    harness.advance_to(RunState::RoundTrain).await;
+    let last_payload = harness.signed_payload(SUBJECT).await;
+    harness.finish_epoch().await;
+    for node in 0..NODES {
+        harness.join(node).await.unwrap();
+    }
     harness.advance_to(RunState::Warmup).await;
     assert_eq!(
-        refusal_code(harness.try_convict(SUBJECT).await),
-        u32::from(CoordinatorProgramError::CoordinatorErrorSlashOutsideEpoch),
+        refusal_code(harness.try_convict_on(SUBJECT, &last_payload).await),
+        treasurer_refusal(ProgramError::CommitmentOutsideEpoch),
     );
+    harness.finish_epoch().await;
+    assert_eq!(harness.ledger(SUBJECT).await.1, 0);
 }

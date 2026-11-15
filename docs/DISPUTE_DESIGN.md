@@ -181,6 +181,54 @@ step from being skipped:
   once: an authority that slashes a target the committee also convicts
   charges it twice.
 
+### What a conviction proves on chain
+
+The chain cannot recompute a gradient, so whether a payload was honest remains
+the verifiers' claim, and the appeals court is what contests it. What the
+target committed to does not have to be a claim. A trainer signs its payload
+hash with its p2p key before it broadcasts the payload, and the coordinator
+roster holds that key. So every conviction now carries that signature, and the
+treasurer checks it (wienerlabs/leviathan-net#43):
+
+- **The hash is rebuilt on chain.** A payload's commitment hash is
+  `sha256(domain, sha256(run_id), step, nonce, batch_start, batch_end,
+  results_digest)`. The `results_digest` is the sha256 of the payload's wire
+  bytes, the same bytes a payload dump holds. A conviction names the step,
+  the nonce and the digest. The treasurer rebuilds the hash from them, the
+  batch the conviction records, and the run id its coordinator holds. Binding
+  the run means a signature a key made in one run convicts it of nothing in
+  another.
+- **The target's key has to have signed it.** The same transaction carries an
+  ed25519 precompile instruction with the key, the signature and the message
+  inside it. The runtime verifies the signature before any program runs. The
+  treasurer reads that instruction through the instructions sysvar and accepts
+  it only if the key is the target's roster p2p key and the message is exactly
+  the rebuilt hash.
+- **The payload is from this epoch.** Its step lies between the epoch's first
+  step and the current one. A commitment from an earlier epoch names work that
+  epoch already charged.
+- **The record is self-checking.** The verdict stores the evidence alongside
+  the hash, so anyone can rebuild the hash from the account and its run.
+  Holding the dump, anyone can check its sha256 against the digest.
+
+Before this, a quorum could record a hash the target never committed to, and
+the record an appeal bench or an observer reads would have been fiction. A
+conviction can still cite a genuine payload and lie about its replay. That is
+the claim the appeals court exists for, and the record now names exactly which
+payload to re-audit.
+
+The client keeps a peer's payload together with the record of what the peer
+signed for it. It writes the record first and then renames the dump into
+place, so a dump is never seen without its record. It also keeps only the first
+payload a peer signed for a batch. A peer that signs two payloads for one batch
+therefore cannot leave one payload's record beside the other's dump, which
+would leave nothing to convict on. Signing two payloads for one batch is itself
+provable from the two signatures, though no rule charges it yet.
+
+The coordinator's own `slash_client` stays the owner's instrument. For a
+treasurer run the owner is the run PDA, so every slash goes through the checks
+above. A run without a treasurer trusts its owner key, as it always has.
+
 One refinement remains, optional and priced: an explicit challenge bond so a
 frivolous appeal has a cost of its own. It is additive on top of the shipped
 lifecycle and needs an economic parameter, so it is a deliberate choice rather

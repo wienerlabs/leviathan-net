@@ -32,14 +32,13 @@ pub struct ReplayAssignment {
     pub data: Vec<BatchDataCPU>,
 }
 
+/// The step and batch a payload dump is for, from its contribution key
+/// (`step7-batchB[12, 19]`, or `step7-batchB15` for a batch of one sample).
 pub fn parse_assignment_key(key: &str) -> Option<(u32, BatchId)> {
-    let (step_part, batch_part) = key.split_once("-batchB")?;
+    let (step_part, batch_part) = key.split_once("-batch")?;
     let step: u32 = step_part.strip_prefix("step")?.parse().ok()?;
-    let bounds = batch_part.trim_start_matches('[').trim_end_matches(']');
-    let (start, end) = bounds.split_once(',')?;
-    let start: u64 = start.trim().parse().ok()?;
-    let end: u64 = end.trim().parse().ok()?;
-    Some((step, BatchId(psyche_core::ClosedInterval::new(start, end))))
+    let batch = batch_part.strip_prefix('B')?.parse().ok()?;
+    Some((step, batch))
 }
 
 #[derive(Debug, Clone)]

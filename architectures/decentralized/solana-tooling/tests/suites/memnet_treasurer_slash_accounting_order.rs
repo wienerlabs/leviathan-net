@@ -34,7 +34,6 @@ use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::CoordinatorAccount;
@@ -53,7 +52,6 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_par
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_update;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
@@ -62,6 +60,9 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
+
+use super::signed_payload::identity;
+use super::signed_payload::slash_on_signed_payload;
 
 const RUN_ID: &str = "Leviathan exit order";
 const BOND: u64 = 500;
@@ -96,6 +97,7 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
     for _ in 0..3 {
         clients.push(Keypair::new());
     }
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let first_out_last = 0usize;
     let last_out_first = 2usize;
 
@@ -241,7 +243,7 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
     .await
     .unwrap();
 
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -267,7 +269,7 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
@@ -322,7 +324,7 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
     let index = live_index(&mut endpoint, &coordinator_account, &clients[last_out_first].pubkey())
         .await
         .expect("last_out_first is live");
-    process_treasurer_run_slash(
+    slash_on_signed_payload(
         &mut endpoint,
         &payer,
         &main_authority,
@@ -330,6 +332,8 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
         &coordinator_account,
         RUN_ID,
         index,
+        &clients[last_out_first],
+        &p2ps[last_out_first],
     )
     .await
     .unwrap();
@@ -345,7 +349,7 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
     let index = live_index(&mut endpoint, &coordinator_account, &clients[first_out_last].pubkey())
         .await
         .expect("first_out_last is live");
-    process_treasurer_run_slash(
+    slash_on_signed_payload(
         &mut endpoint,
         &payer,
         &main_authority,
@@ -353,6 +357,8 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
         &coordinator_account,
         RUN_ID,
         index,
+        &clients[first_out_last],
+        &p2ps[first_out_last],
     )
     .await
     .unwrap();

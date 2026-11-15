@@ -1,0 +1,299 @@
+use std::path::{Path, PathBuf};
+
+use psyche_core::{payload_commitment_hash, payload_commitment_run, BatchId, ClosedInterval};
+use thiserror::Error;
+
+use crate::authenticable_identity::raw_p2p_verify;
+use crate::serialized_distro::{results_digest, SerializedDistroResult, TransmittableDistroResult};
+
+/// The extension a commitment record is kept under, next to the payload dump
+/// it belongs to.
+pub const COMMITMENT_RECORD_EXTENSION: &str = "commitment";
+
+/// A peer's signed commitment to a payload, as kept by the node that verified
+/// it.
+///
+/// A verifier convicts a peer on what the peer signed. So next to each peer
+/// payload a node keeps, it also writes this record: the header the payload
+/// hash was built over, and the peer's signature on that hash. Together with
+/// the payload's results, that is everything the treasurer needs to check that
+/// a conviction names a payload the peer committed to
+/// (wienerlabs/leviathan-net#43).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitmentRecord {
+    pub step: u32,
+    pub trainer_nonce: u32,
+    pub batch_id: BatchId,
+    pub data_hash: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CommitmentRecordError {
+    #[error("a commitment record is {expected} bytes, this one is {actual}")]
+    Length { expected: usize, actual: usize },
+    #[error("the batch in this commitment record ends before it starts")]
+    Batch,
+    #[error("the payload is not the one this commitment's hash was built over")]
+    PayloadMismatch,
+    #[error("the signature on this commitment is not the committer's")]
+    Signature,
+    #[error("the payload could not be encoded to hash: {0}")]
+    Encoding(postcard::Error),
+}
+
+impl CommitmentRecord {
+    /// Step and nonce, the batch bounds, the hash and the signature, in that
+    /// order and big-endian.
+    pub const SERIALIZED_SIZE: usize = 4 + 4 + 8 + 8 + 32 + 64;
+
+    /// The record of `payload`, committed to as `data_hash` and signed with
+    /// `signature`.
+    pub fn new(
+        payload: &TransmittableDistroResult,
+        data_hash: [u8; 32],
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            step: payload.step,
+            trainer_nonce: payload.trainer_nonce,
+            batch_id: payload.batch_id,
+            data_hash,
+            signature,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut bytes = [0u8; Self::SERIALIZED_SIZE];
+        bytes[0..4].copy_from_slice(&self.step.to_be_bytes());
+        bytes[4..8].copy_from_slice(&self.trainer_nonce.to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.batch_id.0.start.to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.batch_id.0.end.to_be_bytes());
+        bytes[24..56].copy_from_slice(&self.data_hash);
+        bytes[56..120].copy_from_slice(&self.signature);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CommitmentRecordError> {
+        let bytes: &[u8; Self::SERIALIZED_SIZE] =
+            bytes
+                .try_into()
+                .map_err(|_| CommitmentRecordError::Length {
+                    expected: Self::SERIALIZED_SIZE,
+                    actual: bytes.len(),
+                })?;
+        let u32_at = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
+        let (start, end) = (u64_at(8), u64_at(16));
+        if end < start {
+            return Err(CommitmentRecordError::Batch);
+        }
+        Ok(Self {
+            step: u32_at(0),
+            trainer_nonce: u32_at(4),
+            batch_id: BatchId(ClosedInterval::new(start, end)),
+            data_hash: bytes[24..56].try_into().unwrap(),
+            signature: bytes[56..120].try_into().unwrap(),
+        })
+    }
+
+    /// The hash this record's header commits `results` under, in the run
+    /// `run_id`.
+    pub fn payload_hash(
+        &self,
+        results: &[SerializedDistroResult],
+        run_id: &str,
+    ) -> Result<[u8; 32], CommitmentRecordError> {
+        let digest = results_digest(results).map_err(CommitmentRecordError::Encoding)?;
+        Ok(payload_commitment_hash(
+            &payload_commitment_run(run_id),
+            self.step,
+            self.trainer_nonce,
+            self.batch_id.0.start,
+            self.batch_id.0.end,
+            &digest,
+        ))
+    }
+
+    /// Checks that `results` are the payload this record's hash was built
+    /// over in the run `run_id`, and that the hash was signed by the holder of
+    /// `p2p_identity`.
+    pub fn verify(
+        &self,
+        results: &[SerializedDistroResult],
+        run_id: &str,
+        p2p_identity: &[u8; 32],
+    ) -> Result<(), CommitmentRecordError> {
+        if self.payload_hash(results, run_id)? != self.data_hash {
+            return Err(CommitmentRecordError::PayloadMismatch);
+        }
+        if !raw_p2p_verify(p2p_identity, &self.data_hash, &self.signature) {
+            return Err(CommitmentRecordError::Signature);
+        }
+        Ok(())
+    }
+}
+
+/// Where the commitment record for the payload dump at `payload_path` is kept.
+pub fn commitment_record_path(payload_path: &Path) -> PathBuf {
+    payload_path.with_extension(COMMITMENT_RECORD_EXTENSION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serializable_tensor::SerializableTensor;
+    use iroh::SecretKey;
+    use tch::{Device, Kind, Tensor};
+
+    const RUN: &str = "leviathan commitment record";
+
+    fn results(values: &[f32]) -> Vec<SerializedDistroResult> {
+        let tensor = Tensor::from_slice(values)
+            .to_kind(Kind::Float)
+            .to(Device::Cpu);
+        let serialized = SerializableTensor::try_from(&tensor).unwrap();
+        vec![SerializedDistroResult {
+            sparse_idx: serialized.clone(),
+            sparse_val: serialized,
+            xshape: vec![values.len() as u16],
+            totalk: values.len() as u32,
+        }]
+    }
+
+    fn payload(results: Vec<SerializedDistroResult>) -> TransmittableDistroResult {
+        TransmittableDistroResult {
+            step: 12,
+            trainer_nonce: 2,
+            batch_id: BatchId(ClosedInterval::new(40, 47)),
+            distro_results: results,
+        }
+    }
+
+    /// A payload signed the way the client signs it.
+    fn signed(key: &SecretKey, payload: &TransmittableDistroResult) -> CommitmentRecord {
+        let data_hash = payload.comptue_hash(RUN).unwrap();
+        let signature = key.sign(&data_hash).to_bytes();
+        CommitmentRecord::new(payload, data_hash, signature)
+    }
+
+    #[test]
+    fn a_genuine_commitment_verifies_against_its_payload_and_signer() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(results(&[1.0, -2.0, 3.0]));
+        let record = signed(&key, &payload);
+        assert_eq!(
+            record.payload_hash(&payload.distro_results, RUN),
+            Ok(payload.comptue_hash(RUN).unwrap())
+        );
+        assert_eq!(
+            record.verify(&payload.distro_results, RUN, key.public().as_bytes()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn other_results_are_not_the_committed_payload() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let record = signed(&key, &payload(results(&[1.0, -2.0, 3.0])));
+        assert_eq!(
+            record.verify(&results(&[1.0, -2.0, 4.0]), RUN, key.public().as_bytes()),
+            Err(CommitmentRecordError::PayloadMismatch)
+        );
+    }
+
+    #[test]
+    fn a_header_other_than_the_signed_one_does_not_verify() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(results(&[1.0, -2.0, 3.0]));
+        let record = signed(&key, &payload);
+        for moved in [
+            CommitmentRecord {
+                step: record.step + 1,
+                ..record
+            },
+            CommitmentRecord {
+                trainer_nonce: record.trainer_nonce + 1,
+                ..record
+            },
+            CommitmentRecord {
+                batch_id: BatchId(ClosedInterval::new(40, 48)),
+                ..record
+            },
+        ] {
+            assert_eq!(
+                moved.verify(&payload.distro_results, RUN, key.public().as_bytes()),
+                Err(CommitmentRecordError::PayloadMismatch)
+            );
+        }
+    }
+
+    /// A record verified against another run is not the commitment the peer
+    /// made, though the peer's key signed it.
+    #[test]
+    fn a_commitment_made_in_another_run_does_not_verify() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(results(&[1.0, -2.0, 3.0]));
+        let record = signed(&key, &payload);
+        assert_eq!(
+            record.verify(
+                &payload.distro_results,
+                "another run",
+                key.public().as_bytes()
+            ),
+            Err(CommitmentRecordError::PayloadMismatch)
+        );
+    }
+
+    #[test]
+    fn another_key_did_not_sign_it() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let other = SecretKey::generate(&mut rand::rng());
+        let payload = payload(results(&[1.0, -2.0, 3.0]));
+        let record = signed(&key, &payload);
+        assert_eq!(
+            record.verify(&payload.distro_results, RUN, other.public().as_bytes()),
+            Err(CommitmentRecordError::Signature)
+        );
+        let forged = signed(&other, &payload);
+        assert_eq!(
+            forged.verify(&payload.distro_results, RUN, key.public().as_bytes()),
+            Err(CommitmentRecordError::Signature)
+        );
+    }
+
+    #[test]
+    fn a_record_survives_its_bytes() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let record = signed(&key, &payload(results(&[1.0, -2.0, 3.0])));
+        assert_eq!(CommitmentRecord::from_bytes(&record.to_bytes()), Ok(record));
+    }
+
+    #[test]
+    fn a_record_of_the_wrong_size_or_an_inverted_batch_is_refused() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let bytes = signed(&key, &payload(results(&[1.0]))).to_bytes();
+        assert_eq!(
+            CommitmentRecord::from_bytes(&bytes[1..]),
+            Err(CommitmentRecordError::Length {
+                expected: CommitmentRecord::SERIALIZED_SIZE,
+                actual: CommitmentRecord::SERIALIZED_SIZE - 1,
+            })
+        );
+        let mut inverted = bytes;
+        inverted[8..16].copy_from_slice(&48u64.to_be_bytes());
+        assert_eq!(
+            CommitmentRecord::from_bytes(&inverted),
+            Err(CommitmentRecordError::Batch)
+        );
+    }
+
+    #[test]
+    fn the_record_sits_next_to_its_payload() {
+        let payload = Path::new("/dumps/result-Abc-step3-batchB[0, 1].vec-postcard");
+        assert_eq!(
+            commitment_record_path(payload),
+            PathBuf::from("/dumps/result-Abc-step3-batchB[0, 1].commitment")
+        );
+    }
+}

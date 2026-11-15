@@ -58,6 +58,7 @@ pub use iroh_blobs::{BlobFormat, Hash, ticket::BlobTicket};
 
 pub mod allowlist;
 mod authenticable_identity;
+mod commitment_record;
 mod connection_monitor;
 mod download;
 mod latency_sorted;
@@ -78,6 +79,9 @@ mod util;
 mod test;
 
 pub use authenticable_identity::raw_p2p_verify;
+pub use commitment_record::{
+    COMMITMENT_RECORD_EXTENSION, CommitmentRecord, CommitmentRecordError, commitment_record_path,
+};
 pub use connection_monitor::{ConnectionData, ConnectionMonitor, PeerBandwidth};
 pub use download::{
     DownloadComplete, DownloadFailed, DownloadSchedulerHandle, DownloadType, ReadyRetry,
@@ -94,7 +98,7 @@ pub use p2p_model_sharing::{
 pub use serde::Networkable;
 pub use serialized_distro::{
     SerializeDistroResultError, SerializedDistroResult, TransmittableDistroResult,
-    distro_results_from_reader, distro_results_to_bytes,
+    distro_results_from_reader, distro_results_to_bytes, results_digest,
 };
 pub use signed_message::SignedMessage;
 pub use tcp::{ClientNotification, TcpClient, TcpServer};

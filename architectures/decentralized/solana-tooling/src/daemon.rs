@@ -7,7 +7,14 @@ use anyhow::Result;
 use leviathan_verifier::decompress_dump;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::check_commitment;
+use leviathan_verifier::CommitmentCheck;
 use psyche_coordinator::select_audits_for_current_round;
+use psyche_coordinator::Coordinator;
+use psyche_core::BatchId;
+use psyche_solana_treasurer::state::commitment_run;
+use psyche_solana_treasurer::state::committee_matches_roster;
+use psyche_solana_treasurer::state::CommitmentEvidence;
 use psyche_verifier::hash_delta;
 use psyche_verifier::verify_within_band;
 use solana_sdk::pubkey::Pubkey;
@@ -16,8 +23,9 @@ use tch::Device;
 
 use crate::get_accounts::get_coordinator_account_state;
 use crate::get_accounts::get_run;
-use crate::process_treasurer_instructions::process_treasurer_run_slash_with_hashes;
+use crate::process_treasurer_instructions::process_treasurer_run_slash;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
+use crate::signed_commitment::SignedCommitment;
 
 pub struct AuditConfig {
     pub run_id: String,
@@ -48,14 +56,38 @@ pub fn parse_committer(path: &Path) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-pub fn parse_batch_bounds(text: &str) -> Option<(u64, u64)> {
-    let lb = text.find('[')?;
-    let rb = text.find(']')?;
-    let inner = &text[lb + 1..rb];
-    let mut parts = inner.split(',');
-    let start = parts.next()?.trim().parse().ok()?;
-    let end = parts.next()?.trim().parse().ok()?;
-    Some((start, end))
+/// The contributions this round's committee assigns for audit, as the committer
+/// named in a dump and the batch it trained.
+fn audit_assignments(
+    coordinator: &Coordinator,
+    tie_breaker_committee_size: u16,
+) -> HashSet<(String, BatchId)> {
+    // In a warmup, or once the roster has moved under the last round's draw,
+    // no committee stands over the roster. Drawing one over it anyway indexes
+    // past the round it was drawn for.
+    if !committee_matches_roster(coordinator) {
+        println!(
+            "[verifier-daemon] no audit assignments this round: no committee drawn over the roster ({})",
+            coordinator.run_state
+        );
+        return HashSet::new();
+    }
+    match select_audits_for_current_round(
+        coordinator,
+        tie_breaker_committee_size,
+    ) {
+        Ok(audits) => audits
+            .iter()
+            // The full signer, as the dump names carry it (finding 20).
+            .map(|a| (bs58::encode(a.target.signer()).into_string(), a.batch_id))
+            .collect(),
+        Err(err) => {
+            println!(
+                "[verifier-daemon] no audit assignments this round: {err:?}"
+            );
+            HashSet::new()
+        },
+    }
 }
 
 pub async fn audit_pass(
@@ -83,27 +115,12 @@ pub async fn audit_pass(
         .await?
         .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
     let coordinator = &state.coordinator;
+    // The run every commitment here has to have been made in.
+    let run_id = String::from(&coordinator.run_id);
 
-    let assigned: Option<HashSet<(String, u64, u64)>> = if config.audit_assigned {
-        match select_audits_for_current_round(coordinator, tie_breaker_committee_size) {
-            Ok(audits) => Some(
-                audits
-                    .iter()
-                    .filter_map(|a| {
-                        let (start, end) = parse_batch_bounds(&format!("{}", a.batch_id))?;
-                        // The full signer, as the dump names carry it (finding 20).
-                        Some((bs58::encode(a.target.signer()).into_string(), start, end))
-                    })
-                    .collect(),
-            ),
-            Err(err) => {
-                println!("[verifier-daemon] no audit assignments this round: {err:?}");
-                Some(HashSet::new())
-            }
-        }
-    } else {
-        None
-    };
+    let assigned = config
+        .audit_assigned
+        .then(|| audit_assignments(coordinator, tie_breaker_committee_size));
 
     let submitted = index_dir(&config.submitted_dir)?;
     let reference = match &config.reference_dir {
@@ -125,10 +142,13 @@ pub async fn audit_pass(
         if judged.contains(key) {
             continue;
         }
-        let (batch_start, batch_end) = parse_batch_bounds(key).unwrap_or((0, 0));
+        let Some((step, batch_id)) = parse_assignment_key(key) else {
+            println!("[verifier-daemon] skip  {key}: not a step and batch this daemon can read");
+            continue;
+        };
 
         if let Some(assigned) = &assigned {
-            if !assigned.contains(&(committer.clone(), batch_start, batch_end)) {
+            if !assigned.contains(&(committer.clone(), batch_id)) {
                 continue;
             }
         }
@@ -137,9 +157,66 @@ pub async fn audit_pass(
         // meant for a human reading a log line; using it here made two clients
         // sharing a prefix indistinguishable, and tied the conviction path to
         // how identities happen to be printed (finding 20).
-        let roster_index = coordinator.epoch_state.clients.iter().position(|client| {
-            bs58::encode(client.id.signer()).into_string() == committer
-        });
+        let Some(index) =
+            coordinator.epoch_state.clients.iter().position(|client| {
+                bs58::encode(client.id.signer()).into_string() == committer
+            })
+        else {
+            println!(
+                "[verifier-daemon] skip  {key} committer {committer} is not in the epoch roster, nothing to judge it against"
+            );
+            continue;
+        };
+        let target = coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .nth(index)
+            .expect("index was just found by position")
+            .id;
+
+        // What the committer signed comes first. A conviction is proven on chain
+        // against it, so a payload kept without one, or with one that does not
+        // hold, has nothing to convict on and is not worth replaying
+        // (wienerlabs/leviathan-net#43).
+        let commitment = match check_commitment(
+            submitted_path,
+            &run_id,
+            target.p2p_identity(),
+        ) {
+            Ok(CommitmentCheck::Verified(commitment)) => commitment,
+            Ok(CommitmentCheck::Missing) => {
+                println!(
+                    "[verifier-daemon] skip  {key} committer {committer} has no signed commitment kept with it, nothing to convict on"
+                );
+                judged.insert(key.clone());
+                continue;
+            },
+            Ok(CommitmentCheck::Invalid(reason)) => {
+                println!(
+                    "[verifier-daemon] skip  {key} committer {committer}: its commitment does not hold: {reason}"
+                );
+                judged.insert(key.clone());
+                continue;
+            },
+            // A failure to read the files may pass, so the pair is looked at
+            // again on the next pass rather than settled now.
+            Err(err) => {
+                println!(
+                    "[verifier-daemon] retry {key} committer {committer}: cannot read its commitment yet: {err:#}"
+                );
+                continue;
+            },
+        };
+        let record = commitment.record;
+        if (record.step, record.batch_id) != (step, batch_id) {
+            println!(
+                "[verifier-daemon] skip  {key} committer {committer}: its commitment is for step {} batch {}",
+                record.step, record.batch_id
+            );
+            judged.insert(key.clone());
+            continue;
+        }
 
         let reference_delta = match (&reference, replay) {
             (Some(reference), _) => {
@@ -150,16 +227,10 @@ pub async fn audit_pass(
             }
             (None, Some(engine)) => {
                 if let Some(step) = config.replay_step {
-                    if parse_assignment_key(key).map(|(at, _)| at) != Some(step) {
+                    if record.step != step {
                         continue;
                     }
                 }
-                let Some(index) = roster_index else {
-                    println!(
-                        "[verifier-daemon] skip  {key} committer {committer} is not in the epoch roster, nothing to replay against"
-                    );
-                    continue;
-                };
                 match engine.replay(index as u64) {
                     Ok(delta) => delta,
                     Err(err) => {
@@ -185,13 +256,24 @@ pub async fn audit_pass(
             continue;
         }
 
-        let committed_hash = hash_delta(&submitted_delta);
+        let signed = SignedCommitment {
+            run: commitment_run(coordinator),
+            batch_start: record.batch_id.0.start,
+            batch_end: record.batch_id.0.end,
+            evidence: CommitmentEvidence {
+                step: record.step,
+                trainer_nonce: record.trainer_nonce,
+                results_digest: commitment.results_digest,
+            },
+            signer: *target.p2p_identity(),
+            signature: record.signature,
+        };
         let replayed_hash = hash_delta(&reference_delta);
         println!(
             "[verifier-daemon] FRAUD {key} committer {committer} distance {:.4} exceeds band {:.4} (committed {} replayed {})",
             verdict.distance,
             config.band,
-            hex8(&committed_hash),
+            hex8(&signed.committed_hash()),
             hex8(&replayed_hash)
         );
 
@@ -200,12 +282,11 @@ pub async fn audit_pass(
             continue;
         }
 
-        let Some(index) = roster_index else {
-            println!("  committer {committer} is not in the current epoch roster, cannot act yet");
-            continue;
+        let action = if config.verdict_mode {
+            "verdict"
+        } else {
+            "slash"
         };
-
-        let action = if config.verdict_mode { "verdict" } else { "slash" };
         if config.dry_run {
             println!("  [dry-run] would submit {action} for {committer} at epoch index {index}");
             new_convictions += 1;
@@ -213,16 +294,6 @@ pub async fn audit_pass(
         }
 
         let result = if config.verdict_mode {
-            let target = Pubkey::new_from_array(
-                *coordinator
-                    .epoch_state
-                    .clients
-                    .iter()
-                    .nth(index)
-                    .expect("index was just found by position")
-                    .id
-                    .signer(),
-            );
             process_treasurer_run_submit_audit_verdict(
                 endpoint,
                 authority,
@@ -230,16 +301,14 @@ pub async fn audit_pass(
                 run,
                 coordinator_account,
                 &config.run_id,
-                &target,
+                &Pubkey::new_from_array(*target.signer()),
                 index as u64,
-                batch_start,
-                batch_end,
-                committed_hash,
+                &signed,
                 replayed_hash,
             )
             .await
         } else {
-            process_treasurer_run_slash_with_hashes(
+            process_treasurer_run_slash(
                 endpoint,
                 authority,
                 authority,
@@ -247,9 +316,7 @@ pub async fn audit_pass(
                 coordinator_account,
                 &config.run_id,
                 index as u64,
-                batch_start,
-                batch_end,
-                committed_hash,
+                &signed,
                 replayed_hash,
             )
             .await

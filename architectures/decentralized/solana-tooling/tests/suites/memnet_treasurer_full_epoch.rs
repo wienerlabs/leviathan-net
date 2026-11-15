@@ -13,7 +13,6 @@ use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGranteeUpdateParams;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
@@ -37,6 +36,8 @@ use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
+use super::signed_payload::identity;
+
 #[tokio::test]
 pub async fn run() {
     let mut endpoint = create_memnet_endpoint().await;
@@ -56,6 +57,7 @@ pub async fn run() {
     for _ in 0..11 {
         clients.push(Keypair::new());
     }
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let ticker = Keypair::new();
     let minted_collateral_amount = 1_000_000_000_000_000;
     let top_up_collateral_amount = 0_999_999_999_999_999;
@@ -295,7 +297,7 @@ pub async fn run() {
     .unwrap();
 
     // The clients can now join the run
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         process_coordinator_join_run(
             &mut endpoint,
             &payer,
@@ -303,7 +305,7 @@ pub async fn run() {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
