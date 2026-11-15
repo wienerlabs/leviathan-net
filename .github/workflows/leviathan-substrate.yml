@@ -11,6 +11,13 @@ on:
       - "architectures/decentralized/solana-coordinator/**"
       - "architectures/decentralized/solana-authorizer/**"
       - "architectures/decentralized/solana-tooling/**"
+      - "shared/core/**"
+      - "shared/modeling/**"
+      - "shared/network/**"
+      - "shared/client/**"
+      - "shared/data-provider/**"
+      - "config/leviathan/**"
+      - "scripts/replay-smoke.sh"
       - ".github/workflows/leviathan-substrate.yml"
   pull_request:
     paths:
@@ -22,6 +29,13 @@ on:
       - "architectures/decentralized/solana-coordinator/**"
       - "architectures/decentralized/solana-authorizer/**"
       - "architectures/decentralized/solana-tooling/**"
+      - "shared/core/**"
+      - "shared/modeling/**"
+      - "shared/network/**"
+      - "shared/client/**"
+      - "shared/data-provider/**"
+      - "config/leviathan/**"
+      - "scripts/replay-smoke.sh"
       - ".github/workflows/leviathan-substrate.yml"
 
 concurrency:
@@ -67,3 +81,66 @@ jobs:
 
       - name: Solana programs in-process (memnet)
         run: cargo test --locked -p psyche-solana-tooling
+
+  # The crates that link libtorch: the model, the payload encoding, the client
+  # that keeps peers' payloads, the replay verifier and the daemon that
+  # convicts on it. None of them built in any gate before, which is how the
+  # daemon suites came to overflow their stack unseen
+  # (wienerlabs/leviathan-net#35).
+  libtorch:
+    name: libtorch suites (model, verifier, daemon)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      LIBTORCH_USE_PYTORCH: "1"
+      LIBTORCH_BYPASS_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU torch, the version tch is built against
+        run: |
+          pip install --quiet torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
+          TORCH_LIB=$(python -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          PYTHON_LIB=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+          echo "LD_LIBRARY_PATH=$TORCH_LIB:$PYTHON_LIB:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$PYTHON_LIB:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: leviathan-libtorch
+
+      - name: Model and DisTrO
+        run: cargo test --locked -p psyche-modeling
+
+      - name: Payload encoding and commitments
+        run: cargo test --locked -p psyche-network
+
+      - name: The client keeps peers' payloads with what they signed
+        run: cargo test --locked -p psyche-client --lib
+
+      - name: Replay verifier
+        run: cargo test --locked -p leviathan-verifier
+
+      # The other memnet suites run in the job above; these are the ones
+      # that need libtorch.
+      - name: Verifier daemon on the real programs (memnet), default stack
+        run: cargo test --locked -p psyche-solana-tooling --features daemon --test mod verifier_daemon
+
+      - name: Replay smoke, honest cleared and forged convicted
+        run: |
+          cargo build --locked -p leviathan-verifier --bins
+          bash scripts/replay-smoke.sh

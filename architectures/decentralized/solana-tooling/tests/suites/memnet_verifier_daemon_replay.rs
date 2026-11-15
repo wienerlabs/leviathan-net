@@ -31,7 +31,6 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::daemon::audit_pass;
 use psyche_solana_tooling::daemon::AuditConfig;
-use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
@@ -52,6 +51,7 @@ use solana_sdk::signer::Signer;
 use super::signed_payload::identity;
 use super::signed_payload::keep_signed_payload;
 use super::signed_payload::payload_header;
+use super::chain_state::coordinator_state;
 
 const RUN_ID: &str = "Leviathan daemon replay slash";
 const BOND: u64 = 500;
@@ -350,10 +350,7 @@ pub async fn run() {
     // checkpoint, the one step this replay engine reproduces. What the cheater
     // trained there, and signed, is what it is judged on.
     let first_round =
-        get_coordinator_account_state(&mut endpoint, &coordinator_account)
-            .await
-            .unwrap()
-            .unwrap();
+        coordinator_state(&mut endpoint, &coordinator_account).await;
     let tie_breakers = get_run(&mut endpoint, &run)
         .await
         .unwrap()
@@ -373,10 +370,7 @@ pub async fn run() {
     );
 
     for _ in 0..4 {
-        let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-            .await
-            .unwrap()
-            .unwrap();
+        let state = coordinator_state(&mut endpoint, &coordinator_account).await;
         for client in &clients {
             let position = state
                 .coordinator
@@ -426,10 +420,7 @@ pub async fn run() {
     }
 
     let cheater_committer = clients[cheater].pubkey().to_string();
-    let roster = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-        .await
-        .unwrap()
-        .unwrap();
+    let roster = coordinator_state(&mut endpoint, &coordinator_account).await;
 
     // The cheater and an honest node, each with the payload it sent for its
     // batch of the run's first step and the commitment it signed.
@@ -565,10 +556,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-        .await
-        .unwrap()
-        .unwrap();
+    let state = coordinator_state(&mut endpoint, &coordinator_account).await;
     let cheater_state = state
         .clients_state
         .clients

@@ -1,4 +1,5 @@
 mod bonded_run;
+mod chain_state;
 mod memnet_authorizer_full_cycle;
 mod memnet_coordinator_data_layout;
 mod memnet_coordinator_full_round;

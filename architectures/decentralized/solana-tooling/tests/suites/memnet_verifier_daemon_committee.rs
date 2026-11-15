@@ -23,7 +23,6 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::daemon::audit_pass;
 use psyche_solana_tooling::daemon::AuditConfig;
-use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
@@ -51,6 +50,7 @@ use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::state::AuditVerdict;
 use super::signed_payload::FRAUD_PAYLOAD;
 use super::signed_payload::HONEST_PAYLOAD;
+use super::chain_state::coordinator_state;
 
 const RUN_ID: &str = "Leviathan daemon committee";
 const BOND: u64 = 500;
@@ -271,10 +271,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-        .await
-        .unwrap()
-        .unwrap();
+    let state = coordinator_state(&mut endpoint, &coordinator_account).await;
     let selection = CommitteeSelection::from_coordinator(&state.coordinator, 0).unwrap();
     let quorum = (2 * selection.get_num_verifier_nodes()).div_ceil(3).max(1);
 
@@ -364,10 +361,7 @@ pub async fn run() {
         assert_eq!(submitted, 1, "each verifier daemon submits one verdict");
     }
 
-    let mid = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-        .await
-        .unwrap()
-        .unwrap();
+    let mid = coordinator_state(&mut endpoint, &coordinator_account).await;
     let target_state_mid = mid
         .coordinator
         .epoch_state
@@ -394,10 +388,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    let after = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-        .await
-        .unwrap()
-        .unwrap();
+    let after = coordinator_state(&mut endpoint, &coordinator_account).await;
     let target_state_after = after
         .coordinator
         .epoch_state
@@ -457,10 +448,7 @@ pub async fn run() {
             &coordinator_account,
         )
         .await;
-        let settled = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-            .await
-            .unwrap()
-            .unwrap();
+        let settled = coordinator_state(&mut endpoint, &coordinator_account).await;
         target_slashed = settled
             .clients_state
             .clients
