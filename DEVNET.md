@@ -91,7 +91,8 @@ If you already have the repository, one command sets up the libtorch toolchain
 `--bond <amount>` posts collateral through the treasurer before joining, so a
 bonded node is one command. Inspect and manage the bond separately with
 `run-manager bond-status`, `bond-deposit`, `bond-withdraw-request` and
-`bond-withdraw-finalize`.
+`bond-withdraw-finalize`. The run's main authority sets the bond the run
+requires, and how long a withdrawal waits, with `run-manager set-bond-config`.
 
 A run that gates admission on the bond is one whose join authority is its own
 treasurer run. The client recognises it from chain state and joins it through

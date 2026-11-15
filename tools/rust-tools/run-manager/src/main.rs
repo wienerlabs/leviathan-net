@@ -24,8 +24,8 @@ use commands::authorization::{
 use commands::can_join::CommandCanJoin;
 use commands::run::{
     CommandCheckpoint, CommandCloseRun, CommandCreateRun, CommandDownloadResults,
-    CommandJsonDumpRun, CommandJsonDumpUser, CommandSetFutureEpochRates, CommandSetPaused,
-    CommandTick, CommandUpdateConfig, CommandUploadData,
+    CommandJsonDumpRun, CommandJsonDumpUser, CommandSetBondConfig, CommandSetFutureEpochRates,
+    CommandSetPaused, CommandTick, CommandUpdateConfig, CommandUploadData,
 };
 use commands::treasury::{
     CommandBondDeposit, CommandBondStatus, CommandBondWithdrawFinalize,
@@ -60,8 +60,9 @@ struct CliArgs {
     #[arg(long)]
     env_file: Option<PathBuf>,
 
-    /// Coordinator program ID (Docker mode)
-    #[arg(long, default_value = "4SHugWqSXwKE5fqDchkJcPEqnoZE22VYKtSTVm7axbT7")]
+    /// Coordinator program ID (Docker mode). Defaults to the program this
+    /// binary was built for.
+    #[arg(long, default_value_t = psyche_solana_coordinator::ID.to_string())]
     coordinator_program_id: String,
 
     /// Use a local Docker image instead of pulling from registry (Docker mode)
@@ -131,6 +132,15 @@ enum Commands {
         wallet: WalletArgs,
         #[clap(flatten)]
         params: CommandSetPaused,
+    },
+    /// Set the bond a treasurer run requires and its withdrawal delay
+    SetBondConfig {
+        #[clap(flatten)]
+        cluster: ClusterArgs,
+        #[clap(flatten)]
+        wallet: WalletArgs,
+        #[clap(flatten)]
+        params: CommandSetBondConfig,
     },
     SetFutureEpochRates {
         #[clap(flatten)]
@@ -284,8 +294,9 @@ enum Commands {
         env_file: Option<PathBuf>,
         #[clap(flatten)]
         cluster: ClusterArgs,
-        /// Coordinator program ID
-        #[arg(long, default_value = "4SHugWqSXwKE5fqDchkJcPEqnoZE22VYKtSTVm7axbT7")]
+        /// Coordinator program ID. Defaults to the program this binary was
+        /// built for.
+        #[arg(long, default_value_t = psyche_solana_coordinator::ID.to_string())]
         coordinator_program_id: String,
         /// Only show runs where this pubkey is the join_authority
         #[arg(long)]
@@ -399,6 +410,11 @@ async fn async_main() -> Result<()> {
             params,
         } => params.execute(create_backend(cluster, wallet)?).await,
         Commands::SetPaused {
+            cluster,
+            wallet,
+            params,
+        } => params.execute(create_backend(cluster, wallet)?).await,
+        Commands::SetBondConfig {
             cluster,
             wallet,
             params,
@@ -583,4 +599,26 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Left off, the coordinator program is the one this binary was built
+    /// for, never a retired id (wienerlabs/leviathan-net#51).
+    #[test]
+    fn the_default_coordinator_program_is_the_crates() {
+        let current = psyche_solana_coordinator::ID.to_string();
+        let docker = CliArgs::parse_from(["run-manager"]);
+        assert_eq!(docker.coordinator_program_id, current);
+        let Some(Commands::ListRuns {
+            coordinator_program_id,
+            ..
+        }) = CliArgs::parse_from(["run-manager", "list-runs"]).command
+        else {
+            panic!("list-runs did not parse");
+        };
+        assert_eq!(coordinator_program_id, current);
+    }
 }

@@ -339,6 +339,24 @@ pub fn treasurer_run_update(
     )
 }
 
+/// Sets the bond a treasurer run requires of its participants, and how long a
+/// withdrawal waits, signed by the run's main authority. A non-zero minimum
+/// needs a non-zero delay, which the program enforces.
+pub fn treasurer_run_bond_config_update(
+    treasurer_index: u64,
+    main_authority: &Pubkey,
+    params: psyche_solana_treasurer::logic::RunBondConfigUpdateParams,
+) -> Instruction {
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunBondConfigUpdateAccounts {
+            main_authority: *main_authority,
+            run: psyche_solana_treasurer::find_run(treasurer_index),
+        },
+        psyche_solana_treasurer::instruction::RunBondConfigUpdate { params },
+    )
+}
+
 pub fn treasurer_participant_create(
     payer: &Pubkey,
     treasurer_index: u64,
