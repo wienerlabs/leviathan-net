@@ -7482,6 +7482,7 @@ dependencies = [
  "flume",
  "itertools 0.14.0",
  "memmap2 0.9.9",
+ "psyche-coordinator",
  "psyche-core",
  "psyche-data-provider",
  "psyche-network",
@@ -7498,6 +7499,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-util 0.7.18",
+ "toml 0.8.23",
  "torch-sys",
  "tracing",
 ]

@@ -26,6 +26,8 @@ flume.workspace = true
 # for examples
 [dev-dependencies]
 clap.workspace = true
+psyche-coordinator.workspace = true
+toml.workspace = true
 clap-markdown.workspace = true
 psyche-data-provider.workspace = true
 psyche-network.workspace = true
