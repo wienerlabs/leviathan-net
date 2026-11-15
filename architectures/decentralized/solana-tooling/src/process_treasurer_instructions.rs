@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use psyche_core::NodeIdentity;
 use crate::get_accounts::get_run;
+use crate::signed_commitment::SignedCommitment;
 use psyche_solana_authorizer::find_authorization;
 use psyche_solana_coordinator::find_coordinator_instance;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
@@ -63,11 +64,13 @@ use psyche_solana_treasurer::logic::RunSubmitAppealVerdictParams;
 use psyche_solana_treasurer::logic::RunFinalizeSlashParams;
 use psyche_solana_treasurer::logic::RunSlashLosingVerifierParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
+use psyche_solana_treasurer::state::CommitmentEvidence;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::system_program;
+use solana_sdk::sysvar;
 use solana_toolbox_endpoint::ToolboxEndpoint;
 
 pub async fn process_treasurer_run_create(
@@ -181,6 +184,49 @@ pub async fn process_treasurer_run_bond_config_update(
     Ok(())
 }
 
+/// The run authority's slash instruction, convicting the client at `index`
+/// on `evidence`. It is refused unless the same transaction proves the
+/// client's p2p key signed the commitment; `process_treasurer_run_slash` sends
+/// the two together.
+#[allow(clippy::too_many_arguments)]
+pub fn run_slash_instruction(
+    authority: &Pubkey,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    index: u64,
+    batch_start: u64,
+    batch_end: u64,
+    evidence: CommitmentEvidence,
+    replayed_hash: [u8; 32],
+) -> Instruction {
+    let coordinator_instance = find_coordinator_instance(run_id);
+    let accounts = RunSlashAccounts {
+        authority: *authority,
+        run: *run,
+        coordinator_instance,
+        coordinator_account: *coordinator_account,
+        coordinator_program: psyche_solana_coordinator::ID,
+        instructions: sysvar::instructions::ID,
+    };
+    Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSlash {
+            params: RunSlashParams {
+                index,
+                batch_start,
+                batch_end,
+                evidence,
+                replayed_hash,
+            },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    }
+}
+
+/// The run authority convicts the client at `index` on `commitment`, a payload
+/// it signed, together with the precompile instruction that proves it.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_treasurer_run_slash(
     endpoint: &mut ToolboxEndpoint,
@@ -190,65 +236,81 @@ pub async fn process_treasurer_run_slash(
     coordinator_account: &Pubkey,
     run_id: &str,
     index: u64,
+    commitment: &SignedCommitment,
+    replayed_hash: [u8; 32],
 ) -> Result<()> {
-    process_treasurer_run_slash_with_hashes(
-        endpoint,
-        payer,
-        authority,
+    let instruction = run_slash_instruction(
+        &authority.pubkey(),
         run,
         coordinator_account,
         run_id,
         index,
-        0,
-        0,
-        [0x11; 32],
-        [0x22; 32],
-    )
-    .await
+        commitment.batch_start,
+        commitment.batch_end,
+        commitment.evidence,
+        replayed_hash,
+    );
+    endpoint
+        .process_instructions_with_signers(
+            payer,
+            &[commitment.proof_instruction(), instruction],
+            &[authority],
+        )
+        .await?;
+    Ok(())
 }
 
+/// A verifier's vote to convict `target` on `evidence`. It is refused unless
+/// the same transaction proves the target's p2p key signed the commitment;
+/// `process_treasurer_run_submit_audit_verdict` sends the two together.
 #[allow(clippy::too_many_arguments)]
-pub async fn process_treasurer_run_slash_with_hashes(
-    endpoint: &mut ToolboxEndpoint,
-    payer: &Keypair,
-    authority: &Keypair,
+pub fn run_submit_audit_verdict_instruction(
+    payer: &Pubkey,
+    verifier: &Pubkey,
     run: &Pubkey,
     coordinator_account: &Pubkey,
     run_id: &str,
-    index: u64,
+    target: &Pubkey,
+    target_index: u64,
     batch_start: u64,
     batch_end: u64,
-    committed_hash: [u8; 32],
+    evidence: CommitmentEvidence,
     replayed_hash: [u8; 32],
-) -> Result<()> {
+) -> Instruction {
     let coordinator_instance = find_coordinator_instance(run_id);
-    let accounts = RunSlashAccounts {
-        authority: authority.pubkey(),
+    let verifier_participant = find_participant(run, verifier);
+    let audit_verdict = find_audit_verdict(run, target);
+    let accounts = RunSubmitAuditVerdictAccounts {
+        payer: *payer,
+        verifier: *verifier,
+        verifier_participant,
         run: *run,
         coordinator_instance,
         coordinator_account: *coordinator_account,
+        audit_verdict,
         coordinator_program: psyche_solana_coordinator::ID,
+        system_program: system_program::ID,
+        instructions: sysvar::instructions::ID,
     };
-    let instruction = Instruction {
+    Instruction {
         accounts: accounts.to_account_metas(None),
-        data: RunSlash {
-            params: RunSlashParams {
-                index,
+        data: RunSubmitAuditVerdict {
+            params: RunSubmitAuditVerdictParams {
+                target: *target,
+                target_index,
                 batch_start,
                 batch_end,
-                committed_hash,
+                evidence,
                 replayed_hash,
             },
         }
         .data(),
         program_id: psyche_solana_treasurer::ID,
-    };
-    endpoint
-        .process_instruction_with_signers(payer, instruction, &[authority])
-        .await?;
-    Ok(())
+    }
 }
 
+/// `verifier` votes to convict `target` on `commitment`, a payload the target
+/// signed, together with the precompile instruction that proves it.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_treasurer_run_submit_audit_verdict(
     endpoint: &mut ToolboxEndpoint,
@@ -259,42 +321,28 @@ pub async fn process_treasurer_run_submit_audit_verdict(
     run_id: &str,
     target: &Pubkey,
     target_index: u64,
-    batch_start: u64,
-    batch_end: u64,
-    committed_hash: [u8; 32],
+    commitment: &SignedCommitment,
     replayed_hash: [u8; 32],
 ) -> Result<()> {
-    let coordinator_instance = find_coordinator_instance(run_id);
-    let verifier_participant = find_participant(run, &verifier.pubkey());
-    let audit_verdict = find_audit_verdict(run, target);
-    let accounts = RunSubmitAuditVerdictAccounts {
-        payer: payer.pubkey(),
-        verifier: verifier.pubkey(),
-        verifier_participant,
-        run: *run,
-        coordinator_instance,
-        coordinator_account: *coordinator_account,
-        audit_verdict,
-        coordinator_program: psyche_solana_coordinator::ID,
-        system_program: system_program::ID,
-    };
-    let instruction = Instruction {
-        accounts: accounts.to_account_metas(None),
-        data: RunSubmitAuditVerdict {
-            params: RunSubmitAuditVerdictParams {
-                target: *target,
-                target_index,
-                batch_start,
-                batch_end,
-                committed_hash,
-                replayed_hash,
-            },
-        }
-        .data(),
-        program_id: psyche_solana_treasurer::ID,
-    };
+    let instruction = run_submit_audit_verdict_instruction(
+        &payer.pubkey(),
+        &verifier.pubkey(),
+        run,
+        coordinator_account,
+        run_id,
+        target,
+        target_index,
+        commitment.batch_start,
+        commitment.batch_end,
+        commitment.evidence,
+        replayed_hash,
+    );
     endpoint
-        .process_instruction_with_signers(payer, instruction, &[verifier])
+        .process_instructions_with_signers(
+            payer,
+            &[commitment.proof_instruction(), instruction],
+            &[verifier],
+        )
         .await?;
     Ok(())
 }

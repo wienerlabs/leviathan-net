@@ -293,6 +293,13 @@ fn assignment_keys_carry_the_step_and_batch_the_target_trained() {
     let (step, batch) = parse_assignment_key("step7-batchB[12, 19]").expect("a real dump name");
     assert_eq!(step, 7);
     assert_eq!(batch, BatchId(ClosedInterval::new(12, 19)));
+    // A batch of one sample is named the way `BatchId` displays it, without
+    // brackets, and is read back all the same.
+    let single = BatchId(ClosedInterval::new(15, 15));
+    assert_eq!(
+        parse_assignment_key(&format!("step3-batch{single}")),
+        Some((3, single))
+    );
     assert!(parse_assignment_key("not-a-dump-name").is_none());
 }
 

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -23,6 +24,9 @@ use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
+use psyche_solana_tooling::get_accounts::get_run;
+use psyche_solana_tooling::signed_commitment::payload_dump_digest;
+use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
@@ -49,6 +53,17 @@ use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
+
+/// The payload the target broadcasts, and an honest one for the same batch,
+/// both produced by a real model.
+const CHEATER_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/daemon/fraud.vec-postcard"
+);
+const REPLAY_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/daemon/honest.vec-postcard"
+);
 
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
@@ -131,6 +146,11 @@ async fn run() -> Result<()> {
     let join_authority = Keypair::new();
     let ticker = Keypair::new();
     let clients: Vec<Keypair> = (0..6).map(|_| Keypair::new()).collect();
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
+    // The payload the target broadcasts, and what an honest replay of its
+    // batch produces: real dumps from a real model.
+    let target_payload = payload_dump_digest(Path::new(CHEATER_DUMP))?;
+    let replayed = payload_dump_digest(Path::new(REPLAY_DUMP))?;
 
     println!("[+] creating collateral mint");
     let collateral_mint = endpoint
@@ -276,7 +296,7 @@ async fn run() -> Result<()> {
     .unwrap();
 
     println!("[+] clients join the run");
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -302,7 +322,10 @@ async fn run() -> Result<()> {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            NodeIdentity::new(
+                client.pubkey().to_bytes(),
+                p2p.pubkey().to_bytes(),
+            ),
         )
         .await
         .unwrap();
@@ -398,6 +421,27 @@ async fn run() -> Result<()> {
         .find(|k| k.pubkey() == target_key)
         .ok_or_else(|| anyhow!("target keypair not found"))?;
 
+    // What the target signed for the batch it trains in this round: the
+    // commitment every verdict below is proven against on chain.
+    let target_node = clients
+        .iter()
+        .position(|k| k.pubkey() == target_key)
+        .ok_or_else(|| anyhow!("target keypair not found"))?;
+    let tie_breaker_committee_size = get_run(&mut endpoint, &run)
+        .await?
+        .ok_or_else(|| anyhow!("run {run} not found"))?
+        .tie_breaker_committee_size;
+    let signed = SignedCommitment::for_round(
+        &state.coordinator,
+        tie_breaker_committee_size,
+        &NodeIdentity::new(
+            target_key.to_bytes(),
+            p2ps[target_node].pubkey().to_bytes(),
+        ),
+        &p2ps[target_node],
+        target_payload,
+    )?;
+
     println!("[+] {} verifiers convict the target (a pending slash opens the challenge window)", verifier_quorum);
     for (i, verifier) in verifiers.iter().take(verifier_quorum as usize).enumerate() {
         process_treasurer_run_submit_audit_verdict(
@@ -409,10 +453,8 @@ async fn run() -> Result<()> {
             &run_id,
             &target_key,
             target_index,
-            0,
-            4,
-            [0xAA; 32],
-            [0xBB; 32],
+            &signed,
+            replayed,
         )
         .await?;
         println!("    verifier {} voted", i + 1);

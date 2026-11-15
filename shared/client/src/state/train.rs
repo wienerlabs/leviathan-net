@@ -15,12 +15,12 @@ use psyche_modeling::{
     TrainerThreadCommunicationError,
 };
 use psyche_network::{
-    Hash, SerializeDistroResultError, SerializedDistroResult, TransmittableDistroResult,
-    distro_results_to_bytes,
+    CommitmentRecord, Hash, SerializeDistroResultError, SerializedDistroResult,
+    TransmittableDistroResult, commitment_record_path, distro_results_to_bytes,
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, trace, trace_span, warn};
 
@@ -77,6 +77,9 @@ pub enum TrainError {
 
     #[error("Failed to serialize distro result: {0}")]
     SerializeDistroResult(SerializeDistroResultError),
+
+    #[error("Failed to hash distro result for its commitment: {0}")]
+    HashDistroResult(postcard::Error),
 
     #[error("Failed to send distro result, channel must be closed")]
     SendDistroResult,
@@ -288,6 +291,8 @@ impl TrainingStepMetadata {
                 })
             } else {
                 let identity = self.identity;
+                // The run a payload's commitment is bound to.
+                let run_id = String::from(&state.run_id);
                 let cancel_training = cancel_training.clone();
                 let write_gradients_dir = self.write_gradients_dir.clone();
                 let tx_distro_result = self.tx_distro_result.clone();
@@ -419,6 +424,7 @@ impl TrainingStepMetadata {
                                 }
                                 let write_gradients_dir = write_gradients_dir.clone();
                                 let tx_distro_result = tx_distro_result.clone();
+                                let run_id = run_id.clone();
                                 let res: Result<(), TrainError> = tokio::task::spawn_blocking(move || {
                                     if cancelled {
                                         trace!("However, we were cancelled, so we're throwing away this result.");
@@ -445,14 +451,16 @@ impl TrainingStepMetadata {
                                         let dir = dir.clone();
                                         tokio::spawn(async move {
                                             if let Err(err) =
-                                                write_gradients_to_disk(dir, identity, transmittable_distro_result).await
+                                                write_gradients_to_disk(dir, identity, transmittable_distro_result, None).await
                                             {
                                                 error!("Failed to write gradients to disk: {err:#}");
                                             }
                                         });
                                     }
 
-                                    let commitment_data_hash = transmittable_distro_result.comptue_hash();
+                                    let commitment_data_hash = transmittable_distro_result
+                                        .comptue_hash(&run_id)
+                                        .map_err(TrainError::HashDistroResult)?;
 
                                     trace!("trying to queue tx distro result...");
                                     tx_distro_result
@@ -795,10 +803,28 @@ fn inject_fake_delta(results: Vec<DistroResult>) -> Vec<DistroResult> {
         .collect()
 }
 
+/// Writes `distro_result` to disk, as a payload dump the verifier daemon reads.
+///
+/// A peer's payload comes with `commitment`, the record of what the peer
+/// signed for it, which is what a conviction proves on chain
+/// (wienerlabs/leviathan-net#43). The pair has to hold together for a reader
+/// at any moment:
+///
+/// - **One payload per committer, step and batch, the first kept.** A peer that
+///   signs two payloads for the same batch would otherwise have them written
+///   over each other. That can leave one's record beside the other's dump, and
+///   nothing could be convicted on it. The record is created only if none
+///   exists, so the first payload owns the name.
+/// - **The record before the dump, and the dump all at once.** The record is
+///   on disk before the dump is written under a temporary name and renamed
+///   into place, so a reader that finds the dump also finds its record,
+///   complete, beside it. A dump that cannot be written takes its record
+///   with it.
 pub(crate) async fn write_gradients_to_disk(
     write_gradients_dir: PathBuf,
     identity: NodeIdentity,
     distro_result: TransmittableDistroResult,
+    commitment: Option<CommitmentRecord>,
 ) -> Result<(), WriteGradientsError> {
     debug!("Trying to write distro result to disk...");
     tokio::fs::create_dir_all(&write_gradients_dir)
@@ -824,12 +850,288 @@ pub(crate) async fn write_gradients_to_disk(
             err,
         }
     })?;
-    tokio::fs::write(fpath, serialized)
-        .await
-        .map_err(|err| WriteGradientsError::Write {
-            fname: fname.clone(),
-            err,
-        })?;
+    let Some(commitment) = commitment else {
+        write_whole(&write_gradients_dir, &fname, &serialized).await?;
+        debug!("Wrote distro result {fname}.");
+        return Ok(());
+    };
+    let record_path = commitment_record_path(&fpath);
+    if !claim_record(&record_path, &commitment, &fpath).await? {
+        warn!(
+            "Already keeping a payload for {fname}; the committer signed another for the same batch, keeping the first"
+        );
+        return Ok(());
+    }
+    if let Err(err) = write_whole(&write_gradients_dir, &fname, &serialized).await {
+        // A record whose dump never lands would keep this payload out for good,
+        // so it goes too, and the payload can be kept when it comes again.
+        if let Err(cleanup) = tokio::fs::remove_file(&record_path).await {
+            warn!(
+                "Could not remove {} after its dump failed: {cleanup}",
+                record_path.display()
+            );
+        }
+        return Err(err);
+    }
     debug!("Wrote distro result {fname}.");
     Ok(())
+}
+
+/// Takes the commitment record for the dump at `dump`, which says this payload
+/// is the one kept under that name. Returns false if another payload holds it.
+///
+/// A record left without its dump, by a crash or a failed write, is still
+/// this payload's if the same commitment arrives again, and the dump is then
+/// finished rather than the payload refused.
+async fn claim_record(
+    record_path: &Path,
+    commitment: &CommitmentRecord,
+    dump: &Path,
+) -> Result<bool, WriteGradientsError> {
+    let write_error = |err| WriteGradientsError::Write {
+        fname: record_path.display().to_string(),
+        err,
+    };
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(record_path)
+        .await
+    {
+        Ok(mut record) => {
+            record
+                .write_all(&commitment.to_bytes())
+                .await
+                .map_err(write_error)?;
+            // On disk before the dump can appear beside it.
+            record.sync_all().await.map_err(write_error)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let held = tokio::fs::read(record_path).await.map_err(write_error)?;
+            let same = CommitmentRecord::from_bytes(&held).is_ok_and(|held| held == *commitment);
+            let dump_kept = tokio::fs::try_exists(dump).await.map_err(write_error)?;
+            Ok(same && !dump_kept)
+        }
+        Err(err) => Err(write_error(err)),
+    }
+}
+
+/// Writes `bytes` to `dir/fname` so that a reader finds either nothing there
+/// or all of it. They go to a temporary name of their own, reach the disk,
+/// and are renamed into place.
+async fn write_whole(dir: &Path, fname: &str, bytes: &[u8]) -> Result<(), WriteGradientsError> {
+    let partial = dir.join(format!("{fname}.{:016x}.partial", rand::random::<u64>()));
+    let written = async {
+        let mut file = tokio::fs::File::create(&partial).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&partial, dir.join(fname)).await
+    }
+    .await;
+    if let Err(err) = written {
+        if let Err(cleanup) = tokio::fs::remove_file(&partial).await {
+            if cleanup.kind() != std::io::ErrorKind::NotFound {
+                warn!("Could not remove {}: {cleanup}", partial.display());
+            }
+        }
+        return Err(WriteGradientsError::Write {
+            fname: fname.to_string(),
+            err,
+        });
+    }
+    Ok(())
+}
+
+/// A verifier convicts a peer on the payload it keeps and the record of what
+/// the peer signed for it, so the pair has to hold together whenever the
+/// verifier reads it (wienerlabs/leviathan-net#43).
+#[cfg(test)]
+mod write_gradients_tests {
+    use super::*;
+    use psyche_core::ClosedInterval;
+    use psyche_network::SecretKey;
+    use tch::{Kind, Tensor};
+
+    const RUN: &str = "leviathan kept payloads";
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("levkept-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A payload of one compressed result whose values are `values`.
+    fn payload(values: &[f32]) -> TransmittableDistroResult {
+        let result = DistroResult {
+            sparse_idx: Tensor::from_slice(&[0i64, 1, 2]).to_kind(Kind::Int16),
+            sparse_val: Tensor::from_slice(values).to_kind(Kind::Float),
+            xshape: vec![1, 3],
+            totalk: 3,
+            stats: None,
+        };
+        TransmittableDistroResult {
+            step: 5,
+            trainer_nonce: 2,
+            batch_id: BatchId(ClosedInterval::new(8, 9)),
+            distro_results: vec![SerializedDistroResult::try_from(&result).unwrap()],
+        }
+    }
+
+    fn signed(key: &SecretKey, payload: &TransmittableDistroResult) -> CommitmentRecord {
+        let data_hash = payload.comptue_hash(RUN).unwrap();
+        CommitmentRecord::new(payload, data_hash, key.sign(&data_hash).to_bytes())
+    }
+
+    fn peer(key: &SecretKey) -> NodeIdentity {
+        NodeIdentity::new(*key.public().as_bytes(), *key.public().as_bytes())
+    }
+
+    fn dump_of(dir: &Path, peer: &NodeIdentity, payload: &TransmittableDistroResult) -> PathBuf {
+        dir.join(format!(
+            "result-{}-step{}-batch{}.vec-postcard",
+            bs58::encode(peer.signer()).into_string(),
+            payload.step,
+            payload.batch_id
+        ))
+    }
+
+    fn kept(dump: &Path) -> (CommitmentRecord, Vec<SerializedDistroResult>) {
+        let record =
+            CommitmentRecord::from_bytes(&std::fs::read(commitment_record_path(dump)).unwrap())
+                .unwrap();
+        let results = psyche_network::distro_results_from_reader(std::io::Cursor::new(
+            std::fs::read(dump).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        (record, results)
+    }
+
+    #[tokio::test]
+    async fn a_peer_payload_is_kept_beside_the_record_it_was_signed_with() {
+        let dir = scratch("pair");
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(&[1.0, -2.0, 3.0]);
+        write_gradients_to_disk(
+            dir.clone(),
+            peer(&key),
+            payload.clone(),
+            Some(signed(&key, &payload)),
+        )
+        .await
+        .unwrap();
+
+        let dump = dump_of(&dir, &peer(&key), &payload);
+        let (record, results) = kept(&dump);
+        assert_eq!(
+            record.verify(&results, RUN, key.public().as_bytes()),
+            Ok(())
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    /// A peer that signs two payloads for one batch gets the first kept, with
+    /// its own record, rather than one written over the other.
+    #[tokio::test]
+    async fn the_first_payload_a_peer_signed_for_a_batch_is_the_one_kept() {
+        let dir = scratch("first");
+        let key = SecretKey::generate(&mut rand::rng());
+        let first = payload(&[1.0, -2.0, 3.0]);
+        let second = payload(&[4.0, 5.0, -6.0]);
+        assert_ne!(
+            first.comptue_hash(RUN).unwrap(),
+            second.comptue_hash(RUN).unwrap()
+        );
+
+        for payload in [&first, &second] {
+            write_gradients_to_disk(
+                dir.clone(),
+                peer(&key),
+                payload.clone(),
+                Some(signed(&key, payload)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (record, results) = kept(&dump_of(&dir, &peer(&key), &first));
+        assert_eq!(record.data_hash, first.comptue_hash(RUN).unwrap());
+        assert_eq!(
+            record.verify(&results, RUN, key.public().as_bytes()),
+            Ok(())
+        );
+    }
+
+    /// A record left without its dump is finished by the same commitment when
+    /// it comes again, rather than keeping the payload out.
+    #[tokio::test]
+    async fn a_record_left_without_its_dump_is_finished_by_the_same_payload() {
+        let dir = scratch("unfinished");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(&[1.0, -2.0, 3.0]);
+        let record = signed(&key, &payload);
+        let dump = dump_of(&dir, &peer(&key), &payload);
+        std::fs::write(commitment_record_path(&dump), record.to_bytes()).unwrap();
+
+        write_gradients_to_disk(dir.clone(), peer(&key), payload.clone(), Some(record))
+            .await
+            .unwrap();
+        let (kept_record, results) = kept(&dump);
+        assert_eq!(
+            kept_record.verify(&results, RUN, key.public().as_bytes()),
+            Ok(())
+        );
+    }
+
+    /// A dump that cannot be written takes its record with it, so the payload
+    /// is not kept out for good and no partial file is left. The rename fails
+    /// here because a directory sits at the dump's name.
+    #[tokio::test]
+    async fn a_dump_that_cannot_be_written_leaves_no_record_behind() {
+        let dir = scratch("failed");
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(&[1.0, -2.0, 3.0]);
+        let dump = dump_of(&dir, &peer(&key), &payload);
+        std::fs::create_dir_all(dump.join("occupied")).unwrap();
+
+        let result = write_gradients_to_disk(
+            dir.clone(),
+            peer(&key),
+            payload.clone(),
+            Some(signed(&key, &payload)),
+        )
+        .await;
+        assert!(result.is_err(), "a dump written over a directory succeeded");
+        assert!(
+            !commitment_record_path(&dump).exists(),
+            "the record outlived its dump"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    /// A node's own result is kept with no record: nobody convicts itself.
+    #[tokio::test]
+    async fn an_own_result_is_kept_without_a_record() {
+        let dir = scratch("own");
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(&[1.0, -2.0, 3.0]);
+        write_gradients_to_disk(dir.clone(), peer(&key), payload.clone(), None)
+            .await
+            .unwrap();
+        let dump = dump_of(&dir, &peer(&key), &payload);
+        assert!(dump.exists());
+        assert!(!commitment_record_path(&dump).exists());
+    }
 }

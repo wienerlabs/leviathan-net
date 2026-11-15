@@ -35,7 +35,6 @@ use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::CoordinatorAccount;
@@ -63,11 +62,17 @@ use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
 use std::collections::HashSet;
 
+use psyche_solana_tooling::get_accounts::get_run;
+use psyche_solana_tooling::signed_commitment::SignedCommitment;
+
+use super::signed_payload::identity;
+use super::signed_payload::replayed_digest;
+use super::signed_payload::signed_payload;
+use super::signed_payload::FRAUD_PAYLOAD;
+
 const RUN_ID: &str = "Leviathan cross round";
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
-const COMMITTED: [u8; 32] = [0xAA; 32];
-const REPLAYED: [u8; 32] = [0xBB; 32];
 
 type State = psyche_solana_coordinator::CoordinatorInstanceState;
 
@@ -91,6 +96,7 @@ pub async fn votes_from_different_committees_do_not_add_up() {
     for _ in 0..6 {
         clients.push(Keypair::new());
     }
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let warmup_time = 10;
     let round_witness_time = 10u64;
 
@@ -234,7 +240,7 @@ pub async fn votes_from_different_committees_do_not_add_up() {
     .await
     .unwrap();
 
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -260,7 +266,7 @@ pub async fn votes_from_different_committees_do_not_add_up() {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
@@ -293,6 +299,25 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         .find(|key| !first_round_verifiers.contains(key))
         .expect("some client is not a verifier this round");
 
+    // What the target signed for the batch it trained this round. Every vote
+    // below disputes this one payload, in whichever round it lands.
+    let target_node = clients
+        .iter()
+        .position(|k| k.pubkey() == target_key)
+        .unwrap();
+    let tie_breakers = get_run(&mut endpoint, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .tie_breaker_committee_size;
+    let commitment = signed_payload(
+        &state.coordinator,
+        tie_breakers,
+        &identity(&clients[target_node], &p2ps[target_node]),
+        &p2ps[target_node],
+        FRAUD_PAYLOAD,
+    );
+
     // One vote, from a verifier legitimately seated in this round.
     let first_voter = *first_round_verifiers
         .iter()
@@ -305,6 +330,7 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         &run,
         &coordinator_account,
         &target_key,
+        &commitment,
     )
     .await
     .expect("a seated verifier may vote");
@@ -372,6 +398,7 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         &run,
         &coordinator_account,
         &target_key,
+        &commitment,
     )
     .await
     .expect("a seated verifier may vote");
@@ -396,6 +423,7 @@ pub async fn votes_from_different_committees_do_not_add_up() {
             &run,
             &coordinator_account,
             &target_key,
+            &commitment,
         )
         .await
         .expect("a second verifier from the same round completes the quorum");
@@ -466,6 +494,7 @@ async fn cast(
     run: &Pubkey,
     coordinator_account: &Pubkey,
     target: &Pubkey,
+    commitment: &SignedCommitment,
 ) -> anyhow::Result<()> {
     // The index is looked up fresh, exactly as an honest verifier client would.
     let target_index = state_of(endpoint, coordinator_account)
@@ -485,10 +514,8 @@ async fn cast(
         RUN_ID,
         target,
         target_index,
-        0,
-        1,
-        COMMITTED,
-        REPLAYED,
+        commitment,
+        replayed_digest(),
     )
     .await
 }

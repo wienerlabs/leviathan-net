@@ -20,10 +20,8 @@ use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_core::BatchId;
-use psyche_core::ClosedInterval;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_data_provider::download_model_repo_sync;
 use psyche_modeling::Batch;
@@ -53,7 +51,12 @@ use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::signature::Keypair;
+use psyche_solana_tooling::get_accounts::get_run;
 use solana_sdk::signer::Signer;
+
+use super::signed_payload::identity;
+use super::signed_payload::keep_signed_payload;
+use super::signed_payload::payload_header;
 
 const RUN_ID: &str = "Leviathan daemon replay slash";
 const BOND: u64 = 500;
@@ -100,12 +103,16 @@ fn nano_trainer() -> Trainer {
     .expect("the replay trainer must build")
 }
 
-fn nano_train_once(trainer: Trainer) -> (Trainer, Vec<f32>) {
+fn nano_train_once(
+    trainer: Trainer,
+    step: u32,
+    batch_id: BatchId,
+) -> (Trainer, Vec<f32>) {
     let output = trainer
         .train(
-            1,
+            step,
             Batch {
-                id: BatchId(ClosedInterval::new(0, 1)),
+                id: batch_id,
                 data: BatchData::CPU(nano_batch()),
             },
             None,
@@ -145,6 +152,7 @@ pub async fn run() {
     for _ in 0..4 {
         clients.push(Keypair::new());
     }
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let cheater = 0usize;
     let warmup_time = 10;
     let round_witness_time = 10;
@@ -280,7 +288,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -306,7 +314,7 @@ pub async fn run() {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
@@ -338,6 +346,32 @@ pub async fn run() {
     )
     .await
     .unwrap();
+
+    // The first round trains the run's first step from the published
+    // checkpoint, the one step this replay engine reproduces. What the cheater
+    // trained there, and signed, is what it is judged on.
+    let first_round =
+        get_coordinator_account_state(&mut endpoint, &coordinator_account)
+            .await
+            .unwrap()
+            .unwrap();
+    let tie_breakers = get_run(&mut endpoint, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .tie_breaker_committee_size;
+    let header = payload_header(
+        &first_round.coordinator,
+        tie_breakers,
+        &identity(&clients[cheater], &p2ps[cheater]),
+    );
+    // The run every commitment here is made in, as the coordinator names it.
+    let run_id = String::from(&first_round.coordinator.run_id);
+    let (step, _, batch_id) = header;
+    assert_eq!(
+        step, first_round.coordinator.epoch_state.start_step,
+        "the first round trains the epoch's first step"
+    );
 
     for _ in 0..4 {
         let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
@@ -405,24 +439,26 @@ pub async fn run() {
         .position(|client| *client.id.signer() == clients[cheater].pubkey().to_bytes())
         .expect("the cheater must be in the epoch roster") as u64;
 
-    let (_, honest) = nano_train_once(nano_trainer());
+    let (_, honest) = nano_train_once(nano_trainer(), step, batch_id);
     let forged: Vec<f32> = honest.iter().map(|v| -5.0 * v).collect();
+    let forged_dump = scratch("forged").join("forged.vec-postcard");
+    write_dense_dump(&forged_dump, &forged, 6).unwrap();
     let submitted_dir = scratch("submitted");
-    write_dense_dump(
-        &submitted_dir.join(format!(
-            "result-{cheater_committer}-step1-batchB[0, 1].vec-postcard"
-        )),
-        &forged,
-        6,
-    )
-    .unwrap();
+    keep_signed_payload(
+        &submitted_dir,
+        &forged_dump,
+        &clients[cheater],
+        &p2ps[cheater],
+        &run_id,
+        header,
+    );
 
     let engine = TrainerReplayEngine::new(
         nano_trainer(),
         vec![ReplayAssignment {
             target_index: cheater_index,
-            step: 1,
-            batch_id: BatchId(ClosedInterval::new(0, 1)),
+            step,
+            batch_id,
             data: nano_batch(),
         }],
         tch::Device::Cpu,
@@ -436,7 +472,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
-        replay_step: Some(1),
+        replay_step: Some(step),
     };
 
     let mut convicted = HashSet::new();

@@ -13,6 +13,7 @@ mod memnet_mining_pool_full_cycle;
 mod memnet_mining_pool_live_freeze;
 mod memnet_treasurer_bond;
 mod memnet_treasurer_bond_gated_claim;
+mod memnet_treasurer_commitment_evidence;
 mod memnet_treasurer_appeals;
 mod memnet_treasurer_bounty;
 mod memnet_treasurer_bounty_recipient;
@@ -26,6 +27,7 @@ mod memnet_treasurer_slash_accounting_order;
 mod memnet_treasurer_slash_settle;
 mod memnet_treasurer_withdraw_hold;
 mod refusal;
+mod signed_payload;
 #[cfg(feature = "daemon")]
 mod memnet_verifier_daemon;
 #[cfg(feature = "daemon")]

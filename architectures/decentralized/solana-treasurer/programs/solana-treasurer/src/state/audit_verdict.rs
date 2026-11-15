@@ -1,5 +1,7 @@
 use anchor_lang::prelude::*;
 
+use crate::state::CommitmentEvidence;
+
 pub const MAX_VERDICT_VOTERS: usize = 64;
 pub const MAX_APPEAL_VOTERS: usize = 64;
 
@@ -43,6 +45,10 @@ pub struct AuditVerdict {
     pub target_index: u64,
     pub batch_start: u64,
     pub batch_end: u64,
+    /// The payload the target committed to, which `committed_hash` is the
+    /// commitment hash of. With it anyone can rebuild that hash from this
+    /// account alone and tell which step to replay (wienerlabs/leviathan-net#43).
+    pub evidence: CommitmentEvidence,
     pub pending_since_unix: i64,
     /// When the challenge was opened, so the appeal can be given a deadline of
     /// its own. Without one a free challenge parked a correct conviction for
@@ -98,6 +104,7 @@ impl AuditVerdict {
             + 8 // target_index
             + 8 // batch_start
             + 8 // batch_end
+            + CommitmentEvidence::SPACE // evidence
             + 8 // pending_since_unix
             + 8 // challenged_since_unix
             + 32 // challenger
@@ -148,6 +155,7 @@ impl AuditVerdict {
         self.target_index = 0;
         self.batch_start = 0;
         self.batch_end = 0;
+        self.evidence = CommitmentEvidence::default();
         self.pending_since_unix = 0;
         self.challenged_since_unix = 0;
         self.challenger = Pubkey::default();

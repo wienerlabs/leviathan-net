@@ -63,6 +63,7 @@ daemon = [
     "dep:tokio",
     "dep:clap",
     "dep:leviathan-verifier",
+    "dep:psyche-network",
     "dep:psyche-verifier",
     "dep:psyche-data-provider",
     "dep:psyche-modeling",
@@ -84,6 +85,10 @@ optional = true
 
 [dependencies.psyche-verifier]
 path = "../../../shared/verifier"
+optional = true
+
+[dependencies.psyche-network]
+path = "../../../shared/network"
 optional = true
 
 [dependencies.psyche-data-provider]

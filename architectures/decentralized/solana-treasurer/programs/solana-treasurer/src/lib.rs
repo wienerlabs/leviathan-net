@@ -283,4 +283,12 @@ pub enum ProgramError {
 
     #[msg("A run with a challenge window must give its appeals a deadline")]
     AppealWindowRequired,
+
+    #[msg("The transaction does not prove the target signed the commitment it is convicted on")]
+    CommitmentNotSigned,
+
+    #[msg(
+        "The commitment a conviction cites was not made in the current epoch"
+    )]
+    CommitmentOutsideEpoch,
 }

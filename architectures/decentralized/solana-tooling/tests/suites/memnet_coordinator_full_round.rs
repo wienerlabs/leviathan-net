@@ -11,7 +11,6 @@ use psyche_coordinator::model::LLMTrainingDataType;
 use psyche_coordinator::model::Model;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::CoordinatorAccount;
@@ -31,6 +30,8 @@ use psyche_solana_tooling::process_coordinator_instructions::process_update;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
+use super::signed_payload::identity;
+
 #[tokio::test]
 pub async fn run() {
     let mut endpoint = create_memnet_endpoint().await;
@@ -46,6 +47,7 @@ pub async fn run() {
     let main_authority = Keypair::new();
     let join_authority = Keypair::new();
     let client = Keypair::new();
+    let client_p2p = Keypair::new();
     let ticker = Keypair::new();
     let warmup_time = 10;
     let round_witness_time = 10;
@@ -157,8 +159,7 @@ pub async fn run() {
     );
 
     // Generate the client key
-    let client_id =
-        NodeIdentity::new(client.pubkey().to_bytes(), Default::default());
+    let client_id = identity(&client, &client_p2p);
 
     // Add client to whitelist
     let authorization = process_authorizer_authorization_create(

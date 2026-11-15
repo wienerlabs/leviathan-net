@@ -20,6 +20,7 @@ use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::get_accounts::get_authorization;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_participant;
+use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
@@ -38,11 +39,16 @@ use psyche_solana_treasurer::find_run;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
+use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_treasurer::state::Participant;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
+
+use super::signed_payload::replayed_digest;
+use super::signed_payload::signed_payload;
+use super::signed_payload::FRAUD_PAYLOAD;
 
 /// The bond a node must keep posted to be admitted, and how long a withdrawal
 /// waits so a conviction can land first.
@@ -120,6 +126,18 @@ impl Harness {
     /// A run on the genesis rehearsal config with `NODES` participants that
     /// have each bonded `BOND` and hold one more `BOND` they can post later.
     pub async fn new(index: u64, run_id: &str, gate: JoinGate) -> Harness {
+        Harness::with(index, run_id, gate, NODES, |_| {}).await
+    }
+
+    /// The same run with `nodes` participants and the genesis rehearsal config
+    /// changed by `adjust`.
+    pub async fn with(
+        index: u64,
+        run_id: &str,
+        gate: JoinGate,
+        nodes: usize,
+        adjust: impl FnOnce(&mut CoordinatorConfig),
+    ) -> Harness {
         let mut endpoint = create_memnet_endpoint().await;
         let payer = Keypair::new();
         endpoint
@@ -129,7 +147,8 @@ impl Harness {
         let mint_authority = Keypair::new();
         let main_authority = Keypair::new();
         let ticker = Keypair::new();
-        let rehearsal = genesis_rehearsal();
+        let mut rehearsal = genesis_rehearsal();
+        adjust(&mut rehearsal.config);
 
         let collateral_mint = endpoint
             .process_spl_token_mint_new(
@@ -223,7 +242,7 @@ impl Harness {
             config: rehearsal.config,
             nodes: Vec::new(),
         };
-        for _ in 0..NODES {
+        for _ in 0..nodes {
             let node = harness.add_node().await;
             harness.deposit(node, BOND).await.unwrap();
         }
@@ -638,7 +657,18 @@ impl Harness {
         self.try_convict(node).await.unwrap();
     }
 
+    /// The run authority convicts `node` on the payload it signed in the
+    /// round under way.
     pub async fn try_convict(&mut self, node: usize) -> anyhow::Result<()> {
+        let commitment = self.signed_payload(node).await;
+        self.try_convict_on(node, &commitment).await
+    }
+
+    pub async fn try_convict_on(
+        &mut self,
+        node: usize,
+        commitment: &SignedCommitment,
+    ) -> anyhow::Result<()> {
         let index = self.roster_index(node).await;
         process_treasurer_run_slash(
             &mut self.endpoint,
@@ -648,8 +678,28 @@ impl Harness {
             &self.coordinator_account,
             &self.run_id,
             index,
+            commitment,
+            replayed_digest(),
         )
         .await
+    }
+
+    /// What `node` signed for the cheating payload it broadcast in the round
+    /// under way.
+    pub async fn signed_payload(&mut self, node: usize) -> SignedCommitment {
+        let tie_breakers = get_run(&mut self.endpoint, &self.run)
+            .await
+            .unwrap()
+            .unwrap()
+            .tie_breaker_committee_size;
+        let coordinator = self.state().await.coordinator;
+        signed_payload(
+            &coordinator,
+            tie_breakers,
+            &self.nodes[node].identity(),
+            &self.nodes[node].p2p,
+            FRAUD_PAYLOAD,
+        )
     }
 
     /// The run authority pauses the run.

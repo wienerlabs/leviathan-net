@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -22,6 +23,9 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_participant;
+use psyche_solana_tooling::get_accounts::get_run;
+use psyche_solana_tooling::signed_commitment::payload_dump_digest;
+use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
@@ -38,11 +42,25 @@ use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
+use psyche_solana_tooling::redact::guard_rpc_url;
+use psyche_solana_tooling::redact::redact_rpc_url;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
+
+/// The payload the cheater broadcasts, and an honest one for the same batch,
+/// both produced by a real model.
+const CHEATER_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/daemon/fraud.vec-postcard"
+);
+const REPLAY_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/daemon/honest.vec-postcard"
+);
 
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
@@ -75,7 +93,17 @@ async fn main() -> Result<()> {
         .map_err(|err| anyhow!("cannot read wallet {}: {}", wallet_path, err))?;
     println!("[+] wallet {}", payer.pubkey());
 
-    let mut endpoint = ToolboxEndpoint::new_devnet().await;
+    let mut endpoint = match std::env::var("LEVIATHAN_DEVNET_RPC").ok() {
+        Some(url) => {
+            guard_rpc_url(&url);
+            println!("[+] rpc {}", redact_rpc_url(&url));
+            ToolboxEndpoint::new_rpc_with_url_or_moniker_and_commitment(
+                &url,
+                CommitmentConfig::confirmed(),
+            )
+        },
+        None => ToolboxEndpoint::new_devnet().await,
+    };
 
     let index = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let run_id = format!("leviathan-conviction-{}", index);
@@ -87,6 +115,11 @@ async fn main() -> Result<()> {
     let stranger = Keypair::new();
     let ticker = Keypair::new();
     let clients: Vec<Keypair> = (0..1).map(|_| Keypair::new()).collect();
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
+    // The payload the cheater broadcasts, and what an honest replay of its
+    // batch produces: real dumps from a real model.
+    let cheater_payload = payload_dump_digest(Path::new(CHEATER_DUMP))?;
+    let replayed = payload_dump_digest(Path::new(REPLAY_DUMP))?;
     let cheater = 0usize;
 
     println!("[+] creating collateral mint");
@@ -231,7 +264,7 @@ async fn main() -> Result<()> {
     .unwrap();
 
     println!("[+] clients join the run");
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -257,28 +290,23 @@ async fn main() -> Result<()> {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            NodeIdentity::new(
+                client.pubkey().to_bytes(),
+                p2p.pubkey().to_bytes(),
+            ),
         )
         .await
         .unwrap();
     }
 
-    println!("[+] a stranger tries to open a dispute (must fail)");
-    let stranger_result = process_treasurer_run_slash(
-        &mut endpoint,
-        &payer,
-        &stranger,
-        &run,
-        &coordinator_account,
-        &run_id,
-        cheater as u64,
-    )
-    .await;
-    println!("    stranger run_slash rejected = {}", stranger_result.is_err());
-
     println!("[+] driving one epoch; the run authority convicts the cheater while it trains");
     let cheater_key = clients[cheater].pubkey().to_bytes();
     let mut slashed_done = false;
+    let mut stranger_tried = false;
+    let tie_breaker_committee_size = get_run(&mut endpoint, &run)
+        .await?
+        .ok_or_else(|| anyhow!("run {run} not found"))?
+        .tie_breaker_committee_size;
     for step in 0..60 {
         let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
             .await
@@ -299,23 +327,61 @@ async fn main() -> Result<()> {
             cheater_index.is_some(),
         );
 
-        if !slashed_done {
-            if let Some(live_index) = cheater_index {
-                if process_treasurer_run_slash(
+        // A conviction is made on the payload the cheater signed for the
+        // batch it trains in the round under way, so it waits for one.
+        let cheater_identity =
+            NodeIdentity::new(cheater_key, p2ps[cheater].pubkey().to_bytes());
+        let signed = SignedCommitment::for_round(
+            &state.coordinator,
+            tie_breaker_committee_size,
+            &cheater_identity,
+            &p2ps[cheater],
+            cheater_payload,
+        );
+        if let (false, Some(live_index), Ok(signed)) =
+            (slashed_done, cheater_index, signed)
+        {
+            if !stranger_tried {
+                println!("[+] a stranger tries to open a dispute (must fail)");
+                let stranger_result = process_treasurer_run_slash(
                     &mut endpoint,
                     &payer,
-                    &main_authority,
+                    &stranger,
                     &run,
                     &coordinator_account,
                     &run_id,
                     live_index as u64,
+                    &signed,
+                    replayed,
                 )
-                .await
-                .is_ok()
-                {
-                    println!("    convicted cheater at live index {} while {}", live_index, run_state);
-                    slashed_done = true;
-                }
+                .await;
+                println!(
+                    "    stranger run_slash rejected = {}",
+                    stranger_result.is_err()
+                );
+                stranger_tried = true;
+            }
+            if process_treasurer_run_slash(
+                &mut endpoint,
+                &payer,
+                &main_authority,
+                &run,
+                &coordinator_account,
+                &run_id,
+                live_index as u64,
+                &signed,
+                replayed,
+            )
+            .await
+            .is_ok()
+            {
+                println!(
+                    "    convicted cheater at live index {} while {} on its signed commitment {}",
+                    live_index,
+                    run_state,
+                    signed.committed_hash().iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()
+                );
+                slashed_done = true;
             }
         }
 

@@ -18,7 +18,6 @@ use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::WAITING_FOR_MEMBERS_EXTRA_SECONDS;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
-use psyche_core::NodeIdentity;
 use psyche_core::OptimizerDefinition;
 use psyche_solana_authorizer::find_authorization;
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
@@ -75,6 +74,14 @@ use solana_sdk::instruction::Instruction;
 use super::refusal::refusal_code;
 use super::refusal::treasurer_refusal;
 
+use psyche_core::NodeIdentity;
+use psyche_solana_tooling::signed_commitment::SignedCommitment;
+
+use super::signed_payload::identity;
+use super::signed_payload::replayed_digest;
+use super::signed_payload::signed_payload;
+use super::signed_payload::FRAUD_PAYLOAD;
+
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
 const BOUNTY_BPS: u16 = 5_000;
@@ -85,8 +92,6 @@ const TIE_BREAKER_SIZE: u16 = 2;
 /// (wienerlabs/leviathan#15, finding 10).
 const APPEAL_WINDOW: i64 = 10_000;
 const EPOCH_TIME: u64 = 300;
-const COMMITTED: [u8; 32] = [0xAA; 32];
-const REPLAYED: [u8; 32] = [0xBB; 32];
 
 struct CommitteeNow {
     verifiers: Vec<(usize, u64)>,
@@ -108,12 +113,17 @@ struct AppealsHarness {
     coordinator_account: Pubkey,
     collateral_mint: Pubkey,
     clients: Vec<Keypair>,
+    /// The p2p key each client joined with, which signs its payloads.
+    p2ps: Vec<Keypair>,
     clients_collateral: Vec<Pubkey>,
     verifiers: Vec<(usize, u64)>,
     tie_breakers: Vec<(usize, u64)>,
     target_client_idx: usize,
     target_key: Pubkey,
     target_index: u64,
+    /// What the target signed for the batch it trained in the first round,
+    /// which the suite's verdicts convict it on.
+    target_commitment: SignedCommitment,
     verifier_quorum: u64,
     tie_breaker_quorum: u64,
 }
@@ -132,6 +142,7 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
     let join_authority = Keypair::new();
     let ticker = Keypair::new();
     let clients: Vec<Keypair> = (0..6).map(|_| Keypair::new()).collect();
+    let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let warmup_time = 10;
 
     let collateral_mint = endpoint
@@ -282,7 +293,7 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
     .await
     .unwrap();
 
-    for client in &clients {
+    for (client, p2p) in clients.iter().zip(&p2ps) {
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -308,7 +319,7 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
             &authorization,
             &coordinator_instance,
             &coordinator_account,
-            NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+            identity(client, p2p),
         )
         .await
         .unwrap();
@@ -380,6 +391,13 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
 
     let (target_client_idx, target_key, target_index) =
         target.expect("no trainer target found");
+    let target_commitment = signed_payload(
+        &state.coordinator,
+        TIE_BREAKER_SIZE,
+        &identity(&clients[target_client_idx], &p2ps[target_client_idx]),
+        &p2ps[target_client_idx],
+        FRAUD_PAYLOAD,
+    );
     assert!(
         verifiers.len() as u64 >= verifier_quorum,
         "not enough verifiers ({}) for quorum {}",
@@ -405,12 +423,14 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
         coordinator_account,
         collateral_mint,
         clients,
+        p2ps,
         clients_collateral,
         verifiers,
         tie_breakers,
         target_client_idx,
         target_key,
         target_index,
+        target_commitment,
         verifier_quorum,
         tie_breaker_quorum,
     }
@@ -428,10 +448,8 @@ impl AppealsHarness {
             &self.run_id,
             &self.target_key,
             self.target_index,
-            0,
-            4,
-            COMMITTED,
-            REPLAYED,
+            &self.target_commitment,
+            replayed_digest(),
         )
         .await
     }
@@ -509,7 +527,7 @@ impl AppealsHarness {
                 &authorization,
                 &self.coordinator_instance,
                 &self.coordinator_account,
-                NodeIdentity::new(client.pubkey().to_bytes(), Default::default()),
+                identity(&client, &self.p2ps[client_idx]),
             )
             .await
             .unwrap();
@@ -724,9 +742,49 @@ impl AppealsHarness {
         committee
     }
 
+    /// What `client_idx` signed for the batch it trained in the round the
+    /// coordinator is in.
+    async fn signed_payload_of(
+        &mut self,
+        client_idx: usize,
+    ) -> SignedCommitment {
+        let state = get_coordinator_account_state(
+            &mut self.endpoint,
+            &self.coordinator_account,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let tie_breakers = get_run(&mut self.endpoint, &self.run)
+            .await
+            .unwrap()
+            .unwrap()
+            .tie_breaker_committee_size;
+        signed_payload(
+            &state.coordinator,
+            tie_breakers,
+            &identity(&self.clients[client_idx], &self.p2ps[client_idx]),
+            &self.p2ps[client_idx],
+            FRAUD_PAYLOAD,
+        )
+    }
+
     /// `voter` votes to convict `target`, a client at roster index
-    /// `target_index`, with the suite's evidence.
+    /// `target_index`, on the payload it signed in the round under way.
     async fn convict_by(&mut self, voter: usize, target: usize, target_index: u64) -> anyhow::Result<()> {
+        let commitment = self.signed_payload_of(target).await;
+        self.convict_on(voter, target, target_index, &commitment)
+            .await
+    }
+
+    /// `voter` votes to convict `target` on `commitment`.
+    async fn convict_on(
+        &mut self,
+        voter: usize,
+        target: usize,
+        target_index: u64,
+        commitment: &SignedCommitment,
+    ) -> anyhow::Result<()> {
         let verifier = self.clients[voter].insecure_clone();
         let target_key = self.clients[target].pubkey();
         process_treasurer_run_submit_audit_verdict(
@@ -738,10 +796,8 @@ impl AppealsHarness {
             &self.run_id,
             &target_key,
             target_index,
-            0,
-            4,
-            COMMITTED,
-            REPLAYED,
+            commitment,
+            replayed_digest(),
         )
         .await
     }
@@ -1987,6 +2043,9 @@ pub async fn no_vote_is_taken_once_the_roster_has_moved_under_the_committee() {
     let committee = h.committee_now().await;
     let (leaver, leaver_index) = committee.trainers[0];
     let (target, _) = committee.trainers[1];
+    // Both signed for the batches they trained in the round just ended.
+    let leaver_commitment = h.signed_payload_of(leaver).await;
+    let target_commitment = h.signed_payload_of(target).await;
     let main_authority = h.main_authority.insecure_clone();
     process_treasurer_run_slash(
         &mut h.endpoint,
@@ -1996,6 +2055,8 @@ pub async fn no_vote_is_taken_once_the_roster_has_moved_under_the_committee() {
         &h.coordinator_account,
         &h.run_id,
         leaver_index,
+        &leaver_commitment,
+        replayed_digest(),
     )
     .await
     .unwrap();
@@ -2006,7 +2067,10 @@ pub async fn no_vote_is_taken_once_the_roster_has_moved_under_the_committee() {
     let target_index = h.roster_index_of(&h.clients[target].pubkey()).await;
     let (voter, _) = committee.verifiers[0];
     assert_eq!(
-        refusal_code(h.convict_by(voter, target, target_index).await),
+        refusal_code(
+            h.convict_on(voter, target, target_index, &target_commitment)
+                .await
+        ),
         treasurer_refusal(ProgramError::CommitteeNotDrawnForRoster),
     );
 }

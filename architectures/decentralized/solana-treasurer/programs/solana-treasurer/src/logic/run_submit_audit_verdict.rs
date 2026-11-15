@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::sysvar::instructions as instructions_sysvar;
 use psyche_coordinator::Committee;
 use psyche_coordinator::CommitteeSelection;
 use psyche_solana_coordinator::cpi::accounts::OwnerCoordinatorAccounts;
@@ -9,6 +10,9 @@ use psyche_solana_coordinator::CoordinatorInstance;
 use psyche_solana_coordinator::SlashClientParams;
 
 use crate::state::AuditVerdict;
+use crate::state::CommitmentEvidence;
+use crate::state::commitment_run;
+use crate::state::transaction_proves_signature;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
@@ -82,6 +86,11 @@ pub struct RunSubmitAuditVerdictAccounts<'info> {
 
     #[account()]
     pub system_program: Program<'info, System>,
+
+    /// CHECK: the instructions sysvar, pinned by address. It is read for the
+    /// precompile instruction proving the target signed the commitment.
+    #[account(address = instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -90,7 +99,10 @@ pub struct RunSubmitAuditVerdictParams {
     pub target_index: u64,
     pub batch_start: u64,
     pub batch_end: u64,
-    pub committed_hash: [u8; 32],
+    /// The payload the target committed to for `batch_start..=batch_end`. The
+    /// same transaction has to carry an ed25519 precompile instruction with the
+    /// target's p2p key signing its commitment hash.
+    pub evidence: CommitmentEvidence,
     pub replayed_hash: [u8; 32],
 }
 
@@ -101,7 +113,7 @@ pub fn run_submit_audit_verdict_processor(
     let verifier_key = context.accounts.verifier.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
-    let (current_epoch, current_round, quorum, landing) = {
+    let (current_epoch, current_round, quorum, landing, target_p2p, run) = {
         let account = context.accounts.coordinator_account.load()?;
 
         // A verdict that turns out wrong is paid for out of this bond, at the
@@ -148,6 +160,14 @@ pub fn run_submit_audit_verdict_processor(
         if *target_client.id.signer() != params.target.to_bytes() {
             return err!(ProgramError::TargetMismatch);
         }
+        let target_p2p = *target_client.id.p2p_identity();
+        let run = commitment_run(coordinator);
+
+        // A conviction is for work done in this epoch. A commitment from an
+        // earlier one names work whose epoch was already charged.
+        if !params.evidence.is_from_current_epoch(coordinator) {
+            return err!(ProgramError::CommitmentOutsideEpoch);
+        }
 
         // A committee has to be big enough for agreement to mean something.
         // `verifier_nodes` rounds down, so small runs land on one seat, where
@@ -175,8 +195,34 @@ pub fn run_submit_audit_verdict_processor(
         // `target_index`.
         let landing =
             conviction_landing(coordinator, &params.target, params.target_index)?;
-        (coordinator.progress.epoch, current_round, quorum, landing)
+        (
+            coordinator.progress.epoch,
+            current_round,
+            quorum,
+            landing,
+            target_p2p,
+            run,
+        )
     };
+
+    // The committed side of the fraud proof is checked here rather than taken
+    // on the voters' word. The hash is rebuilt from the batch this verdict
+    // names, in this run, and the target's own key, read from the roster, has
+    // to have signed it. Otherwise a quorum could record a hash the target never
+    // committed to, and the record an appeal or an observer reads would be
+    // fiction (wienerlabs/leviathan-net#43).
+    let committed_hash = params.evidence.committed_hash(
+        &run,
+        params.batch_start,
+        params.batch_end,
+    );
+    if !transaction_proves_signature(
+        &context.accounts.instructions,
+        &target_p2p,
+        &committed_hash,
+    )? {
+        return err!(ProgramError::CommitmentNotSigned);
+    }
 
     let should_slash;
     {
@@ -218,12 +264,14 @@ pub fn run_submit_audit_verdict_processor(
         // information, and it belongs in a rejected transaction rather than
         // silently in the last writer's favour.
         if verdict.voters.is_empty() {
-            verdict.committed_hash = params.committed_hash;
+            verdict.committed_hash = committed_hash;
+            verdict.evidence = params.evidence;
             verdict.replayed_hash = params.replayed_hash;
             verdict.target_index = params.target_index;
             verdict.batch_start = params.batch_start;
             verdict.batch_end = params.batch_end;
-        } else if verdict.committed_hash != params.committed_hash
+        } else if verdict.committed_hash != committed_hash
+            || verdict.evidence != params.evidence
             || verdict.replayed_hash != params.replayed_hash
             || verdict.target_index != params.target_index
             || verdict.batch_start != params.batch_start
@@ -297,7 +345,7 @@ pub fn run_submit_audit_verdict_processor(
                 index: params.target_index,
                 batch_start: params.batch_start,
                 batch_end: params.batch_end,
-                committed_hash: params.committed_hash,
+                committed_hash,
                 replayed_hash: params.replayed_hash,
             },
         )?;
