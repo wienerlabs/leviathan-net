@@ -12,6 +12,7 @@ mod memnet_mining_pool_cap_deposits;
 mod memnet_mining_pool_full_cycle;
 mod memnet_mining_pool_live_freeze;
 mod memnet_treasurer_bond;
+mod memnet_treasurer_bond_config_command;
 mod memnet_treasurer_bond_gated_claim;
 mod memnet_treasurer_commitment_evidence;
 mod memnet_treasurer_appeals;
