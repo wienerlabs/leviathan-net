@@ -635,6 +635,10 @@ impl Harness {
 
     /// The run authority convicts `node` in the round under way.
     pub async fn convict(&mut self, node: usize) {
+        self.try_convict(node).await.unwrap();
+    }
+
+    pub async fn try_convict(&mut self, node: usize) -> anyhow::Result<()> {
         let index = self.roster_index(node).await;
         process_treasurer_run_slash(
             &mut self.endpoint,
@@ -644,6 +648,29 @@ impl Harness {
             &self.coordinator_account,
             &self.run_id,
             index,
+        )
+        .await
+    }
+
+    /// The run authority pauses the run.
+    pub async fn pause(&mut self) {
+        process_treasurer_run_update(
+            &mut self.endpoint,
+            &self.payer,
+            &self.main_authority,
+            &self.run,
+            &self.coordinator_instance,
+            &self.coordinator_account,
+            RunUpdateParams {
+                metadata: None,
+                config: None,
+                model: None,
+                progress: None,
+                epoch_earning_rate_total_shared: None,
+                epoch_slashing_rate_per_client: None,
+                paused: Some(true),
+                client_version: None,
+            },
         )
         .await
         .unwrap();

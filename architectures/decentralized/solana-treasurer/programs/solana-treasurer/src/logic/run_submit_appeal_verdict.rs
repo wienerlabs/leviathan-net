@@ -15,6 +15,7 @@ use crate::state::VerdictStatus;
 use crate::state::MAX_APPEAL_VOTERS;
 use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
+use crate::state::committee_matches_roster;
 use crate::state::conviction_landing;
 use crate::ProgramError;
 
@@ -95,6 +96,11 @@ pub fn run_submit_appeal_verdict_processor(
         }
 
         let coordinator = &account.state.coordinator;
+
+        // A seat is only a seat on the roster it was drawn over.
+        if !committee_matches_roster(coordinator) {
+            return err!(ProgramError::CommitteeNotDrawnForRoster);
+        }
 
         let appellate_index = coordinator
             .epoch_state

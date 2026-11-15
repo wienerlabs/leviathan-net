@@ -278,6 +278,9 @@ pub enum ProgramError {
     #[msg("The target is not in an epoch that would charge its conviction yet")]
     TargetNotInChargingEpoch,
 
+    #[msg("The committee in force was not drawn over the current roster; vote once a round draws one")]
+    CommitteeNotDrawnForRoster,
+
     #[msg("A run with a challenge window must give its appeals a deadline")]
     AppealWindowRequired,
 }

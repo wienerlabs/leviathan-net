@@ -42,6 +42,7 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_finalize_slash;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_open_challenge;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_challenge_config;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash_losing_verifier;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_appeal_verdict;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
@@ -1957,4 +1958,55 @@ async fn token_amount(endpoint: &mut ToolboxEndpoint, account: &Pubkey) -> u64 {
         .unwrap()
         .unwrap()
         .amount
+}
+
+/// A seat is read from a voter's index in the roster now, and drawn over the
+/// roster as it stood when the round began. In a warmup the roster is already
+/// the next epoch's while the round is still the last one, so the two do not
+/// agree and no vote is taken (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn no_vote_is_taken_in_a_warmup() {
+    let mut h = setup("Leviathan appeals warmup vote", 109).await;
+    h.settle_epoch().await;
+    h.rejoin_all().await;
+    let (voter, _) = h.verifiers[0];
+    assert_eq!(
+        refusal_code(h.cast_verdict(voter).await),
+        treasurer_refusal(ProgramError::CommitteeNotDrawnForRoster),
+    );
+}
+
+/// The end of `Cooldown` compacts the roster, so once someone has left since
+/// the last round was drawn, every index after theirs points at a different
+/// client than the seat it was drawn for, and no vote is taken until a round
+/// draws a committee over the roster again (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn no_vote_is_taken_once_the_roster_has_moved_under_the_committee() {
+    let mut h = setup("Leviathan appeals moved roster", 110).await;
+    h.advance_to_cooldown_with_witnesses().await;
+    let committee = h.committee_now().await;
+    let (leaver, leaver_index) = committee.trainers[0];
+    let (target, _) = committee.trainers[1];
+    let main_authority = h.main_authority.insecure_clone();
+    process_treasurer_run_slash(
+        &mut h.endpoint,
+        &h.payer,
+        &main_authority,
+        &h.run,
+        &h.coordinator_account,
+        &h.run_id,
+        leaver_index,
+    )
+    .await
+    .unwrap();
+    h.finish_epoch_with_witnesses().await;
+    let leaver_key = h.clients[leaver].pubkey();
+    assert_eq!(h.client_state(&leaver_key).await, None, "the roster was not compacted");
+
+    let target_index = h.roster_index_of(&h.clients[target].pubkey()).await;
+    let (voter, _) = committee.verifiers[0];
+    assert_eq!(
+        refusal_code(h.convict_by(voter, target, target_index).await),
+        treasurer_refusal(ProgramError::CommitteeNotDrawnForRoster),
+    );
 }

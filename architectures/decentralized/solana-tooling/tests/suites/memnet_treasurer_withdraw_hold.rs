@@ -5,11 +5,13 @@
 //! training in an epoch may still be charged for it until that epoch ends.
 
 use psyche_coordinator::RunState;
+use psyche_solana_coordinator::ProgramError as CoordinatorProgramError;
 use psyche_solana_treasurer::ProgramError;
 
 use super::bonded_run::Harness;
 use super::bonded_run::JoinGate;
 use super::bonded_run::BOND;
+use super::bonded_run::MAX_TRANSITIONS;
 use super::bonded_run::NODES;
 use super::bonded_run::SLASHING_RATE;
 use super::bonded_run::SUBJECT;
@@ -119,4 +121,80 @@ pub async fn a_node_outside_the_epoch_is_not_held() {
     let before = harness.collateral(SUBJECT).await;
     harness.finalize_withdraw(SUBJECT).await;
     assert_eq!(harness.collateral(SUBJECT).await - before, BOND);
+}
+
+/// From `RoundTrain`, `RoundWitness` and `Cooldown` every way out of the epoch
+/// passes through the charge, so an ejection there is charged
+/// (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn an_ejection_where_its_charge_is_certain_is_charged() {
+    for (index, phase) in [
+        RunState::RoundTrain,
+        RunState::RoundWitness,
+        RunState::Cooldown,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut harness = Harness::new(
+            363 + index as u64,
+            &format!("Leviathan charged ejection {index}"),
+            JoinGate::Bond,
+        )
+        .await;
+        for node in 0..NODES {
+            harness.join(node).await.unwrap();
+        }
+        harness.advance_to(phase).await;
+        harness.convict(SUBJECT).await;
+        harness.finish_epoch().await;
+        assert_eq!(
+            harness.ledger(SUBJECT).await.1,
+            SLASHING_RATE,
+            "an ejection in {phase} was not charged"
+        );
+    }
+}
+
+/// A pause asked for mid-epoch waits for the epoch to end, through the
+/// charge, so it does not shed an ejection made before it
+/// (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn a_pause_after_an_ejection_still_charges_it() {
+    let mut harness =
+        Harness::new(366, "Leviathan paused after ejection", JoinGate::Bond)
+            .await;
+    for node in 0..NODES {
+        harness.join(node).await.unwrap();
+    }
+    harness.advance_to(RunState::RoundTrain).await;
+    harness.convict(SUBJECT).await;
+    harness.pause().await;
+    for _ in 0..MAX_TRANSITIONS {
+        if harness.state().await.coordinator.run_state == RunState::Paused {
+            break;
+        }
+        harness.step().await;
+    }
+    assert_eq!(
+        harness.state().await.coordinator.run_state,
+        RunState::Paused
+    );
+    assert_eq!(harness.ledger(SUBJECT).await.1, SLASHING_RATE);
+}
+
+/// A warmup that is paused goes straight to `Paused` with no charge, so no
+/// ejection lands in a warmup at all (wienerlabs/leviathan-net#36).
+#[tokio::test]
+pub async fn no_ejection_lands_in_a_warmup() {
+    let mut harness =
+        Harness::new(367, "Leviathan warmup ejection", JoinGate::Bond).await;
+    for node in 0..NODES {
+        harness.join(node).await.unwrap();
+    }
+    harness.advance_to(RunState::Warmup).await;
+    assert_eq!(
+        refusal_code(harness.try_convict(SUBJECT).await),
+        u32::from(CoordinatorProgramError::CoordinatorErrorSlashOutsideEpoch),
+    );
 }

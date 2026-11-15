@@ -155,7 +155,11 @@ step from being skipped:
   drawn, so the bench can rule between epochs in either direction. A ruling
   that needs an ejection where none would be charged (an upheld appeal, an
   immediate quorum, or a finalisation) is recorded as `Due`: the conviction
-  stands and waits to be charged.
+  stands and waits to be charged. A vote is taken only while the committee in
+  force was drawn over the roster as it stands: not in a warmup, whose roster
+  is already the next epoch's, and not once the roster has been compacted
+  under the last round's draw, because a seat read through a shifted index
+  belongs to someone else.
 - **A pending conviction holds the bond.** While the target's verdict is inside
   its challenge window or appeal, its withdrawal is held however long ago its
   delay elapsed. Without that, a free challenge was a free exit: open it, let
@@ -172,7 +176,10 @@ step from being skipped:
   charged exactly once. For the same reason a run with a challenge window must
   give appeals a deadline (`appeal_window_seconds > 0`). The windows are read
   from the run as they stand, so the run authority changing them moves the
-  deadlines of disputes in flight, as it always has.
+  deadlines of disputes in flight, as it always has. The run authority's
+  `run_slash` and a committee verdict are separate convictions, each charged
+  once: an authority that slashes a target the committee also convicts
+  charges it twice.
 
 One refinement remains, optional and priced: an explicit challenge bond so a
 frivolous appeal has a cost of its own. It is additive on top of the shipped
