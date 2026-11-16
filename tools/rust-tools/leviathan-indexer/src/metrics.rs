@@ -57,6 +57,7 @@ struct RunSeries {
     epoch_roster_size: RunGauge,
     epoch_clients: Family<RunStateLabels, Value>,
     min_clients: RunGauge,
+    final_round_audit_window: RunGauge,
     audit_probability: RunGauge,
     earned_points: RunGauge,
     slashed_points: RunGauge,
@@ -133,6 +134,11 @@ impl RunSeries {
                 "leviathan_run_min_clients",
                 "The smallest roster an epoch starts with",
             ),
+            final_round_audit_window: gauge(
+                registry,
+                "leviathan_run_final_round_audit_window_seconds",
+                "How long a fraud in an epoch's final round has to be convicted before the epoch is charged: the round's witness phase and the epoch's cooldown",
+            ),
             audit_probability: gauge(
                 registry,
                 "leviathan_run_audit_probability",
@@ -184,6 +190,10 @@ impl RunSeries {
                 .set(count as f64);
         }
         set(&self.min_clients, observation.min_clients as f64);
+        set(
+            &self.final_round_audit_window,
+            observation.final_round_audit_window_seconds as f64,
+        );
         set(&self.audit_probability, observation.audit_probability);
         set(&self.earned_points, observation.earned_points as f64);
         set(&self.slashed_points, observation.slashed_points as f64);

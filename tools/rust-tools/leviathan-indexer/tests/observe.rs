@@ -54,6 +54,8 @@ fn state() -> Box<CoordinatorInstanceState> {
     coordinator.progress.step = 30;
     coordinator.config.min_clients = 2;
     coordinator.config.verification_percent = 50;
+    coordinator.config.round_witness_time = 15;
+    coordinator.config.cooldown_time = 10;
     coordinator.epoch_state.rounds_head = 1;
     coordinator.epoch_state.rounds[1].height = 7;
     // The round under way was drawn over all four on the roster: the dropped
@@ -218,6 +220,15 @@ fn the_roster_counts_who_started_the_epoch_and_who_is_still_healthy() {
     assert!(observation.treasurer.is_none());
 }
 
+/// A fraud in an epoch's final round can be convicted only while that round's
+/// committee stands and its ejection will be charged: through the round's
+/// witness phase and the epoch's cooldown (wienerlabs/leviathan-net#40).
+#[test]
+fn the_final_rounds_audit_window_is_its_witness_phase_and_the_cooldown() {
+    let observation = observe_run(&state(), CLOCK, None, &mut VerdictLedger::default());
+    assert_eq!(observation.final_round_audit_window_seconds, 25);
+}
+
 #[test]
 fn a_treasurer_run_is_judged_on_its_own_rates_bond_and_vault() {
     let observation = observe_treasurer_run(2_500);
@@ -315,6 +326,7 @@ fn a_treasurer_run_is_exported_with_every_series() {
         r#"leviathan_run_training{run_id="genesis"} 1.0"#,
         r#"leviathan_run_active_clients{run_id="genesis"} 3.0"#,
         r#"leviathan_run_epoch_roster_size{run_id="genesis"} 6.0"#,
+        r#"leviathan_run_final_round_audit_window_seconds{run_id="genesis"} 25.0"#,
         r#"leviathan_run_epoch_clients{run_id="genesis",state="dropped"} 1.0"#,
         r#"leviathan_run_epoch_clients{run_id="genesis",state="ejected"} 1.0"#,
         r#"leviathan_run_treasurer_managed{run_id="genesis"} 1.0"#,

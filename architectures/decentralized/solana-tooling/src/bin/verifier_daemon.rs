@@ -3,11 +3,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
 use leviathan_telemetry::server::serve;
+use leviathan_telemetry::verifier::SlowestPass;
 use leviathan_telemetry::verifier::VerifierMetrics;
 use leviathan_verifier::build_replay_trainer;
 use leviathan_verifier::checkpoint_repo_files;
@@ -348,10 +350,20 @@ async fn main() -> Result<()> {
     let mut replayer = args.replay_data_dir.clone().map(Replayer::new);
 
     let mut judged: HashSet<String> = HashSet::new();
+    // At least a second between passes: with none the loop would spin, and
+    // the slowest-pass window would fill with a pass every few milliseconds.
+    let poll_interval = Duration::from_secs(args.poll_secs.max(1));
+    // The slowest pass of the last hour, which is what bounds how late a
+    // vote on a fraud can come (wienerlabs/leviathan-net#40).
+    let mut slowest_pass = SlowestPass::new(Duration::from_secs(3_600));
     loop {
         if let Some(exporter) = exporter.as_mut() {
             exporter.check().await?;
         }
+        // Timed from here, so the pass covers preparing the replay as well as
+        // judging and submitting: all of it delays a vote on a fraud
+        // (wienerlabs/leviathan-net#40).
+        let pass_started = Instant::now();
         let engine = match replayer.as_mut() {
             Some(replayer) => match replayer.engine(&args, &mut endpoint, &coordinator_account).await {
                 Ok(Some(engine)) => Some(engine),
@@ -362,7 +374,14 @@ async fn main() -> Result<()> {
                     if args.once {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;
+                    note_pass(
+                        &mut slowest_pass,
+                        &exporter,
+                        &args.run_id,
+                        pass_started,
+                        poll_interval,
+                    );
+                    tokio::time::sleep(poll_interval).await;
                     continue;
                 }
                 Err(err) => {
@@ -370,7 +389,14 @@ async fn main() -> Result<()> {
                     if let Some(exporter) = &exporter {
                         exporter.metrics.pass_failed(&args.run_id);
                     }
-                    tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;
+                    note_pass(
+                        &mut slowest_pass,
+                        &exporter,
+                        &args.run_id,
+                        pass_started,
+                        poll_interval,
+                    );
+                    tokio::time::sleep(poll_interval).await;
                     continue;
                 }
             },
@@ -410,8 +436,39 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;
+        note_pass(
+            &mut slowest_pass,
+            &exporter,
+            &args.run_id,
+            pass_started,
+            poll_interval,
+        );
+        tokio::time::sleep(poll_interval).await;
     }
 
     Ok(())
+}
+
+/// Times the pass that began at `started`, whether it judged anything or
+/// failed: a failed pass delays the next vote just as long. Logs it, and
+/// exports the slowest pass of the last hour with the polling interval
+/// (wienerlabs/leviathan-net#40).
+fn note_pass(
+    slowest_pass: &mut SlowestPass,
+    exporter: &Option<Exporter>,
+    run_id: &str,
+    started: Instant,
+    poll_interval: Duration,
+) {
+    let took = started.elapsed();
+    let slowest = slowest_pass.record(Instant::now(), took);
+    println!(
+        "[verifier-daemon] pass took {:.3}s (slowest in the last hour {:.3}s), next in {}s",
+        took.as_secs_f64(),
+        slowest.as_secs_f64(),
+        poll_interval.as_secs()
+    );
+    if let Some(exporter) = exporter {
+        exporter.metrics.record_timing(run_id, slowest, poll_interval);
+    }
 }

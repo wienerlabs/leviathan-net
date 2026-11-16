@@ -69,6 +69,12 @@ pub struct RunObservation {
     /// that exited it, by [`CLIENT_STATES`].
     pub epoch_clients: [u64; 4],
     pub min_clients: u16,
+    /// How long a fraud in an epoch's final round has to be convicted before
+    /// the epoch is charged: the round's witness phase and the epoch's
+    /// cooldown, while that round's committee is still in force. A verifier
+    /// slower than this cannot convict a final-round fraud
+    /// (wienerlabs/leviathan-net#40).
+    pub final_round_audit_window_seconds: u64,
     pub audit_probability: f64,
     pub earned_points: u64,
     pub slashed_points: u64,
@@ -267,6 +273,8 @@ pub fn observe_run(
         registered_clients: state.clients_state.clients.len() as u64,
         epoch_clients: epoch_clients(coordinator),
         min_clients: coordinator.config.min_clients,
+        final_round_audit_window_seconds: coordinator.config.round_witness_time
+            + coordinator.config.cooldown_time,
         audit_probability: audit_probability(coordinator),
         earned_points: clients.iter().map(|client| client.earned).sum(),
         slashed_points: clients.iter().map(|client| client.slashed).sum(),

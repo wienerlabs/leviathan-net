@@ -58,8 +58,9 @@ pub struct RunFinalizeSlashParams {
     /// Where the target sits in the client list *now*.
     ///
     /// The verdict records the index it was convicted at, but
-    /// `epoch_state.clients` is compacted at the end of every round, so anyone
-    /// below the target leaving shifts it down. Trusting the stored index left
+    /// `epoch_state.clients` is compacted at the end of every round that goes
+    /// on, and at the end of the cooldown, so anyone below the target leaving
+    /// shifts it down. Trusting the stored index left
     /// a correct conviction permanently unfinalisable with `TargetMismatch` and
     /// no instruction to correct it (wienerlabs/leviathan#15, finding 5). Every
     /// other slash path already takes the index fresh and revalidates it; this

@@ -661,6 +661,18 @@ impl AppealsHarness {
         .await;
     }
 
+    /// Runs the epoch on to its final round's witness phase: the round whose
+    /// end ends the epoch.
+    pub(super) async fn advance_to_final_round_witness(&mut self) {
+        self.advance_with_witnesses(|coordinator| {
+            coordinator.run_state == RunState::RoundWitness
+                && coordinator.epoch_state.last_step_set()
+                && coordinator.progress.step + 1
+                    == coordinator.epoch_state.last_step
+        })
+        .await;
+    }
+
     /// Runs the swarm on into the next round's training, in this epoch or the
     /// next, so a committee drawn for another round is in force.
     pub(super) async fn advance_to_next_round(&mut self) {

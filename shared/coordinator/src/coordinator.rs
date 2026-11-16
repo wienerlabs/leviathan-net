@@ -1185,7 +1185,20 @@ impl Coordinator {
             let current_round = self.current_round_unchecked();
             let height = current_round.height;
             let num_witnesses = current_round.witnesses.len() as u16;
-            self.move_clients_to_exited(height);
+            // Whoever is not healthy leaves the roster when the round ends, but
+            // only once the next round is certain: a round that ends the epoch
+            // keeps its roster as it was drawn until the cooldown ends, which
+            // compacts it at this same height before the epoch is charged.
+            // Until then a seat read by roster index is the seat this round
+            // drew, so its committee can still convict a fraud in it through
+            // the cooldown. Compacted here, one client leaving the final round
+            // shut every vote out of the cooldown (wienerlabs/leviathan-net#40).
+            let healthy_clients = self
+                .epoch_state
+                .clients
+                .iter()
+                .filter(|client| client.state == ClientState::Healthy)
+                .count();
 
             // If there are not witnesses, then we can't distinguish from
             // the situation where only witness nodes disconnected or everyone
@@ -1217,7 +1230,7 @@ impl Coordinator {
 
             // If we don't reach the min number of clients or registered witnesses for the current round,
             // we change to Cooldown
-            if self.epoch_state.clients.len() < self.config.min_clients as usize
+            if healthy_clients < self.config.min_clients as usize
                 || num_witnesses < self.witness_quorum(num_witnesses)
                 || self.progress.step >= self.config.total_steps
                 || self.pending_pause.is_true()
@@ -1226,6 +1239,7 @@ impl Coordinator {
                 return Ok(TickResult::Ticked);
             }
 
+            self.move_clients_to_exited(height);
             self.start_round_train(unix_timestamp, random_seed, 0);
         }
         Ok(TickResult::Ticked)

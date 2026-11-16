@@ -19,6 +19,13 @@
 
 [config]
 warmup_time = 30
+# The final round of an epoch has round_witness_time + cooldown_time to be
+# audited and convicted before the epoch is charged (wienerlabs/leviathan-net#40).
+# That has to be at least twice a verifier's worst audit latency: its polling
+# interval plus two passes over the flagship model on the slowest verifier
+# class. The model is not chosen yet (docs/FIRST_RUN.md section 2), so this is
+# sized when it is, from the daemon's leviathan_verifier_slowest_pass_seconds
+# in the rehearsal; LeviathanAuditWindowTooShort holds it once the run is live.
 cooldown_time = 10
 epoch_time = 300
 max_round_train_time = 60

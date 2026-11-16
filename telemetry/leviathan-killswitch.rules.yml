@@ -150,6 +150,22 @@ groups:
           summary: "The verifier at {{ $labels.instance }} keeps failing its passes on {{ $labels.run_id }}"
           description: "Its audit passes have failed for ten minutes before judging anything, so it audits nothing. Read its log."
 
+      - alert: LeviathanAuditWindowTooShort
+        expr: |
+          2 * (
+            leviathan_verifier_poll_interval_seconds
+            + 2 * leviathan_verifier_slowest_pass_seconds
+          )
+          > on (run_id) group_left
+          max by (run_id) (leviathan_run_final_round_audit_window_seconds)
+        for: 10m
+        labels:
+          severity: high
+          kill_switch: uncaught_fraud
+        annotations:
+          summary: "The verifier at {{ $labels.instance }} has no margin to audit the final round of {{ $labels.run_id }}"
+          description: "Twice its worst audit latency is {{ $value }} seconds: its polling interval and two of its slowest passes in the last hour, since a payload that lands just after a pass began waits for the next. The final round's witness phase and the epoch's cooldown leave less than that margin, so a fraud in an epoch's final round may outlast them and go uncharged. Raise cooldown_time, poll more often, or audit on faster hardware."
+
       - alert: LeviathanCommitteeCannotConvict
         expr: |
           leviathan_run_verifier_committee_size < leviathan_run_min_verifier_committee
