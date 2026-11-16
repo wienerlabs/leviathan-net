@@ -236,9 +236,22 @@ impl fmt::Debug for DistroResultsReaderError {
     }
 }
 
+/// Reads payload results one after another from a stream.
+///
+/// A result is parsed from what has been read so far. Short of it, the
+/// iterator reads at least as much again as it holds, so a result that
+/// declares a field longer than the stream is parsed a logarithmic number of
+/// times, not once per kilobyte. Consumed bytes are skipped by offset, not
+/// copied away after every result. A stranger's payload made either quadratic
+/// (wienerlabs/leviathan-net#59).
+///
+/// It ends after the first error. It used to yield the same error again on
+/// every call, so a caller that logged errors and read on never finished.
 pub struct DistroResultIterator<R: Read> {
     reader: BufReader<R>,
     buffer: Vec<u8>,
+    start: usize,
+    finished: bool,
 }
 
 impl<R: Read> DistroResultIterator<R> {
@@ -246,7 +259,18 @@ impl<R: Read> DistroResultIterator<R> {
         DistroResultIterator {
             reader: BufReader::new(reader),
             buffer: Vec::new(),
+            start: 0,
+            finished: false,
         }
+    }
+
+    /// Reads at least as many bytes again as are pending, or a kilobyte.
+    /// `Ok(0)` is the end of the stream.
+    fn read_more(&mut self) -> std::io::Result<usize> {
+        self.buffer.drain(..self.start);
+        self.start = 0;
+        let want = self.buffer.len().max(1024) as u64;
+        (&mut self.reader).take(want).read_to_end(&mut self.buffer)
     }
 }
 
@@ -254,29 +278,137 @@ impl<R: Read> Iterator for DistroResultIterator<R> {
     type Item = Result<SerializedDistroResult, DistroResultsReaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let item = self.read_result();
+        self.finished = !matches!(item, Some(Ok(_)));
+        item
+    }
+}
+
+impl<R: Read> DistroResultIterator<R> {
+    fn read_result(&mut self) -> Option<Result<SerializedDistroResult, DistroResultsReaderError>> {
         loop {
-            match postcard::take_from_bytes::<SerializedDistroResult>(&self.buffer) {
+            match postcard::take_from_bytes::<SerializedDistroResult>(&self.buffer[self.start..]) {
                 Ok((result, remaining)) => {
-                    self.buffer = remaining.to_vec();
+                    self.start = self.buffer.len() - remaining.len();
                     return Some(Ok(result));
                 }
-                Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                    // Not enough data, need to read more
-                    let mut chunk = [0u8; 1024]; // Adjust chunk size as needed
-                    match self.reader.read(&mut chunk) {
-                        Ok(0) if self.buffer.is_empty() => return None, // EOF and no partial data
-                        Ok(0) => {
-                            return Some(Err(DistroResultsReaderError::Postcard(
-                                postcard::Error::DeserializeUnexpectedEnd,
-                            )));
-                        }
-                        Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
-                        Err(e) => return Some(Err(DistroResultsReaderError::Io(e))),
+                Err(postcard::Error::DeserializeUnexpectedEnd) => match self.read_more() {
+                    Ok(0) if self.buffer.is_empty() => return None,
+                    Ok(0) => {
+                        return Some(Err(DistroResultsReaderError::Postcard(
+                            postcard::Error::DeserializeUnexpectedEnd,
+                        )));
                     }
-                }
+                    Ok(_) => {}
+                    Err(e) => return Some(Err(DistroResultsReaderError::Io(e))),
+                },
                 Err(e) => return Some(Err(DistroResultsReaderError::Postcard(e))),
             }
         }
+    }
+}
+
+/// A stranger's payload can declare a field far longer than the stream holds.
+/// Reading it has to cost time in proportion to the stream, not to its square
+/// (wienerlabs/leviathan-net#59).
+#[cfg(test)]
+mod reader_cost_tests {
+    use super::*;
+    use crate::serializable_tensor::SerializableTensor;
+    use std::time::{Duration, Instant};
+    use tch::{Device, Kind, Tensor};
+
+    fn result(xshape: Vec<u16>) -> SerializedDistroResult {
+        let tensor = Tensor::from_slice(&[1.0f32, 2.0])
+            .to_kind(Kind::Float)
+            .to(Device::Cpu);
+        let serialized = SerializableTensor::try_from(&tensor).unwrap();
+        SerializedDistroResult {
+            sparse_idx: serialized.clone(),
+            sparse_val: serialized,
+            xshape,
+            totalk: 2,
+        }
+    }
+
+    /// A result whose shape lists millions of dimensions, cut short by one
+    /// byte, is refused after reading the stream a handful of times. Read a
+    /// kilobyte at a time and parsed from the start after each, it took the
+    /// verifier minutes.
+    #[test]
+    fn a_result_cut_short_is_refused_in_time_linear_in_its_length() {
+        let mut bytes = postcard::to_allocvec(&result(vec![1; 8_000_000])).unwrap();
+        bytes.pop();
+        let started = Instant::now();
+        let parsed: Vec<_> = distro_results_from_reader(std::io::Cursor::new(bytes)).collect();
+        assert!(matches!(
+            parsed.as_slice(),
+            [Err(DistroResultsReaderError::Postcard(
+                postcard::Error::DeserializeUnexpectedEnd
+            ))]
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// After an error the stream ends, rather than yielding it forever.
+    #[test]
+    fn the_stream_ends_after_its_first_error() {
+        let mut bytes = distro_results_to_bytes(&[result(vec![1, 2])]).unwrap();
+        bytes.extend_from_slice(&[0xff; 3]);
+        let mut results = distro_results_from_reader(std::io::Cursor::new(bytes));
+        assert!(matches!(results.next(), Some(Ok(_))));
+        assert!(matches!(results.next(), Some(Err(_))));
+        assert!(results.next().is_none());
+        assert!(results.next().is_none());
+    }
+
+    /// A reader handing over a byte at a time, and interrupting itself
+    /// between bytes, as a pipe may, still yields every result.
+    #[test]
+    fn a_reader_that_trickles_still_yields_every_result() {
+        struct Trickle {
+            bytes: std::io::Cursor<Vec<u8>>,
+            interrupt: bool,
+        }
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.interrupt = !self.interrupt;
+                if self.interrupt {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let one = buf.len().min(1);
+                self.bytes.read(&mut buf[..one])
+            }
+        }
+        let results: Vec<_> = (0..5).map(|n| result(vec![1, n + 1])).collect();
+        let trickle = Trickle {
+            bytes: std::io::Cursor::new(distro_results_to_bytes(&results).unwrap()),
+            interrupt: false,
+        };
+        let parsed = distro_results_from_reader(trickle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(parsed, results);
+    }
+
+    /// Many results in one stream are read one after another, each once.
+    #[test]
+    fn many_results_are_each_read_once() {
+        let results: Vec<_> = (0..2_000)
+            .map(|n| result(vec![1, (n % 7 + 1) as u16]))
+            .collect();
+        let bytes = distro_results_to_bytes(&results).unwrap();
+        let parsed = distro_results_from_reader(std::io::Cursor::new(bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(parsed, results);
     }
 }
 

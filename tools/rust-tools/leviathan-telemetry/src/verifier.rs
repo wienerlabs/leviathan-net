@@ -27,8 +27,9 @@ use crate::labels::RunLabels;
 pub struct PassReport {
     /// Contributions replayed or compared and found within the band.
     pub cleared: u64,
-    /// Contributions found outside the band: a fraud proof this verifier
-    /// holds. Each is submitted, withheld, already on chain, failed, or
+    /// Contributions found outside the band, or not fitting the run's model at
+    /// all, which is fraud at an infinite distance: a fraud proof this
+    /// verifier holds. Each is submitted, withheld, already on chain, failed, or
     /// against a committer this session already convicted.
     pub fraud_found: u64,
     /// Committers found to have signed two different payloads for one batch:
@@ -49,10 +50,11 @@ pub struct PassReport {
     pub submission_failures: u64,
     /// Fraud proofs held back because the daemon runs in dry-run mode.
     pub withheld: u64,
-    /// Signed payloads that could not be judged: they do not decode, or do not
-    /// fit the model the reference was replayed on. Also equivocation records
-    /// that prove nothing, which a node writes only after checking them, so
-    /// one that does not hold was damaged or tampered with on disk.
+    /// Equivocation records that prove nothing, which a node writes only after
+    /// checking them, so one that does not hold was damaged or tampered with
+    /// on disk. A signed payload that does not fit the run's model is not
+    /// counted here: it is fraud, in `fraud_found`
+    /// (wienerlabs/leviathan-net#59).
     pub malformed: u64,
     /// Contributions this verifier could not establish a reference for: its
     /// reference dump does not read, or the replay failed. Retried.
@@ -92,7 +94,7 @@ const PASS_COUNTERS: [(&str, &str, Count); 9] = [
     ),
     (
         "leviathan_verifier_fraud_found",
-        "Contributions this verifier judged outside the band, counted again while a failed submission is retried",
+        "Contributions this verifier judged outside the band or not fitting the run's model, counted again while a failed submission is retried",
         |r| r.fraud_found,
     ),
     (
@@ -122,7 +124,7 @@ const PASS_COUNTERS: [(&str, &str, Count); 9] = [
     ),
     (
         "leviathan_verifier_contributions_malformed",
-        "Signed payloads that could not be judged, as they do not decode or do not fit the replayed model, and equivocation records that prove nothing",
+        "Equivocation records that prove nothing; a signed payload that does not fit the run's model is fraud, not malformed",
         |r| r.malformed,
     ),
     (

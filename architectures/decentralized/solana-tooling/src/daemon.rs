@@ -7,6 +7,7 @@ use anyhow::Result;
 use leviathan_telemetry::verifier::PassReport;
 use leviathan_verifier::decompress_dump;
 use leviathan_verifier::index_dir;
+use leviathan_verifier::judge_payload;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
@@ -23,7 +24,6 @@ use psyche_solana_treasurer::state::AuditVerdict;
 use psyche_solana_treasurer::state::CommitmentEvidence;
 use psyche_solana_treasurer::state::VerdictStatus;
 use psyche_verifier::hash_delta;
-use psyche_verifier::verify_within_band;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
@@ -438,29 +438,34 @@ pub async fn audit_pass(
             (None, None) => unreachable!("checked above"),
         };
 
-        // A signed payload that does not decode, or does not fit the model the
-        // reference was replayed on, cannot be judged against it. It is set
-        // aside and the pass goes on: failing the pass here would let one such
-        // payload, retried every pass, stop this verifier judging anyone.
-        let verdict = match decompress_dump(submitted_path, device).and_then(
-            |submitted_delta| {
-                Ok(verify_within_band(
-                    &submitted_delta,
-                    &reference_delta,
-                    config.band,
-                )?)
-            },
+        // A signed payload that does not decode, does not hold together, or
+        // does not have the honest result's length cannot be that result: it
+        // is fraud at an infinite distance, and convicted like any other
+        // (wienerlabs/leviathan-net#59). What stops it being judged at all is
+        // this verifier's own trouble, looked at again on the next pass:
+        // failing the pass instead would let one payload stop this verifier
+        // judging anyone (wienerlabs/leviathan-net#57).
+        let judged_payload = match judge_payload(
+            submitted_path,
+            &reference_delta,
+            config.band,
+            device,
         ) {
-            Ok(verdict) => verdict,
+            Ok(judged_payload) => judged_payload,
             Err(err) => {
                 println!(
-                    "[verifier-daemon] skip  {key} committer {committer}: its payload cannot be judged: {err:#}"
+                    "[verifier-daemon] retry {key} committer {committer}: cannot judge its payload yet: {err:#}"
                 );
-                report.malformed += 1;
-                judged.insert(key.clone());
+                report.unreplayable += 1;
                 continue;
             },
         };
+        if let Some(reason) = &judged_payload.unfit {
+            println!(
+                "[verifier-daemon] {key} committer {committer}: its payload does not fit the run's model: {reason}"
+            );
+        }
+        let verdict = judged_payload.verdict;
 
         if !verdict.fraud {
             println!(

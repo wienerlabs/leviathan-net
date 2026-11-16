@@ -243,6 +243,50 @@ step from being skipped:
   refused, and the target is charged once. A proof of equivocation
   (`run_slash_equivocation`, below) lands the same way as `run_slash`.
 
+### A payload that does not fit the model
+
+A signed payload that does not fit the run's model is fraud
+(wienerlabs/leviathan-net#59). Its sender did none of the work it claims for
+its batch, since every honest node's `Distro::apply` refuses the payload. Yet
+it would finish the epoch and earn unless something else caught it.
+
+"Does not fit" means any of the following:
+- the payload does not decode;
+- it does not hold together as a DisTrO encoding of its own shapes: a `totalk`
+  that is not the one its shape gives, or indices or values that are not what
+  that encoding scatters;
+- it does not have the length of the honest result for its batch. The run's
+  own model gives that result, replayed or trained by the verifier's node.
+
+The first two are properties of the signed bytes alone. The third rests on
+the reference, as the band does. A verifier on the wrong model would find
+honest payloads too long or too short, as it would find them out of band if
+the lengths happened to agree. The appeals court and the honest
+false-positive kill switch exist for that case.
+
+The verifier judges such a payload at an infinite distance, as it judges one
+that is not made of numbers. A committee convicts it like any band miss, with
+the target's signature over the payload as the committed side and the hash of
+the honest replay as the replayed side. An appeal bench re-auditing the dump
+with `leviathan-verifier` against the same replay reaches the same verdict,
+because the daemon and the offline tool share one judgement
+(`judge_payload`). A payload that has the honest length and holds together,
+but lays its values out otherwise, is left to the band, which finds it nothing
+like the honest result.
+
+Before decompressing a payload, the verifier makes two checks:
+- **Its size.** The values its shapes claim must number exactly the honest
+  result's, counted without allocating any of them. A payload of a few bytes
+  can claim shapes of billions of values, every index inside them.
+- **Its encoding.** Each result must hold together as an encoding of its own
+  shape (`Distro::check_encodings`).
+
+Decompression allocates every value the payload claims and indexes with what
+it holds, using libtorch's infallible operations. Before these checks, a signed
+payload could make the verifier exhaust its memory, or panic it with indices
+past its shape. Either took the verifier down again on every restart while the
+payload was kept.
+
 ### What a conviction proves on chain
 
 The chain cannot recompute a gradient, so whether a payload was honest remains

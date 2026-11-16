@@ -18,7 +18,9 @@ use psyche_network::EquivocationError;
 use psyche_network::EquivocationRecord;
 use psyche_network::PAYLOAD_DUMP_EXTENSION;
 use psyche_network::SerializedDistroResult;
-use psyche_verifier::audit_contribution;
+use psyche_verifier::hash_delta;
+use psyche_verifier::verify_within_band;
+use psyche_verifier::BandVerdict;
 use psyche_verifier::FraudProof;
 
 pub mod replay;
@@ -69,6 +71,136 @@ pub fn decompress_dump(path: &Path, device: tch::Device) -> Result<Vec<f32>> {
         .map(DistroResult::try_from)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     decompress_results(&results, device)
+}
+
+/// What `judge_payload` found of a signed payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PayloadJudgement {
+    /// The payload's distance from the honest result, against the band:
+    /// infinite, and fraud, for one that does not fit.
+    pub verdict: BandVerdict,
+    /// Why the payload cannot be the honest result whatever it is compared
+    /// with, if it cannot.
+    pub unfit: Option<String>,
+    /// `hash_delta` of what the payload decompresses to, when it does.
+    pub submitted_hash: Option<[u8; 32]>,
+}
+
+/// Judges the signed payload dump at `path` against `reference`, the honest
+/// result for its batch as the run's own model gives it: replayed, or trained
+/// by this verifier's own node.
+///
+/// A payload that does not decode, does not hold together as a DisTrO encoding
+/// of its own shapes, or does not have the reference's length is not the
+/// honest result. Every honest node's `Distro::apply` refuses it, so its
+/// sender did not do the work it claims. It is judged at an infinite distance,
+/// as fraud, as a payload that is not made of numbers is (wienerlabs/leviathan#15
+/// finding 18, wienerlabs/leviathan-net#59). The first two are properties of
+/// the signed bytes alone. The length, like the band, rests on the reference
+/// being the run's own model's result. An appeal bench re-auditing the same
+/// dump against the same replay reaches the same verdict.
+///
+/// An error is this verifier's own: the dump cannot be read, the band is not
+/// one, or the reference is not made of numbers. None of them convicts
+/// anyone, and each may pass.
+pub fn judge_payload(
+    path: &Path,
+    reference: &[f32],
+    band: f32,
+    device: tch::Device,
+) -> Result<PayloadJudgement> {
+    if !band.is_finite() || band < 0.0 {
+        return Err(anyhow!(
+            "the band must be finite and non-negative, it is {band}"
+        ));
+    }
+    if let Some(index) = reference.iter().position(|value| !value.is_finite()) {
+        return Err(anyhow!("the reference is not finite at index {index}"));
+    }
+    let bytes = fs::read(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+    match fitting_values(&bytes, reference.len(), device)? {
+        Ok(submitted) => Ok(PayloadJudgement {
+            verdict: verify_within_band(&submitted, reference, band)?,
+            unfit: None,
+            submitted_hash: Some(hash_delta(&submitted)),
+        }),
+        Err(reason) => Ok(PayloadJudgement {
+            verdict: BandVerdict {
+                distance: f32::INFINITY,
+                band,
+                fraud: true,
+            },
+            unfit: Some(reason),
+            submitted_hash: None,
+        }),
+    }
+}
+
+/// The values the signed payload `bytes` decompresses to, if it fits a model
+/// whose honest result for the batch has `honest_len` values; why it does not,
+/// if it does not.
+///
+/// The outer error is this verifier's own. Once the payload holds together at
+/// the honest size, decompressing it can only fail for reasons of the
+/// verifier's, a device it cannot reach for one, and that convicts nobody.
+fn fitting_values(
+    bytes: &[u8],
+    honest_len: usize,
+    device: tch::Device,
+) -> Result<std::result::Result<Vec<f32>, String>> {
+    let results = match distro_results_from_reader(Cursor::new(bytes))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
+        Ok(results) => results,
+        Err(err) => return Ok(Err(format!("it does not parse: {err}"))),
+    };
+    let results = match results
+        .iter()
+        .map(DistroResult::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
+        Ok(results) => results,
+        Err(err) => return Ok(Err(format!("it does not decode: {err}"))),
+    };
+    // Compared before anything is allocated: a payload of a few bytes can
+    // claim shapes of billions of values, every index inside them, and
+    // decompressing it as it claims would exhaust the verifier's memory
+    // before its length was ever checked.
+    let claimed = claimed_values(&results);
+    if claimed != honest_len as u128 {
+        return Ok(Err(format!(
+            "it claims {claimed} values, the honest result has {honest_len}"
+        )));
+    }
+    if let Err(err) = Distro::check_encodings(&results) {
+        return Ok(Err(format!("it does not hold together: {err}")));
+    }
+    let submitted = decompress_results(&results, device)?;
+    if submitted.len() != honest_len {
+        return Err(anyhow!(
+            "{claimed} values decompressed to {}",
+            submitted.len()
+        ));
+    }
+    Ok(Ok(submitted))
+}
+
+/// How many values `results` decompress to, as their shapes claim, counted
+/// without allocating any of them.
+pub fn claimed_values(results: &[DistroResult]) -> u128 {
+    results
+        .iter()
+        .map(|result| {
+            // Decoding refuses a dimension that is not positive
+            // (`validate_xshape`); one that slipped through would count as no
+            // values, which no honest result has.
+            result
+                .xshape
+                .iter()
+                .map(|dim| u128::try_from(*dim).unwrap_or(0))
+                .product::<u128>()
+        })
+        .sum()
 }
 
 /// The results in a payload dump, as they went over the wire.
@@ -295,7 +427,16 @@ pub fn write_dense_dump(path: &Path, dense: &[f32], rows: i64) -> Result<()> {
 /// -1 and +1 that `Distro::apply` applies. Read as numbers they would come out
 /// as 1 for a negative value and 0 for a positive one
 /// (wienerlabs/leviathan-net#47).
+///
+/// Each result is checked as an encoding of its own shape first.
+/// `CompressDCT::decompress` scatters with libtorch's infallible operations,
+/// so a result whose indices reach past its shape used to panic the verifier,
+/// and again on every restart while the payload was kept
+/// (wienerlabs/leviathan-net#59). It allocates every value the shapes claim,
+/// so a stranger's payload has to be held to a size first, as
+/// `judge_payload` holds it to the honest result's.
 pub fn decompress_results(results: &[DistroResult], device: tch::Device) -> Result<Vec<f32>> {
+    Distro::check_encodings(results)?;
     let mut dense: Vec<f32> = Vec::new();
     for result in results {
         let sparse_idx = result.sparse_idx.to_device(device);
@@ -324,8 +465,16 @@ pub fn decompress_results(results: &[DistroResult], device: tch::Device) -> Resu
 pub enum ContributionOutcome {
     Ok { key: String, distance: f32 },
     Fraud { key: String, proof: FraudProof },
-    LengthMismatch { key: String, submitted: usize, reference: usize },
-    NoReference { key: String },
+    /// A payload that cannot be the honest result whatever it is compared
+    /// with: fraud, at an infinite distance (`judge_payload`,
+    /// wienerlabs/leviathan-net#59).
+    Unfit {
+        key: String,
+        reason: String,
+    },
+    NoReference {
+        key: String,
+    },
 }
 
 pub struct AuditSummary {
@@ -336,7 +485,14 @@ impl AuditSummary {
     pub fn audited(&self) -> usize {
         self.outcomes
             .iter()
-            .filter(|o| matches!(o, ContributionOutcome::Ok { .. } | ContributionOutcome::Fraud { .. }))
+            .filter(|o| {
+                matches!(
+                    o,
+                    ContributionOutcome::Ok { .. }
+                        | ContributionOutcome::Fraud { .. }
+                        | ContributionOutcome::Unfit { .. }
+                )
+            })
             .count()
     }
 
@@ -346,7 +502,7 @@ impl AuditSummary {
             .filter(|o| {
                 matches!(
                     o,
-                    ContributionOutcome::Fraud { .. } | ContributionOutcome::LengthMismatch { .. }
+                    ContributionOutcome::Fraud { .. } | ContributionOutcome::Unfit { .. }
                 )
             })
             .count()
@@ -363,6 +519,38 @@ impl AuditSummary {
     }
 }
 
+/// What the submitted dump at `path`, judged against `reference`, comes to.
+/// A payload that does not fit is its signer's fault; anything that stops it
+/// being judged at all is this verifier's, and fails the audit.
+fn outcome(
+    key: &str,
+    target_index: u64,
+    path: &Path,
+    reference: &[f32],
+    band: f32,
+    device: tch::Device,
+) -> Result<ContributionOutcome> {
+    let judged = judge_payload(path, reference, band, device)?;
+    let key = key.to_string();
+    Ok(match (judged.unfit, judged.submitted_hash) {
+        (Some(reason), _) => ContributionOutcome::Unfit { key, reason },
+        (None, Some(committed_hash)) if judged.verdict.fraud => ContributionOutcome::Fraud {
+            key,
+            proof: FraudProof {
+                target_index,
+                committed_hash,
+                replayed_hash: hash_delta(reference),
+                distance: judged.verdict.distance,
+                band: judged.verdict.band,
+            },
+        },
+        (None, _) => ContributionOutcome::Ok {
+            key,
+            distance: judged.verdict.distance,
+        },
+    })
+}
+
 pub fn audit_with_replay<E: psyche_verifier::ReplayEngine>(
     submitted: &Path,
     engine: &E,
@@ -373,7 +561,6 @@ pub fn audit_with_replay<E: psyche_verifier::ReplayEngine>(
     let mut outcomes = Vec::new();
     for (target_index, (key, submitted_path)) in submitted_index.iter().enumerate() {
         let target_index = target_index as u64;
-        let submitted_delta = decompress_dump(submitted_path, device)?;
         let reference_delta = match engine.replay(target_index) {
             Ok(delta) => delta,
             Err(_) => {
@@ -381,27 +568,14 @@ pub fn audit_with_replay<E: psyche_verifier::ReplayEngine>(
                 continue;
             }
         };
-        if submitted_delta.len() != reference_delta.len() {
-            outcomes.push(ContributionOutcome::LengthMismatch {
-                key: key.clone(),
-                submitted: submitted_delta.len(),
-                reference: reference_delta.len(),
-            });
-            continue;
-        }
-        let report =
-            audit_contribution(target_index, &submitted_delta, &reference_delta, band)?;
-        if report.verdict.fraud {
-            outcomes.push(ContributionOutcome::Fraud {
-                key: key.clone(),
-                proof: report.proof.unwrap(),
-            });
-        } else {
-            outcomes.push(ContributionOutcome::Ok {
-                key: key.clone(),
-                distance: report.verdict.distance,
-            });
-        }
+        outcomes.push(outcome(
+            key,
+            target_index,
+            submitted_path,
+            &reference_delta,
+            band,
+            device,
+        )?);
     }
     Ok(AuditSummary { outcomes })
 }
@@ -420,33 +594,15 @@ pub fn audit_dirs(
             outcomes.push(ContributionOutcome::NoReference { key: key.clone() });
             continue;
         };
-        let submitted_delta = decompress_dump(submitted_path, device)?;
         let reference_delta = decompress_dump(reference_path, device)?;
-        if submitted_delta.len() != reference_delta.len() {
-            outcomes.push(ContributionOutcome::LengthMismatch {
-                key: key.clone(),
-                submitted: submitted_delta.len(),
-                reference: reference_delta.len(),
-            });
-            continue;
-        }
-        let report = audit_contribution(
+        outcomes.push(outcome(
+            key,
             target_index as u64,
-            &submitted_delta,
+            submitted_path,
             &reference_delta,
             band,
-        )?;
-        if report.verdict.fraud {
-            outcomes.push(ContributionOutcome::Fraud {
-                key: key.clone(),
-                proof: report.proof.unwrap(),
-            });
-        } else {
-            outcomes.push(ContributionOutcome::Ok {
-                key: key.clone(),
-                distance: report.verdict.distance,
-            });
-        }
+            device,
+        )?);
     }
     Ok(AuditSummary { outcomes })
 }

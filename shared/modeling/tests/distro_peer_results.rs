@@ -10,7 +10,7 @@
 mod common;
 
 use common::*;
-use psyche_modeling::{CompressDCT, DistroResult, DistroResultMismatch, TransformDCT};
+use psyche_modeling::{CompressDCT, Distro, DistroResult, DistroResultMismatch, TransformDCT};
 use tch::{Device, Kind, Tensor};
 
 /// One result short.
@@ -254,4 +254,77 @@ fn a_runs_aggregation_rule_decides_on_its_own() {
         !same(&robust, &mean),
         "a robust run and a mean run applied the same update"
     );
+}
+
+/// One result's encoded shape shrunk under its indices: the last dimension
+/// halved, with `totalk` left as it was or shrunk to match. Decompressing it
+/// as it claims scatters past the end of the tensor it allocates.
+fn shrunk_shape(honest: &[DistroResult], with_totalk: bool) -> Vec<DistroResult> {
+    let mut results = honest.to_vec();
+    let target = results
+        .iter()
+        .position(|r| r.xshape.last().is_some_and(|last| *last > 1))
+        .expect("the model has a variable with a last dimension above 1");
+    let result = &results[target];
+    let mut xshape = result.xshape.clone();
+    let last = xshape.len() - 1;
+    xshape[last] /= 2;
+    let totalk = match with_totalk {
+        true => result.totalk / 2,
+        false => result.totalk,
+    };
+    results[target] = DistroResult {
+        xshape,
+        totalk,
+        ..result.clone()
+    };
+    results
+}
+
+/// Before anything decompresses a stranger's results, each is checked as an
+/// encoding of its own shape, with no model at hand: its `totalk` is the one
+/// its shape gives, and its indices and values are what that encoding
+/// scatters. A payload that merely fits another model holds together; one
+/// that would make decompression index past its tensor does not
+/// (wienerlabs/leviathan-net#59).
+#[test]
+fn results_are_checked_as_encodings_of_their_own_shapes() {
+    let recipe = genesis_recipe();
+    let honest = peer_results(&recipe, &batch(&recipe, 3));
+    assert_eq!(Distro::check_encodings(&honest), Ok(()));
+    // As a node sends them, 1-bit signs and all.
+    for quantize in [false, true] {
+        let sent = peer_results_quantized(&recipe, &batch(&recipe, 5), quantize);
+        assert_eq!(
+            Distro::check_encodings(&sent),
+            Ok(()),
+            "quantized: {quantize}"
+        );
+    }
+    assert_eq!(Distro::check_encodings(&fewer_results(&honest)), Ok(()));
+    assert_eq!(Distro::check_encodings(&swapped_shapes(&honest)), Ok(()));
+
+    for (name, malformed) in [
+        ("indices outside totalk", indices_outside(&honest)),
+        ("index and value counts that differ", counts_differ(&honest)),
+        (
+            "a shape shrunk under its totalk",
+            shrunk_shape(&honest, false),
+        ),
+        (
+            "a shape and totalk shrunk under its indices",
+            shrunk_shape(&honest, true),
+        ),
+    ] {
+        let refused = Distro::check_encodings(&malformed);
+        assert!(
+            matches!(
+                refused,
+                Err(DistroResultMismatch::Totalk { .. }
+                    | DistroResultMismatch::Indices { .. }
+                    | DistroResultMismatch::Values { .. })
+            ),
+            "a payload with {name} was not refused: {refused:?}"
+        );
+    }
 }
