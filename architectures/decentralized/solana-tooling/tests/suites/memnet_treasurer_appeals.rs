@@ -36,7 +36,7 @@ use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
+use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_appeal;
@@ -338,7 +338,7 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
         .forward_clock_unix_timestamp(WAITING_FOR_MEMBERS_EXTRA_SECONDS)
         .await
         .unwrap();
-    process_coordinator_tick(
+    process_coordinator_tick_and_reveal(
         &mut endpoint,
         &payer,
         &ticker,
@@ -351,7 +351,7 @@ async fn setup(run_id: &str, index: u64) -> AppealsHarness {
         .forward_clock_unix_timestamp(warmup_time)
         .await
         .unwrap();
-    process_coordinator_tick(
+    process_coordinator_tick_and_reveal(
         &mut endpoint,
         &payer,
         &ticker,
@@ -587,7 +587,7 @@ impl AppealsHarness {
             .forward_clock_unix_timestamp(seconds)
             .await
             .unwrap();
-        process_coordinator_tick(
+        process_coordinator_tick_and_reveal(
             &mut self.endpoint,
             &self.payer,
             &self.ticker,
@@ -997,7 +997,7 @@ impl AppealsHarness {
                 .forward_clock_unix_timestamp(60)
                 .await
                 .unwrap();
-            let _ = process_coordinator_tick(
+            let _ = process_coordinator_tick_and_reveal(
                 &mut self.endpoint,
                 &self.payer,
                 &self.ticker,

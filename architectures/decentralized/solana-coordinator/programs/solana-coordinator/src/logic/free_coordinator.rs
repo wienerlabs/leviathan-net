@@ -42,13 +42,13 @@ pub fn free_coordinator_processor(
     context: Context<FreeCoordinatorAccounts>,
     _params: FreeCoordinatorParams,
 ) -> Result<()> {
-    if !&context
-        .accounts
-        .coordinator_account
-        .load()?
-        .state
-        .coordinator
-        .halted()
+    // An account of another version runs nothing under this program, so its
+    // authority may close it and take its rent back; loading it to ask
+    // whether it is halted would panic on its size. One of this version
+    // closes only once halted (wienerlabs/leviathan-net#62).
+    let coordinator_account = &context.accounts.coordinator_account;
+    if CoordinatorAccount::is_current(coordinator_account)?
+        && !coordinator_account.load()?.state.coordinator.halted()
     {
         return err!(ProgramError::CloseCoordinatorNotHalted);
     }

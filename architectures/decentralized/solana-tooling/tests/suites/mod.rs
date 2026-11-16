@@ -5,6 +5,7 @@ mod memnet_coordinator_data_layout;
 mod memnet_coordinator_full_round;
 mod memnet_coordinator_init_free;
 mod memnet_coordinator_rewards;
+mod memnet_coordinator_round_seed;
 mod memnet_coordinator_slash;
 mod memnet_distributor_claim_vesting;
 mod memnet_distributor_many_claims;

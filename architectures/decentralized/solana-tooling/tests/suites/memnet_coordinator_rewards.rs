@@ -26,7 +26,7 @@ use psyche_solana_tooling::process_coordinator_instructions::process_coordiantor
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_init;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_set_paused;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
+use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_coordinator_instructions::process_update;
 use solana_sdk::signature::Keypair;
@@ -206,7 +206,7 @@ pub async fn run() {
         .forward_clock_unix_timestamp(WAITING_FOR_MEMBERS_EXTRA_SECONDS)
         .await
         .unwrap();
-    process_coordinator_tick(
+    process_coordinator_tick_and_reveal(
         &mut endpoint,
         &payer,
         &ticker,
@@ -222,7 +222,7 @@ pub async fn run() {
         .await
         .unwrap();
 
-    process_coordinator_tick(
+    process_coordinator_tick_and_reveal(
         &mut endpoint,
         &payer,
         &ticker,
@@ -281,7 +281,7 @@ pub async fn run() {
             .forward_clock_unix_timestamp(round_witness_time)
             .await
             .unwrap();
-        process_coordinator_tick(
+        process_coordinator_tick_and_reveal(
             &mut endpoint,
             &payer,
             &ticker,
@@ -297,7 +297,7 @@ pub async fn run() {
         .forward_clock_unix_timestamp(cooldown_time)
         .await
         .unwrap();
-    process_coordinator_tick(
+    process_coordinator_tick_and_reveal(
         &mut endpoint,
         &payer,
         &ticker,

@@ -28,7 +28,11 @@ pub struct RunOpenChallengeAccounts<'info> {
     )]
     pub run: Box<Account<'info, Run>>,
 
-    #[account()]
+    // An account of another version is refused, not loaded: loading one
+    // of another size panics (wienerlabs/leviathan-net#62).
+    #[account(
+        constraint = CoordinatorAccount::is_current(&coordinator_account)?,
+    )]
     pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
 
     #[account(

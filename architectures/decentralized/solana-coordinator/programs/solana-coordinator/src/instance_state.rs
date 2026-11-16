@@ -15,7 +15,6 @@ use psyche_coordinator::model::Model;
 use psyche_core::FixedString;
 use psyche_core::NodeIdentity;
 use psyche_core::SmallBoolean;
-use psyche_core::sha256v;
 use serde::Deserialize;
 use serde::Serialize;
 use ts_rs::TS;
@@ -23,6 +22,8 @@ use ts_rs::TS;
 use crate::ProgramError;
 use crate::client::Client;
 use crate::clients_state::ClientsState;
+use crate::round_seed::round_seed;
+use crate::round_seed::slot_hash;
 
 #[derive(
     Debug,
@@ -68,23 +69,112 @@ pub struct CoordinatorInstanceState {
     pub is_warmup_first_tick: SmallBoolean,
     pub is_training_first_tick: SmallBoolean,
     pub client_version: FixedString<96>,
+    /// The slot the next round's seed is committed to: the slot of the first
+    /// tick that found the round due, whose hash nobody knew when it was sent
+    /// (wienerlabs/leviathan-net#62). Zero when none is.
+    pub seed_commit_slot: u64,
 }
 
 unsafe impl Pod for CoordinatorInstanceState {}
 
-impl CoordinatorInstanceState {
-    fn get_random_seed(clock: &Clock) -> u64 {
-        let random_seed_bytes = sha256v(&[
-            &clock.unix_timestamp.to_ne_bytes(),
-            &clock.slot.to_ne_bytes(),
-        ]);
+/// `seed_commit_slot` when no round's seed is committed. Slot zero is the
+/// genesis slot, which no transaction runs in, and it is what a new account
+/// holds.
+const NO_SEED_COMMITMENT: u64 = 0;
 
-        let mut random_seed: [u8; 8] = [0; 8];
-        random_seed.copy_from_slice(&random_seed_bytes[..8]);
-        u64::from_ne_bytes(random_seed)
+/// What a transaction can say of the next round's seed.
+#[derive(Clone, Copy)]
+enum SeedReveal {
+    Seed(u64),
+    /// Nothing is committed yet.
+    Uncommitted,
+    /// It is committed to this very slot, whose hash does not exist yet.
+    Pending,
+    /// The sysvar no longer holds the committed slot.
+    Gone,
+    /// This transaction has no sysvar to read the commitment from.
+    Unknown,
+}
+
+impl CoordinatorInstanceState {
+    /// Whether the next round's seed is committed and not yet revealed: until
+    /// a tick in a later slot starts the round, the run takes no witness,
+    /// health check or pause.
+    pub fn seed_committed(&self) -> bool {
+        self.seed_commit_slot != NO_SEED_COMMITMENT
     }
 
-    pub fn tick(&mut self) -> Result<()> {
+    /// What this transaction can say of the next round's seed, from the
+    /// commitment and `slot_hashes`, the raw `SlotHashes` sysvar.
+    fn reveal_round_seed(
+        &self,
+        clock: &Clock,
+        slot_hashes: Option<&[u8]>,
+    ) -> Result<SeedReveal> {
+        let committed = self.seed_commit_slot;
+        if committed == NO_SEED_COMMITMENT {
+            return Ok(SeedReveal::Uncommitted);
+        }
+        // The committed slot's own hash exists only once the slot is done.
+        if committed >= clock.slot {
+            return Ok(SeedReveal::Pending);
+        }
+        let Some(slot_hashes) = slot_hashes else {
+            return Ok(SeedReveal::Unknown);
+        };
+        match slot_hash(slot_hashes, committed)
+            .map_err(|_| error!(ProgramError::SlotHashesUnreadable))?
+        {
+            Some(hash) => Ok(SeedReveal::Seed(round_seed(
+                String::from(&self.coordinator.run_id).as_bytes(),
+                self.coordinator.progress.step,
+                committed,
+                &hash,
+            ))),
+            None => Ok(SeedReveal::Gone),
+        }
+    }
+
+    /// Settles the commitment after the run moved, or did not, from `before`.
+    ///
+    /// A round that started consumed it, and any other change of phase leaves
+    /// the next round to commit afresh. A run left waiting for a seed commits
+    /// it to this slot, when it has no commitment or the sysvar no longer
+    /// holds the one it had. A transaction that cannot read the sysvar never
+    /// replaces a commitment: it cannot tell whether one is gone, and
+    /// replacing one would draw the round again.
+    fn settle_round_seed(
+        &mut self,
+        before: RunState,
+        reveal: SeedReveal,
+        needs_seed: bool,
+        clock: &Clock,
+    ) {
+        if self.coordinator.run_state != before {
+            self.seed_commit_slot = NO_SEED_COMMITMENT;
+        } else if needs_seed
+            && matches!(reveal, SeedReveal::Uncommitted | SeedReveal::Gone)
+        {
+            msg!("Next round's seed committed to slot {}", clock.slot);
+            self.seed_commit_slot = clock.slot;
+        }
+    }
+
+    /// Refuses what would shape the next round once its seed is committed,
+    /// and so about to be known: a witness, which decides whether the round
+    /// starts; a health check, which drops clients from it; and a pause, which
+    /// cancels it. A tick in a later slot starts the round, and all three are
+    /// taken again.
+    fn refuse_after_seed_commitment(&self) -> Result<()> {
+        if self.seed_committed() {
+            return err!(ProgramError::RoundSeedCommitted);
+        }
+        Ok(())
+    }
+
+    /// Advances the run. `slot_hashes` is the raw `SlotHashes` sysvar, which
+    /// a round can only start with.
+    pub fn tick(&mut self, slot_hashes: Option<&[u8]>) -> Result<()> {
         let active_clients_ids: Option<Vec<NodeIdentity>> =
             match self.coordinator.run_state {
                 RunState::WaitingForMembers => {
@@ -106,11 +196,27 @@ impl CoordinatorInstanceState {
         msg!("Pre-tick run state: {}", self.coordinator.run_state);
 
         let clock: Clock = Clock::get()?;
-        match self.coordinator.tick(
+        let before = self.coordinator.run_state;
+        let reveal = self.reveal_round_seed(&clock, slot_hashes)?;
+        let random_seed = match reveal {
+            SeedReveal::Seed(seed) => Some(seed),
+            _ => None,
+        };
+        let ticked = self.coordinator.tick(
             active_clients_ids.as_ref().map(|v| v.iter()),
             clock.unix_timestamp as u64,
-            Self::get_random_seed(&clock),
-        ) {
+            random_seed,
+        );
+        self.settle_round_seed(
+            before,
+            reveal,
+            matches!(ticked, Ok(TickResult::NeedsSeed)),
+            &clock,
+        );
+        match ticked {
+            Ok(TickResult::NeedsSeed) => {
+                msg!("A round is due and waits for its seed");
+            },
             Ok(TickResult::Ticked) => {
                 if self.coordinator.is_warmup_just_starting()
                     && self.is_warmup_first_tick.is_true()
@@ -187,6 +293,12 @@ impl CoordinatorInstanceState {
             paused,
             self.coordinator.run_state
         );
+        if paused {
+            // Whoever can pause could otherwise cancel a round whose seed it
+            // dislikes, and draw again. A tick before the pause, in the same
+            // transaction, starts the round, and the pause lets it finish.
+            self.refuse_after_seed_commitment()?;
+        }
         if let Err(err) = match paused {
             true => self.coordinator.pause(unix_timestamp),
             false => {
@@ -226,39 +338,48 @@ impl CoordinatorInstanceState {
             // clear all active joins -- require that everyone re-join
             self.clients_state.next_active += 1;
 
-            self.tick()
+            // Resuming starts no round: the run waits for members first.
+            self.tick(None)
         }
     }
 
-    pub fn witness(&mut self, payer: &Pubkey, witness: Witness) -> Result<()> {
+    pub fn witness(
+        &mut self,
+        payer: &Pubkey,
+        witness: Witness,
+        slot_hashes: &[u8],
+    ) -> Result<()> {
         let id = self.clients_state.find_signer(payer)?;
+
+        self.refuse_after_seed_commitment()?;
 
         let clock: Clock = Clock::get()?;
         self.coordinator
             .witness(&id, witness, clock.unix_timestamp as u64)
             .map_err(|err| anchor_lang::error!(ProgramError::from(err)))?;
 
-        self.tick()
+        self.tick(Some(slot_hashes))
     }
 
     pub fn warmup_witness(
         &mut self,
         payer: &Pubkey,
         witness: Witness,
+        slot_hashes: &[u8],
     ) -> Result<()> {
         let id = self.clients_state.find_signer(payer)?;
 
+        self.refuse_after_seed_commitment()?;
+
+        // No seed is committed while witnesses are taken, so the last warmup
+        // witness never starts the first round itself: the warmup's next tick
+        // commits its seed.
         let clock: Clock = Clock::get()?;
         self.coordinator
-            .warmup_witness(
-                &id,
-                witness,
-                clock.unix_timestamp as u64,
-                Self::get_random_seed(&clock),
-            )
+            .warmup_witness(&id, witness, clock.unix_timestamp as u64, None)
             .map_err(|err| anchor_lang::error!(ProgramError::from(err)))?;
 
-        self.tick()
+        self.tick(Some(slot_hashes))
     }
 
     pub fn set_future_epoch_rates(
@@ -392,8 +513,10 @@ impl CoordinatorInstanceState {
             );
         }
 
+        // A join starts no round: joins are taken while the run waits for
+        // members.
         if !self.coordinator.halted() {
-            self.tick()
+            self.tick(None)
         } else {
             Ok(())
         }
@@ -403,14 +526,16 @@ impl CoordinatorInstanceState {
         &mut self,
         payer: &Pubkey,
         checks: HealthChecks,
+        slot_hashes: &[u8],
     ) -> Result<()> {
         // O(n) on clients, reconsider
         let id = self.clients_state.find_signer(payer)?;
+        self.refuse_after_seed_commitment()?;
 
         self.coordinator
             .health_check(&id, checks)
             .map_err(|err| anchor_lang::error!(ProgramError::from(err)))?;
-        self.tick()
+        self.tick(Some(slot_hashes))
     }
 
     pub fn slash(&mut self, index: u64) -> Result<()> {
@@ -424,6 +549,7 @@ impl CoordinatorInstanceState {
         &mut self,
         payer: &Pubkey,
         repo: Checkpoint,
+        slot_hashes: &[u8],
     ) -> Result<()> {
         // O(n) on clients, reconsider
         let id = self.clients_state.find_signer(payer)?;
@@ -442,7 +568,7 @@ impl CoordinatorInstanceState {
         // Only tick if not halted (Paused/Uninitialized/Finished)
         // Checkpoint update itself doesn't require state transitions
         if !self.coordinator.halted() {
-            self.tick()
+            self.tick(Some(slot_hashes))
         } else {
             msg!(
                 "Checkpoint recorded while halted (state: {}), skipping tick",

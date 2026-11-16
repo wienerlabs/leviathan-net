@@ -21,7 +21,7 @@ use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
+use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_reporter;
@@ -252,16 +252,28 @@ pub async fn run() {
         .forward_clock_unix_timestamp(WAITING_FOR_MEMBERS_EXTRA_SECONDS)
         .await
         .unwrap();
-    process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account)
-        .await
-        .unwrap();
+    process_coordinator_tick_and_reveal(
+        &mut endpoint,
+        &payer,
+        &ticker,
+        &coordinator_instance,
+        &coordinator_account,
+    )
+    .await
+    .unwrap();
     endpoint
         .forward_clock_unix_timestamp(warmup_time)
         .await
         .unwrap();
-    process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account)
-        .await
-        .unwrap();
+    process_coordinator_tick_and_reveal(
+        &mut endpoint,
+        &payer,
+        &ticker,
+        &coordinator_instance,
+        &coordinator_account,
+    )
+    .await
+    .unwrap();
 
     for _ in 0..4 {
         let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
@@ -305,9 +317,15 @@ pub async fn run() {
             .forward_clock_unix_timestamp(round_witness_time)
             .await
             .unwrap();
-        process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account)
-            .await
-            .unwrap();
+        process_coordinator_tick_and_reveal(
+            &mut endpoint,
+            &payer,
+            &ticker,
+            &coordinator_instance,
+            &coordinator_account,
+        )
+        .await
+        .unwrap();
     }
 
     slash_on_signed_payload(
@@ -328,9 +346,15 @@ pub async fn run() {
         .forward_clock_unix_timestamp(cooldown_time)
         .await
         .unwrap();
-    process_coordinator_tick(&mut endpoint, &payer, &ticker, &coordinator_instance, &coordinator_account)
-        .await
-        .unwrap();
+    process_coordinator_tick_and_reveal(
+        &mut endpoint,
+        &payer,
+        &ticker,
+        &coordinator_instance,
+        &coordinator_account,
+    )
+    .await
+    .unwrap();
 
     process_treasurer_participant_bond_request_withdraw(
         &mut endpoint,

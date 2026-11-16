@@ -69,16 +69,26 @@ transaction (wienerlabs/leviathan-net#43). So verdicts written by the current
 programs cannot be read by the next ones, and a client built from this
 repository cannot convict through the current programs.
 
-The coordinator account is at version 2 now: the DisTrO optimizer carries the
-run's aggregation rule, `robust_aggregation`, so every node of a run combines
-its peers' results the same way, where each used to pick its own from an
-environment variable (wienerlabs/leviathan-net#60). Version 1 had padding where
-the field is, and real version 1 accounts hold stack leftovers there, so a
-client built from this repository refuses them. It cannot read or join a run on
-the current programs, the flagship included, until the next deployment. That
-deployment goes under new ids: upgrading the current programs in place would
-leave their version 1 runs unable to pay out or release a bond. The dashboard
-decoder checks the version too, and has to accept 2 when it ships.
+The coordinator account is at version 3 now. Version 2 put the run's
+aggregation rule, `robust_aggregation`, in the DisTrO optimizer, so every node
+of a run combines its peers' results the same way, where each used to pick its
+own from an environment variable (wienerlabs/leviathan-net#60). Version 1 had
+padding where the field is, and real version 1 accounts hold stack leftovers
+there. Version 3 appended `seed_commit_slot`: a round's seed used to be the
+clock of whatever transaction started the round, which its sender could pick
+(wienerlabs/leviathan-net#62). Now the first tick to find a round due commits
+it to its own slot, and a tick in a later slot starts the round on that slot's
+hash, read from the `SlotHashes` sysvar. In between, witnesses, health checks
+and pauses are refused with `RoundSeedCommitted`, and the round starts no
+sooner than the slot after that tick. `run-manager set-paused` sends a tick in
+front of the pause, which starts the round first. `tick`, `witness`,
+`warmup_witness`, `health_check` and `checkpoint` take the sysvar as an
+account. A client built from this repository refuses older accounts. It cannot
+read or join a run on the current programs, the flagship included, until the
+next deployment. That deployment goes under new ids: upgrading the current
+programs in place would leave their version 1 runs unable to pay out or release
+a bond. The dashboard decoder checks the version too, and has to accept 3 when
+it ships.
 
 ## Run a node
 

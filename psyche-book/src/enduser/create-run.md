@@ -114,6 +114,19 @@ run-manager set-paused \
 
 Congratulations! As soon as your first client joins, your model will start training.
 
+### Pausing the run
+
+The same command without `--resume` pauses the run.
+
+```bash
+run-manager set-paused \
+    --rpc [RPC] \
+    --run-id [RUN_ID] \
+    --wallet-private-key-path [JSON_PRIVATE_KEY_PATH]
+```
+
+Between the moment a round's seed is committed and the moment the round starts, usually a single slot, the coordinator refuses a pause: a pause there could cancel a round whose seed is about to be known, and draw it again. `run-manager` handles this. It sends a tick in front of the pause, which starts the round, and the run pauses once that round is done. If the pause lands in the committed slot itself, it is sent again a slot later.
+
 ## Configuring training rewards
 
 If you created a run with rewards enabled, you can configure how many points each client earns or loses per training epoch.

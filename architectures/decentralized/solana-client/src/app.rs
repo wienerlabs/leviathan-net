@@ -301,7 +301,11 @@ impl App {
                         .as_ref()
                         .map(|state| state.clients_state.get_active_clients_ids().collect());
 
-                    match ticked.tick(pending_clients_ids.as_ref().map(|v| v.iter()), timestamp, rand::rng().next_u64()) {
+                    // Only asks whether a tick would move the run. The seed of a
+                    // round it starts is the chain's, revealed from a committed
+                    // slot (wienerlabs/leviathan-net#62), and a tick the chain
+                    // defers for a slot is simply sent again on the next check.
+                    match ticked.tick(pending_clients_ids.as_ref().map(|v| v.iter()), timestamp, Some(rand::rng().next_u64())) {
                         Ok(_) => {
                             if ticked.run_state != latest_update.run_state {
                                 // to avoid *everyone* sending a tick, we probabilisticly send it

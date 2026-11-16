@@ -23,6 +23,10 @@ pub fn write_keypair_to_file(keypair: &Keypair, path: &Path) -> std::io::Result<
     fs::write(path, json)
 }
 
+/// How many times a pause is sent while a round's seed is committed.
+const PAUSE_ATTEMPTS: usize = 8;
+const SLOT_TIME: Duration = Duration::from_millis(400);
+
 pub struct SolanaTestClient {
     program: Program<Arc<Keypair>>,
     account: Pubkey,
@@ -60,14 +64,63 @@ impl SolanaTestClient {
     }
 
     /// Pause or resume the run. Requires the owner keypair to be the run's main authority.
+    ///
+    /// While a round's seed is committed the coordinator refuses a pause, so a
+    /// tick goes in front of it and starts that round; refused all the same,
+    /// in the very slot the seed was committed in or with a commitment the
+    /// sysvar no longer holds, a tick goes alone and the pause follows a slot
+    /// later (wienerlabs/leviathan-net#62).
     pub async fn set_paused(&self, paused: bool) -> Result<Signature, ClientError> {
-        let instruction = psyche_solana_rpc::instructions::coordinator_set_paused(
-            &self.run_id,
-            &self.account,
-            &self.owner_keypair.pubkey(),
-            paused,
-        );
-        self.program.request().instruction(instruction).send().await
+        let owner = self.owner_keypair.pubkey();
+        let coordinator_instance =
+            psyche_solana_coordinator::find_coordinator_instance(&self.run_id);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let seed_committed =
+                paused && self.get_coordinator_account().await.state.seed_committed();
+            let tick = psyche_solana_rpc::instructions::coordinator_tick(
+                &coordinator_instance,
+                &self.account,
+                &owner,
+            );
+            let pause = psyche_solana_rpc::instructions::coordinator_set_paused(
+                &self.run_id,
+                &self.account,
+                &owner,
+                paused,
+            );
+            let mut request = self.program.request();
+            for instruction in psyche_solana_rpc::instructions::set_paused_instructions(
+                seed_committed,
+                tick,
+                pause,
+            ) {
+                request = request.instruction(instruction);
+            }
+            match request.send().await {
+                // Refused while committed. A tick of its own keeps a renewal
+                // the refused pause would revert, and a slot later the round
+                // can start.
+                Err(_)
+                    if paused
+                        && attempt < PAUSE_ATTEMPTS
+                        && self.get_coordinator_account().await.state.seed_committed() =>
+                {
+                    self.program
+                        .request()
+                        .instruction(psyche_solana_rpc::instructions::coordinator_tick(
+                            &coordinator_instance,
+                            &self.account,
+                            &owner,
+                        ))
+                        .send()
+                        .await?;
+                    tokio::time::sleep(SLOT_TIME).await;
+                }
+                sent => return sent,
+            }
+        }
     }
 
     async fn get_coordinator_account(&self) -> psyche_solana_coordinator::CoordinatorAccount {

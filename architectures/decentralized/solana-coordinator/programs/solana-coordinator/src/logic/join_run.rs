@@ -36,7 +36,7 @@ pub struct JoinRunAccounts<'info> {
     #[account(
         mut,
         constraint = coordinator_instance.coordinator_account == coordinator_account.key(),
-        constraint = coordinator_account.load()?.version == CoordinatorAccount::VERSION,
+        constraint = CoordinatorAccount::is_current(&coordinator_account)?,
     )]
     pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
 }
