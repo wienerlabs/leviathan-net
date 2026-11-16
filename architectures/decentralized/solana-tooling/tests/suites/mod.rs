@@ -10,6 +10,7 @@ mod memnet_coordinator_round_seed;
 mod memnet_coordinator_slash;
 mod memnet_distributor_claim_vesting;
 mod memnet_distributor_many_claims;
+mod memnet_endpoint_blockhash;
 mod memnet_distributor_single_claim;
 mod memnet_indexer;
 mod memnet_mining_pool_cap_deposits;

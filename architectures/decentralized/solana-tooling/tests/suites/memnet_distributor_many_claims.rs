@@ -2,6 +2,8 @@ use anchor_spl::associated_token;
 use psyche_solana_distributor::state::AirdropMetadata;
 use psyche_solana_distributor::state::Allocation;
 use psyche_solana_distributor::state::Vesting;
+use std::time::Duration;
+
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
@@ -15,6 +17,21 @@ use psyche_solana_tooling::distributor::process_claim_redeem;
 
 #[tokio::test]
 pub async fn run() {
+    claim_everything(Duration::ZERO).await;
+}
+
+/// A client slower than the test machine's, here by a pause before each
+/// claim adding up to more than the second a memnet blockhash lasts, still
+/// claims everything. The flake was this client: the suite under the load of
+/// every other suite (wienerlabs/leviathan-net#53).
+#[tokio::test]
+pub async fn a_slow_client_still_claims_everything() {
+    claim_everything(Duration::from_millis(15)).await;
+}
+
+/// Every claimer claims and redeems each of its allocations, pausing for
+/// `pause` before each.
+async fn claim_everything(pause: Duration) {
     let mut endpoint = create_memnet_endpoint().await;
 
     // Test constants
@@ -119,6 +136,13 @@ pub async fn run() {
             .allocations_indexes_for_claimer(&claimer.pubkey())
             .unwrap()
         {
+            tokio::time::sleep(pause).await;
+            // A new slot, so the claim is signed with a fresh blockhash, as a
+            // client fetches one before it signs. The endpoint's own lasts
+            // about a second of wall time, and 378 transactions outlast it
+            // on a loaded machine (wienerlabs/leviathan-net#53). The clock
+            // keeps its time, so no vesting moves.
+            endpoint.forward_clock_slot(1).await.unwrap();
             // First prepare the claim PDA
             let claimer_allocation =
                 airdrop_merkle_tree.allocations()[allocation_index];
