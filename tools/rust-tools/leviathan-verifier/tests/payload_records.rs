@@ -9,9 +9,12 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use leviathan_verifier::check_commitment;
+use leviathan_verifier::check_equivocation;
 use leviathan_verifier::contribution_key;
 use leviathan_verifier::read_dump;
 use leviathan_verifier::CommitmentCheck;
+use leviathan_verifier::EquivocationCheck;
+use leviathan_verifier::VerifiedCommitment;
 use psyche_core::sha256;
 use psyche_core::BatchId;
 use psyche_core::ClosedInterval;
@@ -19,7 +22,9 @@ use psyche_network::commitment_record_path;
 use psyche_network::distro_results_to_bytes;
 use psyche_network::payload_dump_name;
 use psyche_network::results_digest;
+use psyche_network::equivocation_record_path;
 use psyche_network::CommitmentRecord;
+use psyche_network::EquivocationRecord;
 use psyche_network::SecretKey;
 use psyche_network::TransmittableDistroResult;
 
@@ -190,4 +195,83 @@ fn a_committer_that_spells_epoch_does_not_move_the_key() {
     ] {
         assert_eq!(contribution_key(Path::new(name)).as_deref(), key, "{name}");
     }
+}
+
+/// Keeps what `key` signed for `second`, a payload for the same name as the
+/// dump at `kept`, as the client keeps a contradicting payload: an
+/// equivocation record beside the kept pair (wienerlabs/leviathan-net#46).
+fn keep_equivocation(
+    kept: &Path,
+    second: &TransmittableDistroResult,
+    key: &SecretKey,
+    run_id: &str,
+) {
+    let data_hash = second.comptue_hash(run_id).unwrap();
+    let record = CommitmentRecord::new(second, data_hash, key.sign(&data_hash).to_bytes());
+    let equivocation = EquivocationRecord::new(second, record).unwrap();
+    fs::write(equivocation_record_path(kept), equivocation.to_bytes()).unwrap();
+}
+
+fn verified(path: &Path, key: &SecretKey) -> VerifiedCommitment {
+    match check_commitment(path, RUN, key.public().as_bytes()).unwrap() {
+        CommitmentCheck::Verified(commitment) => commitment,
+        other => panic!("the kept pair does not hold: {other:?}"),
+    }
+}
+
+#[test]
+fn a_second_signed_payload_for_the_batch_proves_equivocation() {
+    let dir = scratch("equivocation");
+    let key = SecretKey::generate(&mut rand::rng());
+    let kept = keep(&dir, &payload(FRAUD), &key, RUN);
+    keep_equivocation(&kept, &payload(HONEST), &key, RUN);
+    let kept_commitment = verified(&kept, &key);
+    match check_equivocation(&kept, &kept_commitment, RUN, key.public().as_bytes()).unwrap() {
+        EquivocationCheck::Proven(second) => {
+            assert_eq!(
+                second.record.data_hash,
+                payload(HONEST).comptue_hash(RUN).unwrap()
+            );
+        }
+        other => panic!("not proven: {other:?}"),
+    }
+}
+
+#[test]
+fn a_payload_with_no_contradiction_proves_nothing() {
+    let dir = scratch("no-equivocation");
+    let key = SecretKey::generate(&mut rand::rng());
+    let kept = keep(&dir, &payload(FRAUD), &key, RUN);
+    let kept_commitment = verified(&kept, &key);
+    assert_eq!(
+        check_equivocation(&kept, &kept_commitment, RUN, key.public().as_bytes()).unwrap(),
+        EquivocationCheck::None
+    );
+}
+
+#[test]
+fn an_equivocation_record_that_does_not_hold_is_invalid() {
+    let dir = scratch("bad-equivocation");
+    let key = SecretKey::generate(&mut rand::rng());
+    let other = SecretKey::generate(&mut rand::rng());
+    let kept = keep(&dir, &payload(FRAUD), &key, RUN);
+    let kept_commitment = verified(&kept, &key);
+    // Signed by someone else.
+    keep_equivocation(&kept, &payload(HONEST), &other, RUN);
+    assert!(matches!(
+        check_equivocation(&kept, &kept_commitment, RUN, key.public().as_bytes()).unwrap(),
+        EquivocationCheck::Invalid(_)
+    ));
+    // The kept payload again: no contradiction.
+    keep_equivocation(&kept, &payload(FRAUD), &key, RUN);
+    assert!(matches!(
+        check_equivocation(&kept, &kept_commitment, RUN, key.public().as_bytes()).unwrap(),
+        EquivocationCheck::Invalid(_)
+    ));
+    // Not a record at all.
+    fs::write(equivocation_record_path(&kept), b"not a record").unwrap();
+    assert!(matches!(
+        check_equivocation(&kept, &kept_commitment, RUN, key.public().as_bytes()).unwrap(),
+        EquivocationCheck::Invalid(_)
+    ));
 }

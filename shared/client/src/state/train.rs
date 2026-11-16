@@ -15,8 +15,9 @@ use psyche_modeling::{
     TrainerThreadCommunicationError,
 };
 use psyche_network::{
-    CommitmentRecord, Hash, SerializeDistroResultError, SerializedDistroResult,
-    TransmittableDistroResult, commitment_record_path, distro_results_to_bytes, payload_dump_name,
+    CommitmentRecord, EquivocationRecord, Hash, SerializeDistroResultError, SerializedDistroResult,
+    TransmittableDistroResult, commitment_record_path, distro_results_to_bytes,
+    equivocation_record_path, payload_dump_name,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -860,11 +861,24 @@ pub(crate) async fn write_gradients_to_disk(
         return Ok(());
     };
     let record_path = commitment_record_path(&fpath);
-    if !claim_record(&record_path, &commitment, &fpath).await? {
-        warn!(
-            "Already keeping a payload for {fname}; the committer signed another for the same batch, keeping the first"
-        );
-        return Ok(());
+    match claim_record(&record_path, &commitment, &fpath).await? {
+        Claim::Owned => {}
+        Claim::Duplicate => {
+            debug!("Already keeping this payload for {fname}.");
+            return Ok(());
+        }
+        Claim::Unreadable => {
+            warn!(
+                "Already keeping a payload for {fname} under a record that does not read; keeping it"
+            );
+            return Ok(());
+        }
+        Claim::Contradicted => {
+            warn!(
+                "Already keeping a payload for {fname}; the committer signed another for the same batch, keeping the first and the proof that it equivocated"
+            );
+            return keep_equivocation(&fpath, &distro_result, commitment).await;
+        }
     }
     if let Err(err) = write_whole(&write_gradients_dir, &fname, &serialized).await {
         // A record whose dump never lands would keep this payload out for good,
@@ -881,8 +895,22 @@ pub(crate) async fn write_gradients_to_disk(
     Ok(())
 }
 
+/// What taking the record for a payload's name found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// The name is this payload's: write its dump.
+    Owned,
+    /// This payload is already kept under the name.
+    Duplicate,
+    /// Another payload is kept under the name, with a commitment that
+    /// contradicts this one: the committer signed two for one batch.
+    Contradicted,
+    /// A record holds the name but does not read, so it proves nothing.
+    Unreadable,
+}
+
 /// Takes the commitment record for the dump at `dump`, which says this payload
-/// is the one kept under that name. Returns false if another payload holds it.
+/// is the one kept under that name, or says who holds it.
 ///
 /// A record left without its dump, by a crash or a failed write, is still
 /// this payload's if the same commitment arrives again, and the dump is then
@@ -891,33 +919,151 @@ async fn claim_record(
     record_path: &Path,
     commitment: &CommitmentRecord,
     dump: &Path,
-) -> Result<bool, WriteGradientsError> {
+) -> Result<Claim, WriteGradientsError> {
     let write_error = |err| WriteGradientsError::Write {
         fname: record_path.display().to_string(),
         err,
     };
+    // On disk, whole, before the dump can appear beside it.
+    match publish_new(record_path, &commitment.to_bytes()).await {
+        Ok(Published::New) => Ok(Claim::Owned),
+        Ok(Published::Taken) => {
+            let held = tokio::fs::read(record_path).await.map_err(write_error)?;
+            let Ok(held) = CommitmentRecord::from_bytes(&held) else {
+                return Ok(Claim::Unreadable);
+            };
+            if held != *commitment {
+                return Ok(Claim::Contradicted);
+            }
+            let dump_kept = tokio::fs::try_exists(dump).await.map_err(write_error)?;
+            Ok(if dump_kept {
+                Claim::Duplicate
+            } else {
+                Claim::Owned
+            })
+        }
+        Err(err) => Err(write_error(err)),
+    }
+}
+
+/// Keeps what the committer signed for `payload`, the second payload under
+/// the name of the dump at `dump`, as an equivocation record beside it: the
+/// proof, with the kept pair, that the committer signed two payloads for one
+/// batch (wienerlabs/leviathan-net#46). The first contradiction is kept; a
+/// later one adds nothing a conviction needs.
+async fn keep_equivocation(
+    dump: &Path,
+    payload: &TransmittableDistroResult,
+    commitment: CommitmentRecord,
+) -> Result<(), WriteGradientsError> {
+    let path = equivocation_record_path(dump);
+    let write_error = |err| WriteGradientsError::Write {
+        fname: path.display().to_string(),
+        err,
+    };
+    let record = EquivocationRecord::new(payload, commitment)
+        .map_err(|err| write_error(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))?;
+    publish_new(&path, &record.to_bytes())
+        .await
+        .map(|_| ())
+        .map_err(write_error)
+}
+
+/// Whether `publish_new` put its bytes in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Published {
+    /// The path was free and now holds them.
+    New,
+    /// Something was there already and is left as it was.
+    Taken,
+}
+
+/// Puts `bytes` at `path` only if nothing is there yet, and only whole. They
+/// go to a temporary name of their own, reach the disk, and are linked to
+/// `path`, which fails if it exists. A reader of `path` finds nothing or all
+/// of it: a second payload arriving while the first record is written reads
+/// the whole record, not a short one, and a crash leaves no partial file to
+/// hold the name for good. Either used to lose a proof of equivocation
+/// (wienerlabs/leviathan-net#46).
+async fn publish_new(path: &Path, bytes: &[u8]) -> std::io::Result<Published> {
+    publish_new_linking(path, bytes, |from, to| async move {
+        tokio::fs::hard_link(from, to).await
+    })
+    .await
+}
+
+/// `publish_new`, linking the finished file into place with `link`.
+///
+/// A filesystem that cannot hard-link (some FUSE, SMB and FAT mounts) gets the
+/// bytes written in place under `create_new` instead. They still never land
+/// over another file, though a reader may find them part-written while the
+/// write lasts. Failing there instead would keep no peer payload at all.
+async fn publish_new_linking<F, Linked>(
+    path: &Path,
+    bytes: &[u8],
+    link: F,
+) -> std::io::Result<Published>
+where
+    F: FnOnce(PathBuf, PathBuf) -> Linked,
+    Linked: std::future::Future<Output = std::io::Result<()>>,
+{
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other(format!("{} has no file name", path.display())))?;
+    let partial = path.with_file_name(format!("{name}.{:016x}.partial", rand::random::<u64>()));
+    let linked = async {
+        let mut file = tokio::fs::File::create(&partial).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        link(partial.clone(), path.to_path_buf()).await
+    }
+    .await;
+    if let Err(cleanup) = tokio::fs::remove_file(&partial).await {
+        if cleanup.kind() != std::io::ErrorKind::NotFound {
+            warn!("Could not remove {}: {cleanup}", partial.display());
+        }
+    }
+    match linked {
+        Ok(()) => Ok(Published::New),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(Published::Taken),
+        Err(err) if cannot_link(&err) => {
+            warn!(
+                "{} cannot be hard-linked into place ({err}); writing it in place",
+                path.display()
+            );
+            create_in_place(path, bytes).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether `err` is a filesystem refusing hard links, rather than a failure to
+/// write at all.
+fn cannot_link(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::CrossesDevices
+    )
+}
+
+/// Writes `bytes` at `path` only if nothing is there yet, in place.
+async fn create_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<Published> {
     match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(record_path)
+        .open(path)
         .await
     {
-        Ok(mut record) => {
-            record
-                .write_all(&commitment.to_bytes())
-                .await
-                .map_err(write_error)?;
-            // On disk before the dump can appear beside it.
-            record.sync_all().await.map_err(write_error)?;
-            Ok(true)
+        Ok(mut file) => {
+            file.write_all(bytes).await?;
+            file.sync_all().await?;
+            Ok(Published::New)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let held = tokio::fs::read(record_path).await.map_err(write_error)?;
-            let same = CommitmentRecord::from_bytes(&held).is_ok_and(|held| held == *commitment);
-            let dump_kept = tokio::fs::try_exists(dump).await.map_err(write_error)?;
-            Ok(same && !dump_kept)
-        }
-        Err(err) => Err(write_error(err)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(Published::Taken),
+        Err(err) => Err(err),
     }
 }
 
@@ -1106,6 +1252,214 @@ mod write_gradients_tests {
             record.verify(&results, RUN, key.public().as_bytes()),
             Ok(())
         );
+    }
+
+    /// The second payload a peer signed for the batch is not kept, but what it
+    /// signed is: beside the kept pair, an equivocation record that proves the
+    /// peer contradicted itself (wienerlabs/leviathan-net#46). A third keeps
+    /// the first equivocation.
+    #[tokio::test]
+    async fn a_second_payload_for_a_batch_leaves_the_proof_of_equivocation() {
+        let dir = scratch("equivocation");
+        let key = SecretKey::generate(&mut rand::rng());
+        let first = payload(&[1.0, -2.0, 3.0]);
+        let second = payload(&[4.0, 5.0, -6.0]);
+        let third = payload(&[7.0, 8.0, 9.0]);
+        for payload in [&first, &second, &third] {
+            write_gradients_to_disk(
+                dir.clone(),
+                peer(&key),
+                payload.clone(),
+                Some(signed(&key, payload)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let dump = dump_of(&dir, &peer(&key), &first);
+        let (kept_record, kept_results) = kept(&dump);
+        let equivocation = EquivocationRecord::from_bytes(
+            &std::fs::read(equivocation_record_path(&dump)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            equivocation.record.data_hash,
+            second.comptue_hash(RUN).unwrap()
+        );
+        assert_eq!(
+            equivocation.proves_against(
+                &kept_record,
+                &psyche_network::results_digest(&kept_results).unwrap(),
+                RUN,
+                key.public().as_bytes(),
+            ),
+            Ok(())
+        );
+    }
+
+    /// Payloads for one batch arriving together, handled at once on several
+    /// threads: one is kept with its own whole record, and a contradicting
+    /// one is the proof beside it. A handler used to read a record another
+    /// had created but not yet written, find it short, and drop the proof
+    /// (wienerlabs/leviathan-net#46).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn payloads_arriving_together_still_leave_the_proof() {
+        for round in 0..64 {
+            let dir = scratch(&format!("together-{round}"));
+            let key = SecretKey::generate(&mut rand::rng());
+            let one = payload(&[1.0, -2.0, 3.0]);
+            let other = payload(&[4.0, 5.0, -6.0]);
+            let arrivals: Vec<_> = (0..8)
+                .map(|n| {
+                    let payload = if n % 2 == 0 {
+                        one.clone()
+                    } else {
+                        other.clone()
+                    };
+                    let commitment = signed(&key, &payload);
+                    tokio::spawn(write_gradients_to_disk(
+                        dir.clone(),
+                        peer(&key),
+                        payload,
+                        Some(commitment),
+                    ))
+                })
+                .collect();
+            for arrival in arrivals {
+                arrival.await.unwrap().unwrap();
+            }
+
+            let dump = dump_of(&dir, &peer(&key), &one);
+            let (kept_record, kept_results) = kept(&dump);
+            assert_eq!(
+                kept_record.verify(&kept_results, RUN, key.public().as_bytes()),
+                Ok(()),
+                "round {round}: the kept pair does not hold"
+            );
+            let equivocation = EquivocationRecord::from_bytes(
+                &std::fs::read(equivocation_record_path(&dump))
+                    .unwrap_or_else(|err| panic!("round {round}: the proof was lost: {err}")),
+            )
+            .unwrap();
+            assert_eq!(
+                equivocation.proves_against(
+                    &kept_record,
+                    &psyche_network::results_digest(&kept_results).unwrap(),
+                    RUN,
+                    key.public().as_bytes(),
+                ),
+                Ok(()),
+                "round {round}: the proof does not hold"
+            );
+            let partials: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.ends_with(".partial"))
+                .collect();
+            assert!(
+                partials.is_empty(),
+                "round {round}: left behind {partials:?}"
+            );
+        }
+    }
+
+    /// A record is put in place whole, and never over another.
+    #[tokio::test]
+    async fn a_record_is_published_whole_and_only_once() {
+        let dir = scratch("publish");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result-x.commitment");
+        assert_eq!(publish_new(&path, b"first").await.unwrap(), Published::New);
+        assert_eq!(
+            publish_new(&path, b"second").await.unwrap(),
+            Published::Taken
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["result-x.commitment".to_string()]);
+    }
+
+    /// Where the filesystem refuses hard links, a record is still published,
+    /// in place, and still never over another.
+    #[tokio::test]
+    async fn a_record_is_published_where_links_are_refused() {
+        let dir = scratch("nolinks");
+        std::fs::create_dir_all(&dir).unwrap();
+        for refusal in [
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::CrossesDevices,
+        ] {
+            let path = dir.join(format!("result-{refusal:?}.commitment"));
+            let refuse =
+                |_: PathBuf, _: PathBuf| async move { Err::<(), _>(std::io::Error::from(refusal)) };
+            assert_eq!(
+                publish_new_linking(&path, b"first", refuse).await.unwrap(),
+                Published::New
+            );
+            assert_eq!(
+                publish_new_linking(&path, b"second", refuse).await.unwrap(),
+                Published::Taken
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        }
+        let partials: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert!(partials.is_empty(), "left behind {partials:?}");
+    }
+
+    /// A record that does not read holds its name and proves nothing: the
+    /// payload is not kept beside a record that is not its own, no proof is
+    /// written against it, and the write does not fail.
+    #[tokio::test]
+    async fn a_record_that_does_not_read_keeps_the_name() {
+        let dir = scratch("unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(&[1.0, -2.0, 3.0]);
+        let dump = dump_of(&dir, &peer(&key), &payload);
+        std::fs::write(commitment_record_path(&dump), b"not a record").unwrap();
+        write_gradients_to_disk(
+            dir.clone(),
+            peer(&key),
+            payload.clone(),
+            Some(signed(&key, &payload)),
+        )
+        .await
+        .unwrap();
+        assert!(!dump.exists());
+        assert!(!equivocation_record_path(&dump).exists());
+        assert_eq!(
+            std::fs::read(commitment_record_path(&dump)).unwrap(),
+            b"not a record"
+        );
+    }
+
+    /// The same payload arriving again is not a contradiction, and leaves no
+    /// equivocation record.
+    #[tokio::test]
+    async fn the_same_payload_twice_leaves_no_equivocation() {
+        let dir = scratch("repeat");
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(&[1.0, -2.0, 3.0]);
+        for _ in 0..2 {
+            write_gradients_to_disk(
+                dir.clone(),
+                peer(&key),
+                payload.clone(),
+                Some(signed(&key, &payload)),
+            )
+            .await
+            .unwrap();
+        }
+        let dump = dump_of(&dir, &peer(&key), &payload);
+        assert!(!equivocation_record_path(&dump).exists());
     }
 
     /// A record left without its dump is finished by the same commitment when

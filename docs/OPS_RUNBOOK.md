@@ -114,8 +114,19 @@ The kill switches are Prometheus alerts over what `leviathan-indexer
 
 A verifier also counts signed payloads it cannot judge at all
 (`leviathan_verifier_contributions_malformed_total`): they do not decode, or do
-not fit the replayed model. It sets each aside and goes on with the rest, so one
+not fit the replayed model. Equivocation records that prove nothing count
+there too. A node writes one only after checking it, so one that fails was
+damaged or tampered with on its disk. It sets each aside and goes on with the rest, so one
 such payload cannot stop it judging everyone else.
+
+A verifier counts the peers it caught signing two different payloads for one
+batch (`leviathan_verifier_equivocations_found_total`). Each is a proof the
+chain takes on its own, and the verifier submits it whatever it is assigned
+(wienerlabs/leviathan-net#46). The submission is counted like a fraud proof's,
+so `LeviathanFraudNotSubmitted` covers it as well. A proof the epoch can no
+longer charge, because the epoch ended or a pause withdrew the peer before it
+landed, fires that alert once, and the verifier's log names the peer. Records
+from epochs that are over are set aside without an alert.
 
 ## Bond and slash economics
 

@@ -2,7 +2,10 @@ pub mod blockhash_keeper;
 pub mod create_memnet_endpoint;
 #[cfg(feature = "daemon")]
 pub mod daemon;
+#[cfg(feature = "daemon")]
+pub mod daemon_equivocation;
 pub mod distributor;
+pub mod equivocation;
 pub mod get_accounts;
 pub mod mining_pool;
 pub mod process_authorizer_instructions;
