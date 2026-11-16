@@ -174,6 +174,13 @@ pub mod psyche_solana_treasurer {
         run_pay_bench_bounty_processor(context, params)
     }
 
+    pub fn run_slash_equivocation(
+        context: Context<RunSlashEquivocationAccounts>,
+        params: RunSlashEquivocationParams,
+    ) -> Result<()> {
+        run_slash_equivocation_processor(context, params)
+    }
+
     pub fn participant_release_verdict_vote(
         context: Context<ParticipantReleaseVerdictVoteAccounts>,
         params: ParticipantReleaseVerdictVoteParams,
@@ -326,4 +333,10 @@ pub enum ProgramError {
 
     #[msg("The losing verifiers' forfeits owe the bench nothing")]
     NothingOwedToBench,
+
+    #[msg("The two commitments are not two different commitments to the same step and batch")]
+    EquivocationNotProven,
+
+    #[msg("The target cannot be ejected into an epoch that will charge it now: it is off the roster, already ejected or withdrawn, or no ejection here would be charged")]
+    EquivocationNotLandable,
 }

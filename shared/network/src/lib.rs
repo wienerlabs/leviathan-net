@@ -61,6 +61,7 @@ mod authenticable_identity;
 mod commitment_record;
 mod connection_monitor;
 mod download;
+mod equivocation_record;
 mod latency_sorted;
 mod local_discovery;
 mod p2p_model_sharing;
@@ -84,6 +85,9 @@ pub use commitment_record::{
     commitment_record_path, payload_dump_name,
 };
 pub use connection_monitor::{ConnectionData, ConnectionMonitor, PeerBandwidth};
+pub use equivocation_record::{
+    EQUIVOCATION_RECORD_EXTENSION, EquivocationError, EquivocationRecord, equivocation_record_path,
+};
 pub use download::{
     DownloadComplete, DownloadFailed, DownloadSchedulerHandle, DownloadType, ReadyRetry,
     RetryConfig, RetryQueueResult, TransmittableDownload,

@@ -19,6 +19,10 @@ use crate::labels::RunLabels;
 /// pass judges it, and counts it, again until the chain takes it. That makes
 /// `submission_failures` a count of attempts, which is what an alert on a
 /// verifier that cannot reach the chain wants.
+///
+/// An equivocation proof is judged the same way. Whatever becomes of it is
+/// counted in the same outcome counters as a fraud proof, so the kill switch
+/// covers it too (wienerlabs/leviathan-net#46).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PassReport {
     /// Contributions replayed or compared and found within the band.
@@ -27,18 +31,28 @@ pub struct PassReport {
     /// holds. Each is submitted, withheld, already on chain, failed, or
     /// against a committer this session already convicted.
     pub fraud_found: u64,
-    /// Fraud proofs put on chain, as a committee vote or as a slash.
+    /// Committers found to have signed two different payloads for one batch:
+    /// a proof of equivocation this verifier holds, which needs no replay.
+    /// Each is submitted, withheld, already on chain, or failed.
+    pub equivocations: u64,
+    /// Fraud proofs put on chain: a committee vote, a slash, or a proof of
+    /// equivocation.
     pub submitted: u64,
     /// Fraud proofs the chain refused because it already holds them: the
     /// target convicted in this epoch, or this verifier's vote in the round.
     pub already_on_chain: u64,
     /// Attempts to put a fraud proof on chain that failed for any other
-    /// reason. The proof is retried on the next pass.
+    /// reason. The proof is retried on the next pass. A proof of equivocation
+    /// its epoch can no longer charge, because the epoch stopped charging or
+    /// its committer withdrew or left the roster, is counted here once and
+    /// dropped.
     pub submission_failures: u64,
     /// Fraud proofs held back because the daemon runs in dry-run mode.
     pub withheld: u64,
     /// Signed payloads that could not be judged: they do not decode, or do not
-    /// fit the model the reference was replayed on.
+    /// fit the model the reference was replayed on. Also equivocation records
+    /// that prove nothing, which a node writes only after checking them, so
+    /// one that does not hold was damaged or tampered with on disk.
     pub malformed: u64,
     /// Contributions this verifier could not establish a reference for: its
     /// reference dump does not read, or the replay failed. Retried.
@@ -57,6 +71,7 @@ impl AddAssign for PassReport {
     fn add_assign(&mut self, other: Self) {
         self.cleared += other.cleared;
         self.fraud_found += other.fraud_found;
+        self.equivocations += other.equivocations;
         self.submitted += other.submitted;
         self.already_on_chain += other.already_on_chain;
         self.submission_failures += other.submission_failures;
@@ -69,7 +84,7 @@ impl AddAssign for PassReport {
 type Count = fn(&PassReport) -> u64;
 
 /// Every counter a pass feeds, its name and help, and the field it counts.
-const PASS_COUNTERS: [(&str, &str, Count); 8] = [
+const PASS_COUNTERS: [(&str, &str, Count); 9] = [
     (
         "leviathan_verifier_contributions_cleared",
         "Contributions this verifier judged within the tolerance band",
@@ -81,8 +96,13 @@ const PASS_COUNTERS: [(&str, &str, Count); 8] = [
         |r| r.fraud_found,
     ),
     (
+        "leviathan_verifier_equivocations_found",
+        "Committers this verifier found signing two different payloads for one batch, counted again while a failed submission is retried",
+        |r| r.equivocations,
+    ),
+    (
         "leviathan_verifier_convictions_submitted",
-        "Fraud proofs this verifier put on chain, as a committee vote or a slash",
+        "Fraud proofs this verifier put on chain, as a committee vote, a slash or a proof of equivocation",
         |r| r.submitted,
     ),
     (
@@ -92,7 +112,7 @@ const PASS_COUNTERS: [(&str, &str, Count); 8] = [
     ),
     (
         "leviathan_verifier_submission_failures",
-        "Attempts to put a fraud proof on chain that failed for any other reason; retried every pass",
+        "Attempts to put a fraud proof on chain that failed for any other reason; retried every pass, or counted once for a proof of equivocation the chain can no longer charge",
         |r| r.submission_failures,
     ),
     (
@@ -102,7 +122,7 @@ const PASS_COUNTERS: [(&str, &str, Count); 8] = [
     ),
     (
         "leviathan_verifier_contributions_malformed",
-        "Signed payloads that could not be judged: they do not decode or do not fit the replayed model",
+        "Signed payloads that could not be judged, as they do not decode or do not fit the replayed model, and equivocation records that prove nothing",
         |r| r.malformed,
     ),
     (
@@ -251,6 +271,7 @@ mod tests {
         let report = PassReport {
             cleared: 4,
             fraud_found: 6,
+            equivocations: 7,
             submitted: 1,
             already_on_chain: 1,
             submission_failures: 2,
@@ -266,6 +287,7 @@ mod tests {
         for line in [
             r#"leviathan_verifier_contributions_cleared_total{run_id="run-a"} 8"#,
             r#"leviathan_verifier_fraud_found_total{run_id="run-a"} 12"#,
+            r#"leviathan_verifier_equivocations_found_total{run_id="run-a"} 14"#,
             r#"leviathan_verifier_convictions_submitted_total{run_id="run-a"} 2"#,
             r#"leviathan_verifier_already_on_chain_total{run_id="run-a"} 2"#,
             r#"leviathan_verifier_submission_failures_total{run_id="run-a"} 4"#,
@@ -293,6 +315,7 @@ mod tests {
         };
         let second = PassReport {
             fraud_found: 1,
+            equivocations: 2,
             withheld: 1,
             submission_failures: 1,
             unreplayable: 2,
@@ -305,6 +328,7 @@ mod tests {
             PassReport {
                 cleared: 1,
                 fraud_found: 3,
+                equivocations: 2,
                 submitted: 1,
                 already_on_chain: 1,
                 submission_failures: 1,

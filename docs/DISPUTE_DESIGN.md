@@ -240,7 +240,8 @@ step from being skipped:
   to undo the vote that reached the quorum (wienerlabs/leviathan-net#40). The
   other way round, `run_slash` still has nothing to record a refusal in: an
   authority slash of a target the committee already ejected this epoch is
-  refused, and the target is charged once.
+  refused, and the target is charged once. A proof of equivocation
+  (`run_slash_equivocation`, below) lands the same way as `run_slash`.
 
 ### What a conviction proves on chain
 
@@ -301,8 +302,96 @@ record. The dump's name carries the epoch, step and batch, so a step trained
 again after a restart is kept under a name of its own. It also keeps only the
 first payload a peer signed for a batch. A peer that signs two payloads for one batch
 therefore cannot leave one payload's record beside the other's dump, which
-would leave nothing to convict on. Signing two payloads for one batch is itself
-provable from the two signatures, though no rule charges it yet.
+would leave nothing to convict on.
+
+### Equivocation
+
+A trainer signs one payload per batch it trains. Two different commitment
+hashes for the same run, round and batch, both signed by the target's roster
+p2p key, are equivocation: the target told different peers different things
+about the same work. The round is the epoch and the step the commitment names
+(wienerlabs/leviathan-net#67). An honest client never does that:
+- It sends the first rank's result for a batch and drops the rest.
+- It trains a batch once per step, and a restarted client joins only a later
+  epoch.
+- A run restarted from an earlier step trains the step again, but in a new
+  epoch, so that is another round.
+- Sending the same payload twice gives the same bytes, so the same hash, and
+  two copies of one commitment are not equivocation.
+
+The nonce is a trainer-local counter. Only the round and the batch say which
+work a payload is, so two commitments to the same round and batch that differ
+in nonce or results are equivocation (wienerlabs/leviathan-net#46).
+
+- **The client keeps the second commitment.** When a payload arrives under a
+  name whose record holds a different commitment, the client keeps the first
+  payload and drops the second, as before. Beside the first it now writes an
+  equivocation record: the second commitment's header and signature, and the
+  digest of its results. That is everything the chain needs to rebuild the
+  second hash and check its signature, without the payload. The first
+  contradiction is kept, and a repeat of the kept commitment writes nothing.
+  Each record goes to a temporary name, reaches the disk, and is linked into
+  place, which fails if the name is taken. A payload arriving while the first
+  record is written then reads it whole, and a crash leaves no partial record
+  holding the name. Either used to lose the proof.
+- **The proof convicts on its own.** `run_slash_equivocation` takes the two
+  commitments, the batch and the target's roster index. The same transaction
+  carries an ed25519 precompile instruction for each, both signed by the
+  target's roster p2p key. The treasurer rebuilds both hashes as above and
+  refuses the proof unless:
+  - both are from the current epoch (`CommitmentOutsideEpoch`);
+  - the steps are the same and the hashes differ (`EquivocationNotProven`);
+  - both signatures are the key of the client at that roster index
+    (`CommitmentNotSigned`).
+
+  A seat past the roster names nobody (`TargetMismatch`). A signature over another batch's
+  commitment does not prove one over this batch's. It needs no replay, so it
+  needs no committee and leaves nothing for an appeal to contest, and anyone
+  may send it.
+- **It lands only as an ejection.** It has no verdict account in which to
+  record a conviction to charge later, so it lands only where an ejection is
+  certain to be charged. That means `conviction_landing` must give an
+  ejection. Otherwise the proof is refused (`EquivocationNotLandable`): when
+  the target is already ejected, has withdrawn, or the epoch is not charging.
+  The ejection is charged with the epoch, at the run's slashing rate, like any
+  other. A target already ejected this epoch is charged once. A committee
+  conviction after the proof is recorded as due and charged as well, as after
+  `run_slash`. The window is ample. A peer sees the second payload in the
+  round it arrives, and the final round's roster stands through the cooldown
+  (wienerlabs/leviathan-net#40).
+- **Every verifier submits it.** Each pass, the daemon looks beside every kept
+  payload for an equivocation record, whatever batches its committee assigns
+  it. It checks both commitments against the target's roster key and submits
+  the proof. The first proof to land ejects the target, and the next daemon
+  finds it ejected (`already_on_chain`).
+  - **Refused.** A proof the chain did not take counts as a failed
+    submission, which the uncaught-fraud kill switch fires on, and is sent
+    again every pass.
+  - **No longer landable.** Before sending, the daemon asks
+    `conviction_landing` whether the proof can land. One it can never land in
+    this epoch is counted once as a failed submission and dropped: the target
+    withdrew or left the roster, or the epoch stopped charging before the
+    proof landed.
+  - **From an ended epoch.** A record from an epoch that is over is set aside
+    without being counted, so a daemon restarted with old records on disk
+    does not report them again.
+  - **Ahead of the daemon.** A record from a round the daemon's view of the
+    run has not reached is looked at again on the next pass.
+
+What this does not charge:
+- **An equivocation whose epoch ends before any verifier sends the proof.**
+  For instance, a pause withdraws everyone first. As with `run_slash`,
+  nothing records it to charge later. The kill switch reports it. A client
+  cannot withdraw itself from an epoch on chain: only a pause withdraws, and
+  it withdraws everyone.
+- **One no single peer sees.** The proof needs one node to hold both
+  payloads. A trainer broadcasts its commitment over gossip, which floods it
+  to every peer. Only a trainer that sent each commitment to peers who never
+  relay the other could keep both from meeting.
+
+A daemon that finds an equivocation record that proves nothing counts it as
+malformed. A node writes a record only after checking the second payload's
+signature, so such a record was damaged or tampered with on disk.
 
 The coordinator's own `slash_client` stays the owner's instrument. For a
 treasurer run the owner is the run PDA, so every slash goes through the checks

@@ -25,9 +25,9 @@ vault and what it owes, the verdict accounts, and how fresh its own view is.
 Repeat `--run-id` to export several runs. Its counters count what it saw move
 after it started; its first poll only learns what is there, so a restart never
 reports an old dispute as a new one. The verifier daemon exports what it judged,
-what the chain already held, what it could not get on chain, payloads it
-could not judge at all, and how long a pass takes against how long it waits
-between passes. Neither endpoint authenticates a scrape, so bind it to
+the peers it caught signing two payloads for one batch, what the chain already
+held, what it could not get on chain, payloads it could not judge at all, and
+how long a pass takes against how long it waits between passes. Neither endpoint authenticates a scrape, so bind it to
 an interface only Prometheus reaches.
 
 | Alert | Fires when |

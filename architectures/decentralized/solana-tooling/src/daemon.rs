@@ -10,6 +10,7 @@ use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
+use leviathan_verifier::VerifiedCommitment;
 use psyche_coordinator::select_audits_for_current_round;
 use psyche_coordinator::ClientState;
 use psyche_coordinator::Coordinator;
@@ -28,6 +29,7 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use tch::Device;
 
+use crate::daemon_equivocation::EquivocationPass;
 use crate::get_accounts::get_coordinator_account_state;
 use crate::get_accounts::get_run;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
@@ -111,6 +113,54 @@ pub fn epoch_is_over(
             && record.step < coordinator.epoch_state.start_step)
 }
 
+/// What `p2p` signed for a kept payload, as the treasurer takes it in a
+/// conviction.
+pub fn signed_commitment_of(
+    coordinator: &Coordinator,
+    commitment: &VerifiedCommitment,
+    p2p: [u8; 32],
+) -> SignedCommitment {
+    let record = commitment.record;
+    SignedCommitment {
+        run: commitment_run(coordinator),
+        batch_start: record.batch_id.0.start,
+        batch_end: record.batch_id.0.end,
+        evidence: CommitmentEvidence {
+            epoch_start: record.epoch_start,
+            step: record.step,
+            trainer_nonce: record.trainer_nonce,
+            results_digest: commitment.results_digest,
+        },
+        signer: p2p,
+        signature: record.signature,
+    }
+}
+
+/// Whether `target` is ejected, on the roster or, once a round ended, among
+/// the clients that left it.
+fn is_ejected(coordinator: &Coordinator, target: &Pubkey) -> bool {
+    let roster = coordinator.epoch_state.clients.iter();
+    let exited = coordinator.epoch_state.exited_clients.iter();
+    roster.chain(exited).any(|client| {
+        *client.id.signer() == target.to_bytes()
+            && client.state == ClientState::Ejected
+    })
+}
+
+/// Whether the chain has ejected `target`, read now.
+pub async fn target_ejected(
+    endpoint: &mut solana_toolbox_endpoint::ToolboxEndpoint,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+) -> Result<bool> {
+    let state = get_coordinator_account_state(endpoint, coordinator_account)
+        .await?
+        .ok_or_else(|| {
+            anyhow!("coordinator account {coordinator_account} not found")
+        })?;
+    Ok(is_ejected(&state.coordinator, target))
+}
+
 /// Whether the chain already holds what a refused submission would have put
 /// there: a conviction of `target` in this epoch, landed or still in its
 /// windows, or `verifier`'s own vote against it in the round under way. A
@@ -133,12 +183,7 @@ async fn already_on_chain(
                     )
                 })?;
         let coordinator = &state.coordinator;
-        let roster = coordinator.epoch_state.clients.iter();
-        let exited = coordinator.epoch_state.exited_clients.iter();
-        let ejected = roster.chain(exited).any(|client| {
-            *client.id.signer() == target.to_bytes()
-                && client.state == ClientState::Ejected
-        });
+        let ejected = is_ejected(coordinator, target);
         let round_height =
             coordinator.current_round().map_or(0, |round| round.height);
         (coordinator.progress.epoch, round_height, ejected)
@@ -221,6 +266,22 @@ pub async fn audit_pass(
     }
     let device = Device::Cpu;
     let mut report = PassReport::default();
+
+    // Equivocation first: it needs no reference and no committee seat, so it
+    // is proven for every payload kept, assigned or not, and a committer it
+    // convicts is not convicted again below (wienerlabs/leviathan-net#46).
+    EquivocationPass {
+        endpoint,
+        authority,
+        coordinator_account,
+        run,
+        config,
+        coordinator,
+        report: &mut report,
+        judged,
+    }
+    .convict_all(&submitted)
+    .await;
 
     for (key, submitted_path) in &submitted {
         let Some(committer) = parse_committer(submitted_path) else {
@@ -307,19 +368,18 @@ pub async fn audit_pass(
             judged.insert(key.clone());
             continue;
         }
-        let evidence = CommitmentEvidence {
-            epoch_start: record.epoch_start,
-            step: record.step,
-            trainer_nonce: record.trainer_nonce,
-            results_digest: commitment.results_digest,
-        };
+        let signed = signed_commitment_of(
+            coordinator,
+            &commitment,
+            *target.p2p_identity(),
+        );
         // A payload from an epoch that is over convicts nobody now: the
         // treasurer refuses it, by the same rule. One kept from before a
         // restart from an earlier step is such a payload, though its step is
         // trained again. Judged and sent anyway, it would be refused every
         // pass and reported as a fraud the chain never saw
         // (wienerlabs/leviathan-net#67).
-        if !evidence.is_from_current_epoch(coordinator) {
+        if !signed.evidence.is_from_current_epoch(coordinator) {
             if epoch_is_over(coordinator, &record) {
                 println!(
                     "[verifier-daemon] skip  {key} committer {committer}: its epoch is over, nothing can convict on it now"
@@ -412,14 +472,6 @@ pub async fn audit_pass(
             continue;
         }
 
-        let signed = SignedCommitment {
-            run: commitment_run(coordinator),
-            batch_start: record.batch_id.0.start,
-            batch_end: record.batch_id.0.end,
-            evidence,
-            signer: *target.p2p_identity(),
-            signature: record.signature,
-        };
         let replayed_hash = hash_delta(&reference_delta);
         report.fraud_found += 1;
         println!(

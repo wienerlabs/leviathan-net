@@ -26,6 +26,7 @@ mod memnet_treasurer_committee_slash;
 mod memnet_treasurer_cross_round_quorum;
 mod memnet_treasurer_create_claim;
 mod memnet_treasurer_create_update;
+mod memnet_treasurer_equivocation;
 mod memnet_treasurer_final_round_audit;
 mod memnet_treasurer_full_epoch;
 mod memnet_treasurer_join_gate;
@@ -39,6 +40,8 @@ mod signed_payload;
 mod memnet_verifier_daemon;
 #[cfg(feature = "daemon")]
 mod memnet_verifier_daemon_committee;
+#[cfg(feature = "daemon")]
+mod memnet_verifier_daemon_equivocation;
 #[cfg(feature = "daemon")]
 mod memnet_verifier_daemon_replay;
 #[cfg(feature = "daemon")]

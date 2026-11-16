@@ -11,8 +11,11 @@ use psyche_modeling::Distro;
 use psyche_modeling::DistroResult;
 use psyche_network::commitment_record_path;
 use psyche_network::distro_results_from_reader;
+use psyche_network::equivocation_record_path;
 use psyche_network::results_digest;
 use psyche_network::CommitmentRecord;
+use psyche_network::EquivocationError;
+use psyche_network::EquivocationRecord;
 use psyche_network::PAYLOAD_DUMP_EXTENSION;
 use psyche_network::SerializedDistroResult;
 use psyche_verifier::audit_contribution;
@@ -162,6 +165,65 @@ pub fn check_commitment(
         record,
         results_digest: results_digest(&results)?,
     }))
+}
+
+/// What an equivocation record kept beside a payload dump proves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EquivocationCheck {
+    /// No equivocation record is kept beside the dump.
+    None,
+    /// A record is there and does not prove anything: the wrong size, the
+    /// kept commitment again, other work, or another key's signature.
+    Invalid(String),
+    /// The committer signed this second commitment for the same step and
+    /// batch as the kept one, which differs from it.
+    Proven(EquivocationRecord),
+}
+
+/// Checks the equivocation record kept beside the payload dump at `path`,
+/// against `kept`, the dump's own verified commitment, in the run `run_id`
+/// for the committer's key `p2p_identity` (wienerlabs/leviathan-net#46).
+///
+/// A `Proven` record and `kept` are two signed commitments to one batch, which
+/// convict the committer on their own. An error is a failure to read the file,
+/// which may pass.
+pub fn check_equivocation(
+    path: &Path,
+    kept: &VerifiedCommitment,
+    run_id: &str,
+    p2p_identity: &[u8; 32],
+) -> Result<EquivocationCheck> {
+    let record_path = equivocation_record_path(path);
+    let size = match fs::metadata(&record_path) {
+        Ok(metadata) => metadata.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(EquivocationCheck::None)
+        }
+        Err(err) => return Err(anyhow!("cannot read {}: {}", record_path.display(), err)),
+    };
+    // Sized before it is read, so a stray file cannot make the daemon load it.
+    if size != EquivocationRecord::SERIALIZED_SIZE as u64 {
+        return Ok(EquivocationCheck::Invalid(format!(
+            "{} is {size} bytes, a record is {}",
+            record_path.display(),
+            EquivocationRecord::SERIALIZED_SIZE
+        )));
+    }
+    let bytes = fs::read(&record_path)
+        .map_err(|err| anyhow!("cannot read {}: {}", record_path.display(), err))?;
+    let invalid = |err: EquivocationError| {
+        EquivocationCheck::Invalid(format!("{}: {err}", record_path.display()))
+    };
+    let second = match EquivocationRecord::from_bytes(&bytes) {
+        Ok(second) => second,
+        Err(err) => return Ok(invalid(err)),
+    };
+    Ok(
+        match second.proves_against(&kept.record, &kept.results_digest, run_id, p2p_identity) {
+            Ok(()) => EquivocationCheck::Proven(second),
+            Err(err) => invalid(err),
+        },
+    )
 }
 
 /// Writes a tokenized dataset a small model can actually be trained on. Real

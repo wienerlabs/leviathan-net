@@ -101,20 +101,20 @@ pub fn dump_name(wallet: &Keypair, header: PayloadHeader) -> String {
     )
 }
 
-/// Keeps the payload dump at `source` in `dir` as a node keeps a peer's payload
-/// it verified in the run `run_id`. It writes the record of what the committer signed for it, as
-/// the client does: `p2p` signs the payload's commitment hash with the same
-/// ed25519 key the client's iroh identity holds. Then it writes the dump
-/// itself, under the name the client gives it.
+/// The payload with the results of the dump at `source`, for the work
+/// `header` names, and the record of `p2p` signing it in the run `run_id` the
+/// way a client signs what it broadcasts: the payload's commitment hash,
+/// signed with the same ed25519 key the client's iroh identity holds.
 #[cfg(feature = "daemon")]
-pub fn keep_signed_payload(
-    dir: &std::path::Path,
+fn signed_record(
     source: &std::path::Path,
-    wallet: &Keypair,
     p2p: &Keypair,
     run_id: &str,
     header: PayloadHeader,
-) -> PathBuf {
+) -> (
+    psyche_network::TransmittableDistroResult,
+    psyche_network::CommitmentRecord,
+) {
     let distro_results = leviathan_verifier::read_dump(source).unwrap();
     let payload = psyche_network::TransmittableDistroResult {
         epoch_start: header.epoch_start,
@@ -129,6 +129,23 @@ pub fn keep_signed_payload(
     let signature = key.sign(&data_hash).to_bytes();
     let record =
         psyche_network::CommitmentRecord::new(&payload, data_hash, signature);
+    (payload, record)
+}
+
+/// Keeps the payload dump at `source` in `dir` as a node keeps a peer's payload
+/// it verified in the run `run_id`. It writes the record of what the committer
+/// signed for it, as the client does, signed by `p2p`. Then it writes the dump
+/// itself, under the name the client gives it.
+#[cfg(feature = "daemon")]
+pub fn keep_signed_payload(
+    dir: &std::path::Path,
+    source: &std::path::Path,
+    wallet: &Keypair,
+    p2p: &Keypair,
+    run_id: &str,
+    header: PayloadHeader,
+) -> PathBuf {
+    let (payload, record) = signed_record(source, p2p, run_id, header);
     let path = dir.join(dump_name(wallet, header));
     std::fs::write(
         psyche_network::commitment_record_path(&path),
@@ -141,6 +158,26 @@ pub fn keep_signed_payload(
             .unwrap(),
     )
     .unwrap();
+    path
+}
+
+/// Keeps, beside the payload dump at `kept`, the record a client keeps when
+/// a second payload arrives for the same batch under a different commitment:
+/// the results of the dump at `source`, for the work `header` names, signed
+/// by `p2p` in the run `run_id` (wienerlabs/leviathan-net#46).
+#[cfg(feature = "daemon")]
+pub fn keep_equivocation(
+    kept: &std::path::Path,
+    source: &std::path::Path,
+    p2p: &Keypair,
+    run_id: &str,
+    header: PayloadHeader,
+) -> PathBuf {
+    let (payload, record) = signed_record(source, p2p, run_id, header);
+    let second = psyche_network::EquivocationRecord::new(&payload, record)
+        .expect("the payload encodes");
+    let path = psyche_network::equivocation_record_path(kept);
+    std::fs::write(&path, second.to_bytes()).unwrap();
     path
 }
 

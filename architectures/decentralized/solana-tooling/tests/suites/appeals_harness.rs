@@ -107,7 +107,7 @@ pub(super) struct AppealsHarness {
     pub(super) collateral_mint: Pubkey,
     pub(super) clients: Vec<Keypair>,
     /// The p2p key each client joined with, which signs its payloads.
-    p2ps: Vec<Keypair>,
+    pub(super) p2ps: Vec<Keypair>,
     pub(super) clients_collateral: Vec<Pubkey>,
     pub(super) verifiers: Vec<(usize, u64)>,
     pub(super) tie_breakers: Vec<(usize, u64)>,
