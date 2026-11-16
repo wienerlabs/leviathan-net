@@ -3,6 +3,8 @@ use std::sync::Arc;
 use leviathan_verifier::audit_with_replay;
 use leviathan_verifier::decompress_results;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::replay_epoch;
+use leviathan_verifier::DumpKey;
 use leviathan_verifier::write_token_dataset;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::TrainerReplayEngine;
@@ -225,7 +227,7 @@ fn a_dump_directory_is_audited_against_a_recomputed_reference() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let (_, honest) = train_once(build_trainer(), sample_batch());
-    write_dump(&dir, "step1-batchB[0, 0]", &honest);
+    write_dump(&dir, "epoch1700000000-step1-batchB[0, 0]", &honest);
 
     let engine = engine_with_assignment(build_trainer());
     let summary =
@@ -240,7 +242,7 @@ fn a_dump_directory_is_audited_against_a_recomputed_reference() {
     let forged: Vec<f32> = honest.iter().map(|v| -5.0 * v).collect();
     let fraud_dir = dir.join("fraud");
     std::fs::create_dir_all(&fraud_dir).unwrap();
-    write_dump(&fraud_dir, "step1-batchB[0, 0]", &forged);
+    write_dump(&fraud_dir, "epoch1700000000-step1-batchB[0, 0]", &forged);
 
     let engine = engine_with_assignment(build_trainer());
     let summary = audit_with_replay(&fraud_dir, &engine, DEFAULT_BAND, Device::Cpu)
@@ -281,7 +283,7 @@ async fn a_verifier_replays_the_exact_batch_its_target_pulled_from_the_dataset()
     assert!(!data.is_empty(), "the batch must carry real tokens");
 
     let (_, honest) = train_once(build_trainer(), data.clone());
-    write_dump(&dir, "step1-batchB[0, 0]", &honest);
+    write_dump(&dir, "epoch1700000000-step1-batchB[0, 0]", &honest);
 
     let engine = TrainerReplayEngine::new(
         build_trainer(),
@@ -307,17 +309,46 @@ async fn a_verifier_replays_the_exact_batch_its_target_pulled_from_the_dataset()
 
 #[test]
 fn assignment_keys_carry_the_step_and_batch_the_target_trained() {
-    let (step, batch) = parse_assignment_key("step7-batchB[12, 19]").expect("a real dump name");
-    assert_eq!(step, 7);
-    assert_eq!(batch, BatchId(ClosedInterval::new(12, 19)));
+    let key =
+        parse_assignment_key("epoch1700000000-step7-batchB[12, 19]").expect("a real dump name");
+    assert_eq!(key.epoch_start, 1_700_000_000);
+    assert_eq!(key.step, 7);
+    assert_eq!(key.batch_id, BatchId(ClosedInterval::new(12, 19)));
     // A batch of one sample is named the way `BatchId` displays it, without
     // brackets, and is read back all the same.
     let single = BatchId(ClosedInterval::new(15, 15));
     assert_eq!(
-        parse_assignment_key(&format!("step3-batch{single}")),
-        Some((3, single))
+        parse_assignment_key(&format!("epoch1700000090-step3-batch{single}")),
+        Some(DumpKey {
+            epoch_start: 1_700_000_090,
+            step: 3,
+            batch_id: single,
+        })
     );
+    // A name without its epoch is a dump from before the epoch named the
+    // round, which cannot be placed (wienerlabs/leviathan-net#67).
+    assert!(parse_assignment_key("step7-batchB[12, 19]").is_none());
     assert!(parse_assignment_key("not-a-dump-name").is_none());
+}
+
+/// Dumps of the first step from one epoch are replayed without naming it.
+/// From two, as after a run restarts from its first step, the epoch has to be
+/// named: they were trained from other weights (wienerlabs/leviathan-net#67).
+#[test]
+fn the_epoch_replayed_is_the_only_one_or_the_one_named() {
+    let key = |epoch_start: u64, step: u32| DumpKey {
+        epoch_start,
+        step,
+        batch_id: BatchId(ClosedInterval::new(0, 3)),
+    };
+    let one = [key(100, 1), key(100, 1), key(100, 2), key(190, 2)];
+    assert_eq!(replay_epoch(&one, 1, None).unwrap(), Some(100));
+    assert_eq!(replay_epoch(&one, 1, Some(190)).unwrap(), None);
+    assert_eq!(replay_epoch(&one, 3, None).unwrap(), None);
+
+    let restarted = [key(100, 1), key(190, 1)];
+    assert!(replay_epoch(&restarted, 1, None).is_err());
+    assert_eq!(replay_epoch(&restarted, 1, Some(190)).unwrap(), Some(190));
 }
 
 #[test]

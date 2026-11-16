@@ -29,20 +29,23 @@ fn participant_is_the_length_the_web_decoder_expects() {
 }
 
 /// Mirrors `VERDICT_LAYOUT_BY_SIZE` in the same file, which stops at 4328
-/// (`appealsWithDeadline`). Two generations followed it:
+/// (`appealsWithDeadline`). Three generations followed it:
 ///
 /// - 4368 records the payload the target signed: `evidence` (step u32,
 ///   trainer nonce u32, results digest 32 bytes) sits between `batch_end` and
 ///   `pending_since_unix` (wienerlabs/leviathan-net#43).
-/// - 4392, this one, adds three u64 fields between `settled_count` and
-///   `voters` (wienerlabs/leviathan-net#39): `released_voters` (one bit per
-///   voter), `bench_bounty_owed` and `bench_paid` (one bit per appeal voter).
-///   Read with the 4368 layout, they land in the voter list's length and
-///   every voter after it is misread.
+/// - 4392 adds three u64 fields between `settled_count` and `voters`
+///   (wienerlabs/leviathan-net#39): `released_voters` (one bit per voter),
+///   `bench_bounty_owed` and `bench_paid` (one bit per appeal voter). Read
+///   with the 4368 layout, they land in the voter list's length and every
+///   voter after it is misread.
+/// - 4400, this one, puts the epoch the payload was trained in (`epoch_start`,
+///   u64) at the head of `evidence`, before the step
+///   (wienerlabs/leviathan-net#67). Every field after it moves 8 bytes.
 ///
-/// A decoder has to learn 4392 before it reads accounts from the deployment
+/// A decoder has to learn 4400 before it reads accounts from the deployment
 /// carrying it.
 #[test]
 fn audit_verdict_is_the_length_the_web_decoder_expects() {
-    assert_eq!(AuditVerdict::space_with_discriminator(), 4392);
+    assert_eq!(AuditVerdict::space_with_discriminator(), 4400);
 }

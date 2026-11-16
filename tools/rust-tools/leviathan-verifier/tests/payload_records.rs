@@ -17,6 +17,7 @@ use psyche_core::BatchId;
 use psyche_core::ClosedInterval;
 use psyche_network::commitment_record_path;
 use psyche_network::distro_results_to_bytes;
+use psyche_network::payload_dump_name;
 use psyche_network::results_digest;
 use psyche_network::CommitmentRecord;
 use psyche_network::SecretKey;
@@ -41,6 +42,7 @@ fn scratch(tag: &str) -> PathBuf {
 
 fn payload(name: &str) -> TransmittableDistroResult {
     TransmittableDistroResult {
+        epoch_start: 1_700_000_000,
         step: 9,
         trainer_nonce: 4,
         batch_id: BatchId(ClosedInterval::new(16, 17)),
@@ -53,9 +55,11 @@ fn payload(name: &str) -> TransmittableDistroResult {
 fn keep(dir: &Path, payload: &TransmittableDistroResult, key: &SecretKey, run_id: &str) -> PathBuf {
     let data_hash = payload.comptue_hash(run_id).unwrap();
     let record = CommitmentRecord::new(payload, data_hash, key.sign(&data_hash).to_bytes());
-    let path = dir.join(format!(
-        "result-{}-step{}-batch{}.vec-postcard",
-        "Committer", payload.step, payload.batch_id
+    let path = dir.join(payload_dump_name(
+        "Committer",
+        payload.epoch_start,
+        payload.step,
+        payload.batch_id,
     ));
     fs::write(commitment_record_path(&path), record.to_bytes()).unwrap();
     fs::write(
@@ -108,7 +112,7 @@ fn a_genuine_commitment_is_verified() {
 #[test]
 fn a_dump_kept_without_a_record_has_nothing_to_convict_on() {
     let dir = scratch("missing");
-    let path = dir.join("result-Committer-step9-batchB[16, 17].vec-postcard");
+    let path = dir.join("result-Committer-epoch1700000000-step9-batchB[16, 17].vec-postcard");
     fs::copy(fixture(FRAUD), &path).unwrap();
     let key = SecretKey::generate(&mut rand::rng());
     assert_eq!(
@@ -118,8 +122,8 @@ fn a_dump_kept_without_a_record_has_nothing_to_convict_on() {
 }
 
 /// Each way a record can fail to hold is final for that pair: another key,
-/// another run, a dump other than the one hashed, or a file that is not a
-/// record at all.
+/// another run, another epoch, a dump other than the one hashed, or a file
+/// that is not a record at all.
 #[test]
 fn a_record_that_does_not_hold_is_invalid() {
     let key = SecretKey::generate(&mut rand::rng());
@@ -130,6 +134,14 @@ fn a_record_that_does_not_hold_is_invalid() {
     let elsewhere = keep(&scratch("elsewhere"), &payload, &key, "another run");
     let swapped = keep(&scratch("swapped"), &payload, &key, RUN);
     fs::copy(fixture(HONEST), &swapped).unwrap();
+    // The record names an epoch the signature was not made over, as a
+    // record of a round trained before a restart, relabelled, would
+    // (wienerlabs/leviathan-net#67).
+    let relabelled = keep(&scratch("relabelled"), &payload, &key, RUN);
+    let record = commitment_record_path(&relabelled);
+    let mut held = CommitmentRecord::from_bytes(&fs::read(&record).unwrap()).unwrap();
+    held.epoch_start += 90;
+    fs::write(&record, held.to_bytes()).unwrap();
     let truncated = keep(&scratch("truncated"), &payload, &key, RUN);
     let record = commitment_record_path(&truncated);
     let bytes = fs::read(&record).unwrap();
@@ -138,6 +150,7 @@ fn a_record_that_does_not_hold_is_invalid() {
     for (case, path) in [
         ("signed by another key", foreign),
         ("made in another run", elsewhere),
+        ("naming another epoch", relabelled),
         ("kept beside another dump", swapped),
         ("cut short", truncated),
     ] {
@@ -151,21 +164,29 @@ fn a_record_that_does_not_hold_is_invalid() {
     }
 }
 
-/// The committer is base58, which can spell `step`. The key starts at the
-/// `-step` that ends the committer, wherever else the letters appear.
+/// The committer is base58, which can spell `epoch`. The key starts at the
+/// `-epoch` that ends the committer, wherever else the letters appear.
 #[test]
-fn a_committer_that_spells_step_does_not_move_the_key() {
+fn a_committer_that_spells_epoch_does_not_move_the_key() {
     for (name, key) in [
         (
-            "result-AstepB-step3-batchB15.vec-postcard",
-            Some("step3-batchB15"),
+            "result-AepochB-epoch1700000000-step3-batchB15.vec-postcard",
+            Some("epoch1700000000-step3-batchB15"),
         ),
         (
-            "result-Abc-step7-batchB[12, 19].vec-postcard",
-            Some("step7-batchB[12, 19]"),
+            "result-Abc-epoch1700000000-step7-batchB[12, 19].vec-postcard",
+            Some("epoch1700000000-step7-batchB[12, 19]"),
         ),
-        ("Abc-step7-batchB[12, 19].vec-postcard", None),
-        ("result-Abc-step7-batchB[12, 19].commitment", None),
+        (
+            "Abc-epoch1700000000-step7-batchB[12, 19].vec-postcard",
+            None,
+        ),
+        (
+            "result-Abc-epoch1700000000-step7-batchB[12, 19].commitment",
+            None,
+        ),
+        // A dump named before the epoch named the round cannot be placed.
+        ("result-Abc-step7-batchB[12, 19].vec-postcard", None),
     ] {
         assert_eq!(contribution_key(Path::new(name)).as_deref(), key, "{name}");
     }

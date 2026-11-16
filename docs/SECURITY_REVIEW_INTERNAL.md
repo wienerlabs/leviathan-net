@@ -720,7 +720,8 @@ is meant to bound identities, delegation has to require the grantor's signature.
 **Files:** `solana-tooling/src/daemon.rs:113-117` and `:37-42`,
 `shared/client/src/state/train.rs:808-811`
 
-The client writes each gradient dump as `result-{identity}-step{n}-batch{...}`,
+The client writes each gradient dump as `result-{identity}-step{n}-batch{...}`
+(since wienerlabs/leviathan-net#67, `result-{signer}-epoch{t}-step{n}-batch{...}`),
 where `{identity}` is `NodeIdentity`'s `Display`. The daemon parses that segment
 back out of the filename and matches it against the roster:
 

@@ -10,10 +10,11 @@ use psyche_core::payload_commitment_run;
 /// The chain cannot recompute a gradient, so whether the payload was honest
 /// remains the verifiers' claim. Whether the target committed to it does not
 /// have to be a claim. The target signed the payload hash with its p2p key, and
-/// that hash is rebuilt here from the step, the nonce, the batch the verdict
-/// names, and the digest of the payload's results. A conviction carries the
-/// target's signature over that hash. It therefore names work the target cannot
-/// disown, for exactly the batch it records (wienerlabs/leviathan-net#43).
+/// that hash is rebuilt here from the epoch, the step, the nonce, the batch the
+/// verdict names, and the digest of the payload's results. A conviction carries
+/// the target's signature over that hash. It therefore names work the target
+/// cannot disown, for exactly the round and batch it records
+/// (wienerlabs/leviathan-net#43, #67).
 #[derive(
     AnchorSerialize,
     AnchorDeserialize,
@@ -25,13 +26,17 @@ use psyche_core::payload_commitment_run;
     Eq,
 )]
 pub struct CommitmentEvidence {
+    /// When the epoch the payload was trained in started: the coordinator's
+    /// `epoch_state.start_timestamp` then. With the step, it names the round
+    /// (wienerlabs/leviathan-net#67).
+    pub epoch_start: u64,
     pub step: u32,
     pub trainer_nonce: u32,
     pub results_digest: [u8; 32],
 }
 
 impl CommitmentEvidence {
-    pub const SPACE: usize = 4 + 4 + 32;
+    pub const SPACE: usize = 8 + 4 + 4 + 32;
 
     /// The hash the target signed, if this is a payload it committed to for
     /// `batch_start..=batch_end` in the run `run` (`commitment_run`).
@@ -43,6 +48,7 @@ impl CommitmentEvidence {
     ) -> [u8; 32] {
         payload_commitment_hash(
             run,
+            self.epoch_start,
             self.step,
             self.trainer_nonce,
             batch_start,
@@ -53,8 +59,14 @@ impl CommitmentEvidence {
 
     /// Whether the payload was trained in the epoch the coordinator is in, so
     /// a conviction cannot reach back for work an earlier epoch already settled.
+    ///
+    /// The step range alone does not say so. A run restarted from an earlier
+    /// step trains that step again in a new epoch, so a step signed before the
+    /// restart is back inside the range. The epoch it names has to be this one
+    /// too (wienerlabs/leviathan-net#67).
     pub fn is_from_current_epoch(&self, coordinator: &Coordinator) -> bool {
-        coordinator.epoch_state.start_step <= self.step
+        self.epoch_start == coordinator.epoch_state.start_timestamp
+            && coordinator.epoch_state.start_step <= self.step
             && self.step <= coordinator.progress.step
     }
 }
@@ -287,6 +299,7 @@ mod tests {
     #[test]
     fn the_committed_hash_is_the_payload_commitment_for_the_batch_and_run() {
         let evidence = CommitmentEvidence {
+            epoch_start: 1_700_000_000,
             step: 4,
             trainer_nonce: 1,
             results_digest: [3; 32],
@@ -294,7 +307,15 @@ mod tests {
         let run = payload_commitment_run("a run");
         assert_eq!(
             evidence.committed_hash(&run, 8, 15),
-            payload_commitment_hash(&run, 4, 1, 8, 15, &[3; 32])
+            payload_commitment_hash(&run, 1_700_000_000, 4, 1, 8, 15, &[3; 32])
+        );
+        assert_ne!(
+            evidence.committed_hash(&run, 8, 15),
+            CommitmentEvidence {
+                epoch_start: 1_700_000_090,
+                ..evidence
+            }
+            .committed_hash(&run, 8, 15)
         );
         assert_ne!(
             evidence.committed_hash(&run, 8, 15),

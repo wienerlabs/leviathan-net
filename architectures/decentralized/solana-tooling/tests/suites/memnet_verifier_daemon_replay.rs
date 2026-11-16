@@ -364,7 +364,7 @@ pub async fn run() {
     );
     // The run every commitment here is made in, as the coordinator names it.
     let run_id = String::from(&first_round.coordinator.run_id);
-    let (step, _, batch_id) = header;
+    let (step, batch_id) = (header.step, header.batch_id);
     assert_eq!(
         step, first_round.coordinator.epoch_state.start_step,
         "the first round trains the epoch's first step"
@@ -452,13 +452,13 @@ pub async fn run() {
             first_step_payload(
                 &llm,
                 &first_round.coordinator,
-                honest_header.0,
-                honest_header.2,
+                honest_header.step,
+                honest_header.batch_id,
             ),
         ),
     ] {
         assert_eq!(
-            node_header.0, step,
+            node_header.step, step,
             "both nodes trained the run's first step"
         );
         let staged = staging.join(format!("{node}.vec-postcard"));
@@ -499,7 +499,7 @@ pub async fn run() {
     let (trainer, replay_config) = trainer_for(&llm);
     let engine = TrainerReplayEngine::new(
         trainer,
-        [(cheater, batch_id), (honest, honest_header.2)]
+        [(cheater, batch_id), (honest, honest_header.batch_id)]
             .into_iter()
             .map(|(node, node_batch)| ReplayAssignment {
                 target_index: roster_index(node),

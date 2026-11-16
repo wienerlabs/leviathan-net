@@ -23,6 +23,11 @@ pub struct SerializedDistroResult {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransmittableDistroResult {
+    /// When the epoch the payload was trained in started: the coordinator's
+    /// `epoch_state.start_timestamp`. With the step, it names the round, which
+    /// the step alone does not once a run restarts from an earlier step
+    /// (wienerlabs/leviathan-net#67).
+    pub epoch_start: u64,
     pub step: u32,
     pub trainer_nonce: u32,
     pub batch_id: BatchId,
@@ -33,16 +38,19 @@ impl TransmittableDistroResult {
     /// The hash a sender signs and a receiver checks a download against.
     ///
     /// It is `payload_commitment_hash` over the run `run_id`, this payload's
-    /// step, nonce and batch, and the digest of its results. With the run in
-    /// it, a signature made in one run convicts in no other. The header is kept apart from
-    /// the results so the chain can rebuild the hash from a few dozen bytes. It
-    /// can then check that a conviction names a payload the target signed for
-    /// exactly that step and batch (wienerlabs/leviathan-net#43).
+    /// epoch, step, nonce and batch, and the digest of its results. With the
+    /// run in it, a signature made in one run convicts in no other, and with
+    /// the epoch, one made in a round convicts in no other round
+    /// (wienerlabs/leviathan-net#67). The header is kept apart from the results
+    /// so the chain can rebuild the hash from a few dozen bytes. It can then
+    /// check that a conviction names a payload the target signed for exactly
+    /// that step and batch (wienerlabs/leviathan-net#43).
     ///
     /// The struct is destructured rather than read field by field: a new field
     /// is then a compile error here, not a silent hole in the commitment.
     pub fn comptue_hash(&self, run_id: &str) -> Result<[u8; 32], postcard::Error> {
         let TransmittableDistroResult {
+            epoch_start,
             step,
             trainer_nonce,
             batch_id,
@@ -50,6 +58,7 @@ impl TransmittableDistroResult {
         } = self;
         Ok(payload_commitment_hash(
             &payload_commitment_run(run_id),
+            *epoch_start,
             *step,
             *trainer_nonce,
             batch_id.0.start,
@@ -337,6 +346,7 @@ mod commitment_binding_tests {
 
     fn payload(results: Vec<SerializedDistroResult>) -> TransmittableDistroResult {
         TransmittableDistroResult {
+            epoch_start: 1_700_000_000,
             step: 7,
             trainer_nonce: 1,
             batch_id: BatchId(ClosedInterval::new(0, 3)),
@@ -365,6 +375,22 @@ mod commitment_binding_tests {
             one_result(&[2, 2], vec![2, 2], 4)
                 .comptue_hash(RUN)
                 .unwrap(),
+        );
+    }
+
+    /// The same payload in another round, here an epoch that started later
+    /// because the run restarted from an earlier step, is another commitment
+    /// (wienerlabs/leviathan-net#67).
+    #[test]
+    fn the_epoch_changes_the_commitment() {
+        let first = one_result(&[4], vec![2, 2], 4);
+        let again = TransmittableDistroResult {
+            epoch_start: first.epoch_start + 1,
+            ..first.clone()
+        };
+        assert_ne!(
+            first.comptue_hash(RUN).unwrap(),
+            again.comptue_hash(RUN).unwrap()
         );
     }
 
@@ -460,6 +486,7 @@ mod commitment_binding_tests {
             payload.comptue_hash(RUN).unwrap(),
             payload_commitment_hash(
                 &payload_commitment_run(RUN),
+                payload.epoch_start,
                 payload.step,
                 payload.trainer_nonce,
                 payload.batch_id.0.start,

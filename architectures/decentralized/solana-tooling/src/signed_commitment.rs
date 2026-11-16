@@ -7,6 +7,7 @@ use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::Coordinator;
 use psyche_core::sha256;
 use psyche_core::BatchId;
+use psyche_core::ClosedInterval;
 use psyche_core::NodeIdentity;
 use psyche_solana_treasurer::state::commitment_run;
 use psyche_solana_treasurer::state::committee_matches_roster;
@@ -82,15 +83,26 @@ pub fn trained_step(coordinator: &Coordinator) -> Result<u32> {
     Ok(coordinator.epoch_state.start_step + round.height)
 }
 
+/// Which work a payload is: the round, named by when its epoch started and
+/// its step, the trainer's nonce, and the batch (wienerlabs/leviathan-net#43,
+/// #67).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayloadHeader {
+    pub epoch_start: u64,
+    pub step: u32,
+    pub trainer_nonce: u32,
+    pub batch_id: BatchId,
+}
+
 /// Which work a payload of `node` from the round the coordinator is in is:
-/// the step trained there, the trainer's nonce, and the batch the coordinator
-/// assigned `node` in that round. The committee is drawn with the run's
-/// `tie_breaker_committee_size`, as the treasurer draws it.
+/// the epoch and the step trained there, the trainer's nonce, and the batch
+/// the coordinator assigned `node` in that round. The committee is drawn with
+/// the run's `tie_breaker_committee_size`, as the treasurer draws it.
 pub fn payload_header(
     coordinator: &Coordinator,
     tie_breaker_committee_size: u16,
     node: &NodeIdentity,
-) -> Result<(u32, u32, BatchId)> {
+) -> Result<PayloadHeader> {
     // Batches are assigned by the committee drawn for the round, over the
     // roster as it stood then. In a warmup, or once the roster has moved since
     // the round was drawn, no batch is assigned to anyone in it.
@@ -111,9 +123,14 @@ pub fn payload_header(
         .find_map(|(batch, trainer)| (trainer == *node).then_some(batch))
         .ok_or_else(|| anyhow!("{node} trains no batch this round"))?;
     let step = trained_step(coordinator)?;
-    // The trainer counts the steps it has trained; a node that joined at the
-    // start of the epoch has trained one per round before this.
-    Ok((step, step - coordinator.epoch_state.start_step, batch))
+    Ok(PayloadHeader {
+        epoch_start: coordinator.epoch_state.start_timestamp,
+        step,
+        // The trainer counts the steps it has trained; a node that joined at
+        // the start of the epoch has trained one per round before this.
+        trainer_nonce: step - coordinator.epoch_state.start_step,
+        batch_id: batch,
+    })
 }
 
 /// A payload commitment with its committer's signature: what a conviction is
@@ -132,23 +149,22 @@ pub struct SignedCommitment {
 
 impl SignedCommitment {
     /// `p2p` commits to the payload whose results digest is `results_digest`,
-    /// trained on `batch_start..=batch_end` at `step` in the run `run`. It
-    /// signs the commitment hash the way a client signs the payload it
-    /// broadcasts.
+    /// for the work `header` names, in the run `run`. It signs the commitment
+    /// hash the way a client signs the payload it broadcasts.
     pub fn sign(
         p2p: &Keypair,
         run: [u8; 32],
-        step: u32,
-        trainer_nonce: u32,
-        batch_start: u64,
-        batch_end: u64,
+        header: PayloadHeader,
         results_digest: [u8; 32],
     ) -> SignedCommitment {
         let evidence = CommitmentEvidence {
-            step,
-            trainer_nonce,
+            epoch_start: header.epoch_start,
+            step: header.step,
+            trainer_nonce: header.trainer_nonce,
             results_digest,
         };
+        let (batch_start, batch_end) =
+            (header.batch_id.0.start, header.batch_id.0.end);
         let committed_hash =
             evidence.committed_hash(&run, batch_start, batch_end);
         SignedCommitment {
@@ -174,17 +190,27 @@ impl SignedCommitment {
         if node.p2p_identity() != &p2p.pubkey().to_bytes() {
             return Err(anyhow!("{node} did not join with this p2p key"));
         }
-        let (step, trainer_nonce, batch) =
+        let header =
             payload_header(coordinator, tie_breaker_committee_size, node)?;
         Ok(SignedCommitment::sign(
             p2p,
             commitment_run(coordinator),
-            step,
-            trainer_nonce,
-            batch.0.start,
-            batch.0.end,
+            header,
             results_digest,
         ))
+    }
+
+    /// The work this commitment is to.
+    pub fn header(&self) -> PayloadHeader {
+        PayloadHeader {
+            epoch_start: self.evidence.epoch_start,
+            step: self.evidence.step,
+            trainer_nonce: self.evidence.trainer_nonce,
+            batch_id: BatchId(ClosedInterval::new(
+                self.batch_start,
+                self.batch_end,
+            )),
+        }
     }
 
     /// The commitment hash the signature is over.

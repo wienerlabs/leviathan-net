@@ -179,10 +179,23 @@ migration instruction exists. Versions 2 and 3 (wienerlabs/leviathan-net#60,
 #62) have none: deploy them under new ids, as `DEVNET.md` describes, where no
 older account exists.
 
+The payload commitment is a wire format too, and its change in
+wienerlabs/leviathan-net#67 is a flag day.
+- **What changed.** A payload now carries the epoch it was trained in, and
+  the commitment hash covers it under a new domain (`v2`). A kept commitment
+  record grew from 120 to 128 bytes, and a dump's name carries the epoch.
+- **Who has to upgrade at once.** Every node, verifier and treasurer of a run
+  moves together. A node on the old build and one on the new drop each
+  other's payloads. A verifier on the new build reads no record the old one
+  kept, and the treasurer refuses an old signature.
+- **How.** Bring a run up on the new build from its start. Do not upgrade it
+  mid-run.
+
 The treasurer's own accounts grow the same way. `Participant` gained
 `open_verdict_votes` (69 bytes) and `AuditVerdict` gained `released_voters`,
 `bench_bounty_owed` and `bench_paid` (4392 bytes) in
-wienerlabs/leviathan-net#39. An older, shorter account does not deserialize
+wienerlabs/leviathan-net#39, and its evidence the epoch it was trained in
+(4400 bytes) in wienerlabs/leviathan-net#67. An older, shorter account does not deserialize
 with the new layout, so the treasurer that carries them deploys under a new id
 too.
 

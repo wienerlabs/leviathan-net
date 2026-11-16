@@ -47,13 +47,64 @@ pub struct ReplayAssignment {
     pub data: Vec<BatchDataCPU>,
 }
 
-/// The step and batch a payload dump is for, from its contribution key
-/// (`step7-batchB[12, 19]`, or `step7-batchB15` for a batch of one sample).
-pub fn parse_assignment_key(key: &str) -> Option<(u32, BatchId)> {
-    let (step_part, batch_part) = key.split_once("-batch")?;
-    let step: u32 = step_part.strip_prefix("step")?.parse().ok()?;
-    let batch = batch_part.strip_prefix('B')?.parse().ok()?;
-    Some((step, batch))
+/// The work a payload dump is for: the round, named by its epoch and step,
+/// and the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DumpKey {
+    /// When the epoch the payload was trained in started (the coordinator's
+    /// `epoch_state.start_timestamp`). A run restarted from an earlier step
+    /// trains the step again in a later epoch (wienerlabs/leviathan-net#67).
+    pub epoch_start: u64,
+    pub step: u32,
+    pub batch_id: BatchId,
+}
+
+/// The epoch whose dumps of `step` a replay reproduces, out of the dumps
+/// `keys` name: `wanted` if one is named, else the only one there is. `None`
+/// when no dump is of `step`, or none of the epoch named.
+///
+/// A run restarted from an earlier step trains that step again in a later
+/// epoch, from other weights. Dumps of one step from two epochs cannot both be
+/// judged against one replay, and offline there is no coordinator to say
+/// which epoch is the run's first, so the caller has to name it
+/// (wienerlabs/leviathan-net#67).
+pub fn replay_epoch<'a>(
+    keys: impl IntoIterator<Item = &'a DumpKey>,
+    step: u32,
+    wanted: Option<u64>,
+) -> Result<Option<u64>> {
+    let epochs: std::collections::BTreeSet<u64> = keys
+        .into_iter()
+        .filter(|key| key.step == step)
+        .map(|key| key.epoch_start)
+        .collect();
+    if let Some(epoch) = wanted {
+        return Ok(epochs.contains(&epoch).then_some(epoch));
+    }
+    match epochs.len() {
+        0 | 1 => Ok(epochs.into_iter().next()),
+        _ => Err(anyhow!(
+            "the dumps of step {step} come from {} epochs, started at {:?}: name the one to replay with --epoch-start",
+            epochs.len(),
+            epochs
+        )),
+    }
+}
+
+/// The work a payload dump is for, from its contribution key
+/// (`epoch1700000000-step7-batchB[12, 19]`, or `...-batchB15` for a batch of
+/// one sample).
+pub fn parse_assignment_key(key: &str) -> Option<DumpKey> {
+    let (epoch_part, rest) = key.split_once("-step")?;
+    let epoch_start = epoch_part.strip_prefix("epoch")?.parse().ok()?;
+    let (step_part, batch_part) = rest.split_once("-batch")?;
+    let step = step_part.parse().ok()?;
+    let batch_id = batch_part.strip_prefix('B')?.parse().ok()?;
+    Some(DumpKey {
+        epoch_start,
+        step,
+        batch_id,
+    })
 }
 
 /// What a replay trains with. It has to be what the run trains with: a replay

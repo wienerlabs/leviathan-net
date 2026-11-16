@@ -45,8 +45,8 @@ fn honest_replay_passes_on_real_distro_dumps() {
     let honest = honest_delta();
     let submitted = scratch("honest-sub");
     let reference = scratch("honest-ref");
-    write_dump(&submitted, "step1-batch0", &honest);
-    write_dump(&reference, "step1-batch0", &honest);
+    write_dump(&submitted, "epoch1700000000-step1-batch0", &honest);
+    write_dump(&reference, "epoch1700000000-step1-batch0", &honest);
 
     let summary = audit_dirs(&submitted, &reference, DEFAULT_BAND, Device::Cpu).unwrap();
     assert_eq!(summary.audited(), 1);
@@ -59,8 +59,8 @@ fn sign_flip_is_caught_on_real_distro_dumps() {
     let tampered: Vec<f32> = honest.iter().map(|v| -5.0 * v).collect();
     let submitted = scratch("fraud-sub");
     let reference = scratch("fraud-ref");
-    write_dump(&submitted, "step1-batch0", &tampered);
-    write_dump(&reference, "step1-batch0", &honest);
+    write_dump(&submitted, "epoch1700000000-step1-batch0", &tampered);
+    write_dump(&reference, "epoch1700000000-step1-batch0", &honest);
 
     let summary = audit_dirs(&submitted, &reference, DEFAULT_BAND, Device::Cpu).unwrap();
     assert_eq!(summary.audited(), 1);
@@ -73,7 +73,7 @@ fn missing_reference_is_skipped_not_convicted() {
     let honest = honest_delta();
     let submitted = scratch("skip-sub");
     let reference = scratch("skip-ref");
-    write_dump(&submitted, "step9-batch9", &honest);
+    write_dump(&submitted, "epoch1700000000-step9-batch9", &honest);
 
     let summary = audit_dirs(&submitted, &reference, DEFAULT_BAND, Device::Cpu).unwrap();
     assert_eq!(summary.audited(), 0);

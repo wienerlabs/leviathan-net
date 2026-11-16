@@ -15,6 +15,7 @@ use leviathan_verifier::build_replay_trainer;
 use leviathan_verifier::checkpoint_repo_files;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::DumpKey;
 use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ReplayAssignment;
@@ -209,18 +210,26 @@ impl Replayer {
         // published checkpoint with fresh state, so only its contributions can
         // be reproduced here. Past the first epoch there is nothing to replay,
         // and nothing worth loading (wienerlabs/leviathan-net#48).
-        let Some(replayable) = coordinator.replayable_step() else {
+        if coordinator.replayable_step().is_none() {
             return Ok(None);
-        };
+        }
         let Model::LLM(llm) = coordinator.model;
         let loaded = self.load(&llm)?;
 
         let mut assignments = Vec::new();
         for (key, path) in index_dir(&args.submitted_dir)? {
-            let Some((step, batch_id)) = parse_assignment_key(&key) else {
+            let Some(DumpKey {
+                epoch_start,
+                step,
+                batch_id,
+            }) = parse_assignment_key(&key)
+            else {
                 continue;
             };
-            if step != replayable {
+            // A run restarted from an earlier step trains it again in a later
+            // epoch; only this epoch's is the step the replay reproduces
+            // (wienerlabs/leviathan-net#67).
+            if !coordinator.is_replayable(epoch_start, step) {
                 continue;
             }
             let Some(committer) = parse_committer(&path) else {

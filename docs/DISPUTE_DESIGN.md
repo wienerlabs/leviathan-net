@@ -252,22 +252,33 @@ roster holds that key. So every conviction now carries that signature, and the
 treasurer checks it (wienerlabs/leviathan-net#43):
 
 - **The hash is rebuilt on chain.** A payload's commitment hash is
-  `sha256(domain, sha256(run_id), step, nonce, batch_start, batch_end,
-  results_digest)`. The `results_digest` is the sha256 of the payload's wire
-  bytes, the same bytes a payload dump holds. A conviction names the step,
-  the nonce and the digest. The treasurer rebuilds the hash from them, the
-  batch the conviction records, and the run id its coordinator holds. Binding
-  the run means a signature a key made in one run convicts it of nothing in
-  another.
+  `sha256(domain, sha256(run_id), epoch_start, step, nonce, batch_start,
+  batch_end, results_digest)`. The `results_digest` is the sha256 of the
+  payload's wire bytes, the same bytes a payload dump holds. `epoch_start` is
+  when the epoch the payload was trained in started, the coordinator's
+  `epoch_state.start_timestamp`. A conviction names the epoch, the step, the
+  nonce and the digest. The treasurer rebuilds the hash from them, the batch
+  the conviction records, and the run id its coordinator holds. Binding the run
+  means a signature a key made in one run convicts it of nothing in another.
 - **The target's key has to have signed it.** The same transaction carries an
   ed25519 precompile instruction with the key, the signature and the message
   inside it. The runtime verifies the signature before any program runs. The
   treasurer reads that instruction through the instructions sysvar and accepts
   it only if the key is the target's roster p2p key and the message is exactly
   the rebuilt hash.
-- **The payload is from this epoch.** Its step lies between the epoch's first
-  step and the current one. A commitment from an earlier epoch names work that
-  epoch already charged.
+- **The payload is from this epoch.** The epoch it names is the one the
+  coordinator is in, and its step lies between the epoch's first step and the
+  current one. A commitment from an earlier epoch names work that epoch
+  already charged. The step alone would not say so. A run restarted from an
+  earlier step (`run-manager update-config --restart-from-step`) trains that
+  step again, and a run id freed and taken again starts at step 1. Both
+  times the old commitment's step is back inside the range. The epoch's start
+  is not. A restart needs the run paused, and a paused run resumes only
+  through a new warmup, which starts a new epoch. The coordinator starts an
+  epoch only in a later second than the waiting it began from, and a run id
+  taken again starts its epochs later still. On a cluster clock that never
+  runs back, no two epochs of a run id share a start
+  (wienerlabs/leviathan-net#67).
 - **The record is self-checking.** The verdict stores the evidence alongside
   the hash, so anyone can rebuild the hash from the account and its run.
   Holding the dump, anyone can check its sha256 against the digest.
@@ -279,9 +290,16 @@ the claim the appeals court exists for, and the record now names exactly which
 payload to re-audit.
 
 The client keeps a peer's payload together with the record of what the peer
-signed for it. It writes the record first and then renames the dump into
-place, so a dump is never seen without its record. It also keeps only the first
-payload a peer signed for a batch. A peer that signs two payloads for one batch
+signed for it. It keeps only a payload whose header names the work it was
+broadcast for: the round's epoch and step, and the batch the peer was assigned.
+The sender signs its header with the results, so a header naming other work
+passes the hash check. Kept, it would be a record of work outside the round,
+which convicts nobody, for a payload every peer trained on. Dropping it closes
+that escape (wienerlabs/leviathan-net#67). The client writes the record first
+and then renames the dump into place, so a dump is never seen without its
+record. The dump's name carries the epoch, step and batch, so a step trained
+again after a restart is kept under a name of its own. It also keeps only the
+first payload a peer signed for a batch. A peer that signs two payloads for one batch
 therefore cannot leave one payload's record beside the other's dump, which
 would leave nothing to convict on. Signing two payloads for one batch is itself
 provable from the two signatures, though no rule charges it yet.

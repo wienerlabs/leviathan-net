@@ -41,7 +41,8 @@ echo "[smoke] producing one honest contribution"
     --run-config "$RUN_CONFIG" \
     --data-dir "$WORK/data" \
     --out-dir "$WORK/submitted" \
-    --committer node0
+    --committer node0 \
+    --epoch-start "$(date +%s)"
 
 DUMP_NAME=$(cd "$WORK/submitted" && ls result-node0-*.vec-postcard)
 

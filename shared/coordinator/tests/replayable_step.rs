@@ -5,6 +5,7 @@ use bytemuck::Zeroable;
 use psyche_coordinator::Coordinator;
 
 const START_STEP: u32 = 40;
+const EPOCH_START: u64 = 1_700_000_000;
 
 /// The `epoch`-th epoch of a run, started at `START_STEP`, in its round of
 /// height `height`, flagged as a cold start or not.
@@ -13,6 +14,7 @@ fn coordinator(epoch: u16, cold_start: bool, height: u32) -> Box<Coordinator> {
     coordinator.progress.epoch = epoch;
     coordinator.epoch_state.cold_start_epoch = cold_start.into();
     coordinator.epoch_state.start_step = START_STEP;
+    coordinator.epoch_state.start_timestamp = EPOCH_START;
     coordinator.progress.step = START_STEP + height;
     let head = coordinator.epoch_state.rounds_head as usize;
     coordinator.epoch_state.rounds[head].height = height;
@@ -47,4 +49,17 @@ fn no_step_of_a_later_epoch_is_replayable() {
             assert_eq!(coordinator(7, cold_start, height).replayable_step(), None);
         }
     }
+}
+
+/// A payload is replayable when it is of the replayable step of the epoch the
+/// coordinator is in. One of the same step from an epoch that started
+/// earlier, as a run set back to its first step trains it again, is another
+/// round's, trained from other weights (wienerlabs/leviathan-net#67).
+#[test]
+fn only_the_replayable_step_of_this_epoch_is_replayed() {
+    let first = coordinator(0, false, 0);
+    assert!(first.is_replayable(EPOCH_START, START_STEP));
+    assert!(!first.is_replayable(EPOCH_START - 90, START_STEP));
+    assert!(!first.is_replayable(EPOCH_START, START_STEP + 1));
+    assert!(!coordinator(1, false, 0).is_replayable(EPOCH_START, START_STEP));
 }

@@ -16,7 +16,7 @@ use psyche_modeling::{
 };
 use psyche_network::{
     CommitmentRecord, Hash, SerializeDistroResultError, SerializedDistroResult,
-    TransmittableDistroResult, commitment_record_path, distro_results_to_bytes,
+    TransmittableDistroResult, commitment_record_path, distro_results_to_bytes, payload_dump_name,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -218,6 +218,7 @@ impl TrainingStepMetadata {
         *current_round = RoundState {
             height: round.height,
             step: state.progress.step,
+            epoch_start: state.epoch_state.start_timestamp,
             sent_witness: false,
             sent_finished: false,
             downloads: Default::default(),
@@ -291,8 +292,10 @@ impl TrainingStepMetadata {
                 })
             } else {
                 let identity = self.identity;
-                // The run a payload's commitment is bound to.
+                // The run a payload's commitment is bound to, and the epoch it
+                // names the round by (wienerlabs/leviathan-net#67).
                 let run_id = String::from(&state.run_id);
+                let epoch_start = state.epoch_state.start_timestamp;
                 let cancel_training = cancel_training.clone();
                 let write_gradients_dir = self.write_gradients_dir.clone();
                 let tx_distro_result = self.tx_distro_result.clone();
@@ -436,6 +439,7 @@ impl TrainingStepMetadata {
                                     let to_transmit = inject_fake_delta(to_transmit);
 
                                     let transmittable_distro_result = TransmittableDistroResult {
+                                        epoch_start,
                                         step,
                                         batch_id,
                                         distro_results: to_transmit
@@ -837,11 +841,11 @@ pub(crate) async fn write_gradients_to_disk(
     // identities are printed silently broke the match, with the daemon skipping
     // every contribution while reporting a clean pass
     // (wienerlabs/leviathan#15, finding 20).
-    let fname = format!(
-        "result-{}-step{}-batch{}.vec-postcard",
-        bs58::encode(identity.signer()).into_string(),
+    let fname = payload_dump_name(
+        &bs58::encode(identity.signer()).into_string(),
+        distro_result.epoch_start,
         distro_result.step,
-        distro_result.batch_id
+        distro_result.batch_id,
     );
     let fpath = write_gradients_dir.join(&fname);
     let serialized = distro_results_to_bytes(&distro_result.distro_results).map_err(|err| {
@@ -971,6 +975,7 @@ mod write_gradients_tests {
             stats: None,
         };
         TransmittableDistroResult {
+            epoch_start: 1_700_000_000,
             step: 5,
             trainer_nonce: 2,
             batch_id: BatchId(ClosedInterval::new(8, 9)),
@@ -989,8 +994,9 @@ mod write_gradients_tests {
 
     fn dump_of(dir: &Path, peer: &NodeIdentity, payload: &TransmittableDistroResult) -> PathBuf {
         dir.join(format!(
-            "result-{}-step{}-batch{}.vec-postcard",
+            "result-{}-epoch{}-step{}-batch{}.vec-postcard",
             bs58::encode(peer.signer()).into_string(),
+            payload.epoch_start,
             payload.step,
             payload.batch_id
         ))
@@ -1034,6 +1040,40 @@ mod write_gradients_tests {
             .filter(|name| name.ends_with(".partial"))
             .collect();
         assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    /// A run restarted from an earlier step trains the step again in a new
+    /// epoch. The payload the peer signs then is another round's, and is kept
+    /// beside the first under its own name, with its own record, rather than
+    /// refused for a name the first one holds (wienerlabs/leviathan-net#67).
+    #[tokio::test]
+    async fn the_same_step_trained_again_in_a_later_epoch_is_kept_too() {
+        let dir = scratch("restart");
+        let key = SecretKey::generate(&mut rand::rng());
+        let first = payload(&[1.0, -2.0, 3.0]);
+        let again = TransmittableDistroResult {
+            epoch_start: first.epoch_start + 90,
+            ..payload(&[4.0, 5.0, -6.0])
+        };
+        for payload in [&first, &again] {
+            write_gradients_to_disk(
+                dir.clone(),
+                peer(&key),
+                payload.clone(),
+                Some(signed(&key, payload)),
+            )
+            .await
+            .unwrap();
+        }
+        for payload in [&first, &again] {
+            let (record, results) = kept(&dump_of(&dir, &peer(&key), payload));
+            assert_eq!(record.epoch_start, payload.epoch_start);
+            assert_eq!(record.data_hash, payload.comptue_hash(RUN).unwrap());
+            assert_eq!(
+                record.verify(&results, RUN, key.public().as_bytes()),
+                Ok(())
+            );
+        }
     }
 
     /// A peer that signs two payloads for one batch gets the first kept, with
