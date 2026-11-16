@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
+use leviathan_telemetry::verifier::PassReport;
 use psyche_coordinator::model::Checkpoint;
 use psyche_coordinator::model::HubRepo;
 use psyche_coordinator::model::LLMArchitecture;
@@ -270,8 +271,7 @@ pub async fn run() {
     // where no round has been drawn over the new roster and nothing is
     // assigned. It used to draw a committee over the warmup's roster anyway
     // and panic indexing past the round.
-    let warmup =
-        coordinator_state(&mut endpoint, &coordinator_account).await;
+    let warmup = coordinator_state(&mut endpoint, &coordinator_account).await;
     assert_eq!(warmup.coordinator.run_state, RunState::Warmup);
     let mut judged = HashSet::new();
     let warmup_config = AuditConfig {
@@ -295,7 +295,7 @@ pub async fn run() {
         )
         .await
         .unwrap(),
-        0
+        PassReport::default()
     );
     endpoint
         .forward_clock_unix_timestamp(warmup_time)
@@ -312,7 +312,8 @@ pub async fn run() {
     .unwrap();
 
     for _ in 0..4 {
-        let state = coordinator_state(&mut endpoint, &coordinator_account).await;
+        let state =
+            coordinator_state(&mut endpoint, &coordinator_account).await;
         for client in &clients {
             let position = state
                 .coordinator
@@ -362,8 +363,7 @@ pub async fn run() {
     }
 
     let cheater_committer = clients[cheater].pubkey().to_string();
-    let state =
-        coordinator_state(&mut endpoint, &coordinator_account).await;
+    let state = coordinator_state(&mut endpoint, &coordinator_account).await;
     let tie_breakers = get_run(&mut endpoint, &run)
         .await
         .unwrap()
@@ -415,7 +415,7 @@ pub async fn run() {
     );
     for dir in [unsigned_dir, foreign_dir] {
         let mut judged = HashSet::new();
-        let convictions = audit_pass(
+        let report = audit_pass(
             &mut endpoint,
             &main_authority,
             &coordinator_account,
@@ -426,9 +426,11 @@ pub async fn run() {
         )
         .await
         .unwrap();
+        // Skipped before it is judged at all: there is nothing to convict on.
         assert_eq!(
-            convictions, 0,
-            "a payload the cheater did not sign convicted it"
+            report,
+            PassReport::default(),
+            "a payload the cheater did not sign was judged"
         );
     }
 
@@ -441,10 +443,44 @@ pub async fn run() {
         &run_id,
         header,
     );
+    // Beside it, another node's payload, signed by that node, that does not
+    // fit the model: one result short of what the reference holds. It cannot
+    // be judged. It used to fail the whole pass, and since it was retried
+    // every pass, it stopped this verifier judging anyone at all
+    // (wienerlabs/leviathan-net#57).
+    let short = (cheater + 1) % clients.len();
+    let short_header = payload_header(
+        &state.coordinator,
+        tie_breakers,
+        &identity(&clients[short], &p2ps[short]),
+    );
+    keep_reference(
+        &reference_dir,
+        &fixture(HONEST_PAYLOAD),
+        &clients[short],
+        short_header,
+    );
+    let mut results =
+        leviathan_verifier::read_dump(&fixture(HONEST_PAYLOAD)).unwrap();
+    results.pop();
+    let short_source = scratch("short").join("short.vec-postcard");
+    fs::write(
+        &short_source,
+        psyche_network::distro_results_to_bytes(&results).unwrap(),
+    )
+    .unwrap();
+    keep_signed_payload(
+        &submitted_dir,
+        &short_source,
+        &clients[short],
+        &p2ps[short],
+        &run_id,
+        short_header,
+    );
     let config = config_for(submitted_dir);
 
     let mut convicted = HashSet::new();
-    let convictions = audit_pass(
+    let report = audit_pass(
         &mut endpoint,
         &main_authority,
         &coordinator_account,
@@ -456,8 +492,59 @@ pub async fn run() {
     .await
     .unwrap();
 
-    assert_eq!(convictions, 1);
+    assert_eq!(
+        report,
+        PassReport {
+            fraud_found: 1,
+            submitted: 1,
+            malformed: 1,
+            ..PassReport::default()
+        }
+    );
+    assert_eq!(report.convictions(), 1);
     assert!(convicted.contains(&cheater_committer));
+
+    // Everything in the directory is settled: a second pass judges nothing.
+    assert_eq!(
+        audit_pass(
+            &mut endpoint,
+            &main_authority,
+            &coordinator_account,
+            &run,
+            &config,
+            None,
+            &mut convicted,
+        )
+        .await
+        .unwrap(),
+        PassReport::default()
+    );
+
+    // A daemon that lost what it had settled, say to a restart, proves the
+    // same fraud again, and the chain refuses to eject a target twice. The
+    // chain already holds that conviction, so the refusal is reported as
+    // such, not as a proof the chain never saw: that is what the
+    // uncaught-fraud kill switch fires on (wienerlabs/leviathan-net#57).
+    let restarted = audit_pass(
+        &mut endpoint,
+        &main_authority,
+        &coordinator_account,
+        &run,
+        &config,
+        None,
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restarted,
+        PassReport {
+            fraud_found: 1,
+            already_on_chain: 1,
+            malformed: 1,
+            ..PassReport::default()
+        }
+    );
 
     endpoint
         .forward_clock_unix_timestamp(cooldown_time)

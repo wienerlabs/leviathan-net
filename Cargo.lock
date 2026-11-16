@@ -2490,6 +2490,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
+name = "dtoa"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
+
+[[package]]
 name = "dwrote"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5012,18 +5018,32 @@ dependencies = [
 name = "leviathan-indexer"
 version = "0.2.0"
 dependencies = [
+ "anchor-lang",
+ "anchor-spl",
  "anyhow",
  "bs58",
  "bytemuck",
  "clap",
+ "leviathan-telemetry",
+ "prometheus-client",
  "psyche-coordinator",
  "psyche-core",
  "psyche-solana-coordinator",
- "psyche-solana-tooling",
+ "psyche-solana-treasurer",
  "serde",
  "serde_json",
  "solana-sdk",
  "solana_toolbox_endpoint",
+ "tokio",
+]
+
+[[package]]
+name = "leviathan-telemetry"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "prometheus-client",
  "tokio",
 ]
 
@@ -7077,6 +7097,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus-client"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f021d42d29841d029b61b45a25a7ef94feaf1d744913e59665103333a56045b8"
+dependencies = [
+ "dtoa",
+ "itoa",
+ "parking_lot",
+ "prometheus-client-derive-encode",
+]
+
+[[package]]
+name = "prometheus-client-derive-encode"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01e34894696ff94f64a20c2c373a6440903e9c2789a303d68ec6e6f953f890e4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7695,7 +7738,10 @@ dependencies = [
  "bs58",
  "bytemuck",
  "clap",
+ "leviathan-indexer",
+ "leviathan-telemetry",
  "leviathan-verifier",
+ "prometheus-client",
  "psyche-coordinator",
  "psyche-core",
  "psyche-data-provider",
@@ -12009,6 +12055,17 @@ name = "syn"
 version = "2.0.115"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e614ed320ac28113fa64972c4262d5dbc89deacdfd00c34a3e4cea073243c12"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
 dependencies = [
  "proc-macro2",
  "quote",

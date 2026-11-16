@@ -1,3 +1,11 @@
+use leviathan_indexer::live::read_run;
+use leviathan_indexer::metrics::IndexerMetrics;
+use leviathan_indexer::verdicts::status_label;
+use leviathan_indexer::verdicts::VerdictLedger;
+use leviathan_indexer::verdicts::VerdictTally;
+use leviathan_indexer::verdicts::VERDICT_STATUSES;
+use leviathan_telemetry::exposition::render;
+use prometheus_client::registry::Registry;
 use psyche_coordinator::model::Checkpoint;
 use psyche_coordinator::model::HubRepo;
 use psyche_coordinator::model::LLMArchitecture;
@@ -2073,4 +2081,119 @@ pub async fn no_vote_is_taken_once_the_roster_has_moved_under_the_committee() {
         ),
         treasurer_refusal(ProgramError::CommitteeNotDrawnForRoster),
     );
+}
+
+/// What `leviathan-indexer` sees of one verdict account, and what it exports.
+async fn indexer_look(
+    h: &mut AppealsHarness,
+    ledger: &mut VerdictLedger,
+    metrics: &IndexerMetrics,
+) -> VerdictTally {
+    let run_id = h.run_id.clone();
+    let observation = read_run(&mut h.endpoint, None, &run_id)
+        .await
+        .unwrap()
+        .observe(ledger);
+    metrics.observe(&run_id, &observation);
+    observation
+        .treasurer
+        .expect("the appeals run is treasurer-managed")
+        .verdicts
+}
+
+/// The indexer follows a dispute from its first vote to its overturn and
+/// counts the conviction and the overturn once each, however many polls see
+/// them: the overturn is the chain's record of an innocent target convicted,
+/// which the honest-false-positive kill switch fires on
+/// (wienerlabs/leviathan-net#57).
+#[tokio::test]
+pub async fn the_indexer_counts_a_conviction_and_its_overturn_once() {
+    let mut h = setup("Leviathan indexer appeal", 111).await;
+    let mut ledger = VerdictLedger::default();
+    let mut registry = Registry::default();
+    let metrics = IndexerMetrics::register(&mut registry);
+    let status = |name: &str| {
+        VERDICT_STATUSES
+            .iter()
+            .position(|s| status_label(*s) == name)
+            .unwrap()
+    };
+
+    let quiet = indexer_look(&mut h, &mut ledger, &metrics).await;
+    assert_eq!(quiet, VerdictTally::default());
+
+    // One vote opens the dispute; it is open, not lapsed, in its own round.
+    let voters: Vec<usize> = h
+        .verifiers
+        .iter()
+        .take(h.verifier_quorum as usize)
+        .map(|(i, _)| *i)
+        .collect();
+    h.cast_verdict(voters[0]).await.unwrap();
+    let open = indexer_look(&mut h, &mut ledger, &metrics).await;
+    assert_eq!(open.by_status[status("voting")], 1);
+    assert_eq!((open.new_convictions, open.new_lapsed), (0, 0));
+
+    // The rest of the quorum convicts.
+    for voter in &voters[1..] {
+        h.cast_verdict(*voter).await.unwrap();
+    }
+    let convicted = indexer_look(&mut h, &mut ledger, &metrics).await;
+    assert_eq!(convicted.by_status[status("slash_pending")], 1);
+    assert_eq!(convicted.new_convictions, 1);
+    assert_eq!(
+        indexer_look(&mut h, &mut ledger, &metrics)
+            .await
+            .new_convictions,
+        0,
+        "a conviction standing over two polls is one conviction"
+    );
+
+    // The target challenges, and the tie-breakers overturn.
+    let target = h.clients[h.target_client_idx].insecure_clone();
+    process_treasurer_run_open_challenge(
+        &mut h.endpoint,
+        &h.payer,
+        &target,
+        &h.run,
+    )
+    .await
+    .unwrap();
+    let challenged = indexer_look(&mut h, &mut ledger, &metrics).await;
+    assert_eq!(challenged.by_status[status("challenged")], 1);
+    assert_eq!(
+        (challenged.new_convictions, challenged.new_overturned),
+        (0, 0)
+    );
+    let appellates: Vec<usize> = h
+        .tie_breakers
+        .iter()
+        .take(h.tie_breaker_quorum as usize)
+        .map(|(i, _)| *i)
+        .collect();
+    for appellate in appellates {
+        h.cast_appeal(appellate, true).await.unwrap();
+    }
+    let overturned = indexer_look(&mut h, &mut ledger, &metrics).await;
+    assert_eq!(overturned.by_status[status("overturned")], 1);
+    assert_eq!(
+        (overturned.new_convictions, overturned.new_overturned),
+        (0, 1)
+    );
+    assert_eq!(
+        indexer_look(&mut h, &mut ledger, &metrics)
+            .await
+            .new_overturned,
+        0
+    );
+
+    let scrape = render(&registry).unwrap();
+    for line in [
+        r#"leviathan_run_convictions_total{run_id="Leviathan indexer appeal"} 1"#,
+        r#"leviathan_run_overturned_convictions_total{run_id="Leviathan indexer appeal"} 1"#,
+        r#"leviathan_run_lapsed_disputes_total{run_id="Leviathan indexer appeal"} 0"#,
+        r#"leviathan_run_verdicts{run_id="Leviathan indexer appeal",status="overturned"} 1.0"#,
+    ] {
+        assert!(scrape.contains(line), "missing {line} in\n{scrape}");
+    }
 }

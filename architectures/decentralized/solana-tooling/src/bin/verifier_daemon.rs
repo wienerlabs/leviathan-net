@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -6,6 +7,8 @@ use std::time::Duration;
 use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
+use leviathan_telemetry::server::serve;
+use leviathan_telemetry::verifier::VerifierMetrics;
 use leviathan_verifier::build_replay_trainer;
 use leviathan_verifier::checkpoint_repo_files;
 use leviathan_verifier::index_dir;
@@ -15,6 +18,7 @@ use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
+use prometheus_client::registry::Registry;
 use psyche_coordinator::model::HubRepo;
 use psyche_coordinator::model::Model;
 use psyche_coordinator::model::LLM;
@@ -75,6 +79,46 @@ struct Args {
     audit_assigned: bool,
     #[arg(long, default_value_t = false)]
     verdict: bool,
+
+    /// Serve what each pass judged at http://<address>/metrics for Prometheus:
+    /// contributions cleared, fraud found, convictions submitted, and
+    /// submissions the chain refused.
+    #[arg(long)]
+    metrics_listen: Option<SocketAddr>,
+}
+
+/// The daemon's `/metrics` endpoint: the counters it records into, and the
+/// server task, watched so the daemon stops rather than audit on unseen.
+struct Exporter {
+    metrics: VerifierMetrics,
+    server: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl Exporter {
+    async fn start(listen: SocketAddr) -> Result<Self> {
+        let mut registry = Registry::default();
+        let metrics = VerifierMetrics::register(&mut registry);
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        println!(
+            "[verifier-daemon] serving metrics at http://{}/metrics",
+            listener.local_addr()?
+        );
+        let server =
+            tokio::spawn(serve(listener, std::sync::Arc::new(registry)));
+        Ok(Self { metrics, server })
+    }
+
+    /// An error once the server has stopped: the daemon's monitoring is gone.
+    async fn check(&mut self) -> Result<()> {
+        if !self.server.is_finished() {
+            return Ok(());
+        }
+        Err(match (&mut self.server).await {
+            Ok(Ok(())) => anyhow!("the metrics server stopped"),
+            Ok(Err(err)) => err.context("the metrics server failed"),
+            Err(err) => anyhow!("the metrics server panicked: {err}"),
+        })
+    }
 }
 
 /// The run's published checkpoint, loaded with the run's own configuration,
@@ -297,10 +341,17 @@ async fn main() -> Result<()> {
         }
     );
 
+    let mut exporter = match args.metrics_listen {
+        Some(listen) => Some(Exporter::start(listen).await?),
+        None => None,
+    };
     let mut replayer = args.replay_data_dir.clone().map(Replayer::new);
 
     let mut judged: HashSet<String> = HashSet::new();
     loop {
+        if let Some(exporter) = exporter.as_mut() {
+            exporter.check().await?;
+        }
         let engine = match replayer.as_mut() {
             Some(replayer) => match replayer.engine(&args, &mut endpoint, &coordinator_account).await {
                 Ok(Some(engine)) => Some(engine),
@@ -316,6 +367,9 @@ async fn main() -> Result<()> {
                 }
                 Err(err) => {
                     eprintln!("[verifier-daemon] cannot prepare this pass: {err:#}");
+                    if let Some(exporter) = &exporter {
+                        exporter.metrics.pass_failed(&args.run_id);
+                    }
                     tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;
                     continue;
                 }
@@ -336,16 +390,25 @@ async fn main() -> Result<()> {
             replayer.reclaim(engine);
         }
         match result {
-            Ok(new_convictions) => {
+            Ok(report) => {
+                if let Some(exporter) = &exporter {
+                    exporter.metrics.record(&args.run_id, &report);
+                }
                 if args.once {
                     println!(
-                        "[verifier-daemon] single pass complete, {} new conviction(s)",
-                        new_convictions
+                        "[verifier-daemon] single pass complete, {} new conviction(s), {} submission(s) refused",
+                        report.convictions(),
+                        report.submission_failures
                     );
                     break;
                 }
             }
-            Err(err) => eprintln!("[verifier-daemon] pass error: {err:#}"),
+            Err(err) => {
+                eprintln!("[verifier-daemon] pass error: {err:#}");
+                if let Some(exporter) = &exporter {
+                    exporter.metrics.pass_failed(&args.run_id);
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(args.poll_secs)).await;
     }

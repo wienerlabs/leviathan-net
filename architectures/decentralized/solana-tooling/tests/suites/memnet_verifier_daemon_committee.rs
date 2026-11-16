@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
+use leviathan_telemetry::verifier::PassReport;
 use psyche_coordinator::model::Checkpoint;
 use psyche_coordinator::model::HubRepo;
 use psyche_coordinator::model::LLMArchitecture;
@@ -345,9 +346,40 @@ pub async fn run() {
         verdict_mode: true,
     };
 
+    // A trainer off this round's committee proves the same fraud and cannot
+    // vote it: the chain holds nothing of the proof, so the refusal is a
+    // submission failure, and the daemon tries again on its next pass
+    // (wienerlabs/leviathan-net#57).
+    let outsider = clients
+        .iter()
+        .find(|k| !verifiers.contains(k) && k.pubkey() != target_key)
+        .expect("a trainer off the committee");
+    let mut outsider_judged = HashSet::new();
+    for _ in 0..2 {
+        let refused = audit_pass(
+            &mut endpoint,
+            outsider,
+            &coordinator_account,
+            &run,
+            &config,
+            None,
+            &mut outsider_judged,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refused,
+            PassReport {
+                fraud_found: 1,
+                submission_failures: 1,
+                ..PassReport::default()
+            }
+        );
+    }
+
     for verifier in verifiers.iter().take((quorum - 1) as usize) {
         let mut convicted = HashSet::new();
-        let submitted = audit_pass(
+        let report = audit_pass(
             &mut endpoint,
             verifier,
             &coordinator_account,
@@ -358,8 +390,39 @@ pub async fn run() {
         )
         .await
         .unwrap();
-        assert_eq!(submitted, 1, "each verifier daemon submits one verdict");
+        assert_eq!(
+            report,
+            PassReport {
+                fraud_found: 1,
+                submitted: 1,
+                ..PassReport::default()
+            },
+            "each verifier daemon submits one verdict"
+        );
     }
+
+    // A verifier that already voted, proving the fraud again after a
+    // restart, is refused: the chain holds its vote, so it is not a proof the
+    // chain never saw.
+    let revote = audit_pass(
+        &mut endpoint,
+        verifiers[0],
+        &coordinator_account,
+        &run,
+        &config,
+        None,
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        revote,
+        PassReport {
+            fraud_found: 1,
+            already_on_chain: 1,
+            ..PassReport::default()
+        }
+    );
 
     let mid = coordinator_state(&mut endpoint, &coordinator_account).await;
     let target_state_mid = mid
@@ -376,7 +439,7 @@ pub async fn run() {
     );
 
     let mut convicted = HashSet::new();
-    audit_pass(
+    let quorum_report = audit_pass(
         &mut endpoint,
         verifiers[(quorum - 1) as usize],
         &coordinator_account,
@@ -387,6 +450,35 @@ pub async fn run() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        quorum_report,
+        PassReport {
+            fraud_found: 1,
+            submitted: 1,
+            ..PassReport::default()
+        }
+    );
+    // Once the quorum convicted the target, the outsider's retried proof is
+    // refused because the chain holds the conviction, and is settled.
+    let after_quorum = audit_pass(
+        &mut endpoint,
+        outsider,
+        &coordinator_account,
+        &run,
+        &config,
+        None,
+        &mut outsider_judged,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        after_quorum,
+        PassReport {
+            fraud_found: 1,
+            already_on_chain: 1,
+            ..PassReport::default()
+        }
+    );
 
     let after = coordinator_state(&mut endpoint, &coordinator_account).await;
     let target_state_after = after
@@ -448,7 +540,8 @@ pub async fn run() {
             &coordinator_account,
         )
         .await;
-        let settled = coordinator_state(&mut endpoint, &coordinator_account).await;
+        let settled =
+            coordinator_state(&mut endpoint, &coordinator_account).await;
         target_slashed = settled
             .clients_state
             .clients

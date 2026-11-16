@@ -19,6 +19,10 @@ services:
     image: prom/prometheus:latest
     ports:
       - '9090:9090'
+    # The indexer and the verifier daemon run on the host; Docker Desktop
+    # resolves this name on its own, Linux needs it mapped.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       - ./leviathan-killswitch.rules.yml:/etc/prometheus/leviathan-killswitch.rules.yml

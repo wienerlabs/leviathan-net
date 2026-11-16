@@ -1,0 +1,18 @@
+[package]
+name = "leviathan-telemetry"
+edition = "2021"
+version.workspace = true
+
+[features]
+# The `/metrics` endpoint. The metric families themselves need neither tokio
+# nor an HTTP stack, so a crate that only fills them does not pull those in.
+server = ["dep:axum", "dep:tokio", "dep:anyhow"]
+
+[dependencies]
+prometheus-client = "0.26"
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

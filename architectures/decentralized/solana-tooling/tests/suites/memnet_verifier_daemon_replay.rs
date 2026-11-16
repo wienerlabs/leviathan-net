@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
+use leviathan_telemetry::verifier::PassReport;
 use psyche_coordinator::model::Model;
 use psyche_coordinator::model::LLM;
 use psyche_coordinator::CommitteeSelection;
@@ -370,7 +371,8 @@ pub async fn run() {
     );
 
     for _ in 0..4 {
-        let state = coordinator_state(&mut endpoint, &coordinator_account).await;
+        let state =
+            coordinator_state(&mut endpoint, &coordinator_account).await;
         for client in &clients {
             let position = state
                 .coordinator
@@ -523,7 +525,7 @@ pub async fn run() {
     };
 
     let mut convicted = HashSet::new();
-    let convictions = audit_pass(
+    let report = audit_pass(
         &mut endpoint,
         &main_authority,
         &coordinator_account,
@@ -535,7 +537,17 @@ pub async fn run() {
     .await
     .unwrap();
 
-    assert_eq!(convictions, 1);
+    // The honest node's contribution replays within band, the cheater's does
+    // not and is convicted.
+    assert_eq!(
+        report,
+        PassReport {
+            cleared: 1,
+            fraud_found: 1,
+            submitted: 1,
+            ..PassReport::default()
+        }
+    );
     assert!(convicted.contains(&cheater_committer));
     assert!(
         !convicted.contains(&clients[honest].pubkey().to_string()),

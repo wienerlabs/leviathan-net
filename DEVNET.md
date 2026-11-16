@@ -138,18 +138,17 @@ and what three nodes actually cost.
 
 ### Dashboard telemetry
 
-`leviathan-indexer --features live` reads a coordinator account and prints run
-telemetry as JSON. It is libtorch-free, so it runs anywhere. Publish it for the
-dashboard:
+`leviathan-indexer --features live` reads a run off chain from its run id and
+prints its telemetry as JSON. It is libtorch-free, so it runs anywhere:
 
 ```
-OUT=telemetry.json ./scripts/publish-telemetry.sh \
-  --coordinator-account <coordinator-pubkey> --run-id <run> --rpc <rpc> \
-  --reward-per-round 0.324 --bond 10.55 --slash-when-caught 10.55
+OUT=telemetry.json ./scripts/publish-telemetry.sh --run-id <run> --rpc <rpc>
 ```
 
-The economics flags add the on-chain economic security verdict. This is for the
-command line only. The dashboard reads the coordinator and treasurer accounts
+A treasurer-managed run also gets its economic security verdict, computed from
+the run's own epoch rates and bond minimum. With `--metrics-listen` the indexer
+serves the run to Prometheus instead, for the kill-switch alerts
+(`telemetry/README.md`). This is for the command line only. The dashboard reads the coordinator and treasurer accounts
 itself, so it needs nothing published and there is no action keeping a file in
 sync any more.
 

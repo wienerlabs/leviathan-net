@@ -2,6 +2,18 @@ use psyche_coordinator::Coordinator;
 use psyche_solana_coordinator::Client;
 use serde::Serialize;
 
+pub mod economics;
+#[cfg(feature = "live")]
+pub mod live;
+pub mod metrics;
+pub mod observe;
+pub mod verdicts;
+
+pub use economics::assess_security;
+pub use economics::chain_economics;
+pub use economics::RunEconomics;
+pub use economics::SecurityAssessment;
+
 pub const DEFAULT_LEADERBOARD_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -28,50 +40,6 @@ pub struct RunTelemetry {
     pub leaderboard: Vec<ClientEntry>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub security: Option<SecurityAssessment>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RunEconomics {
-    pub reward_per_round: f64,
-    pub bond: f64,
-    pub slash_when_caught: f64,
-}
-
-impl RunEconomics {
-    pub fn is_well_formed(&self) -> bool {
-        [self.reward_per_round, self.bond, self.slash_when_caught]
-            .iter()
-            .all(|value| value.is_finite() && *value >= 0.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
-pub struct SecurityAssessment {
-    pub audit_probability: f64,
-    pub break_even_penalty: Option<f64>,
-    pub effective_penalty: f64,
-    pub expected_fraud_value_per_round: f64,
-    pub economically_secure: bool,
-}
-
-pub fn assess_security(audit_probability: f64, economics: &RunEconomics) -> SecurityAssessment {
-    let p = audit_probability.clamp(0.0, 1.0);
-    let break_even_penalty = if p > 0.0 {
-        let value = economics.reward_per_round * (1.0 - p) / p;
-        value.is_finite().then_some(value)
-    } else {
-        None
-    };
-    let effective_penalty = economics.slash_when_caught.min(economics.bond);
-    let expected_fraud_value_per_round =
-        (1.0 - p) * economics.reward_per_round - p * effective_penalty;
-    SecurityAssessment {
-        audit_probability: p,
-        break_even_penalty,
-        effective_penalty,
-        expected_fraud_value_per_round,
-        economically_secure: p > 0.0 && expected_fraud_value_per_round <= 0.0,
-    }
 }
 
 // Base58, because that is what a Solana address is everywhere else: what the
@@ -103,7 +71,7 @@ pub fn compute_telemetry(
     leaderboard.truncate(leaderboard_size);
 
     let verification_percent = coordinator.config.verification_percent;
-    let audit_probability = verification_percent as f64 / 100.0;
+    let audit_probability = economics::audit_probability(coordinator);
     let expected_rounds_to_catch = if audit_probability > 0.0 {
         Some(1.0 / audit_probability)
     } else {
@@ -116,7 +84,7 @@ pub fn compute_telemetry(
         epoch: coordinator.progress.epoch,
         step: coordinator.progress.step,
         registered_clients: on_chain_clients.len(),
-        active_clients: coordinator.epoch_state.clients.len(),
+        active_clients: economics::healthy_clients(coordinator),
         total_earned,
         total_slashed,
         convicted_clients,
@@ -201,58 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn secure_when_penalty_meets_break_even() {
-        let econ = RunEconomics {
-            reward_per_round: 1000.0,
-            bond: 100_000.0,
-            slash_when_caught: 9000.0,
-        };
-        let s = assess_security(0.1, &econ);
-        assert_eq!(s.break_even_penalty, Some(9000.0));
-        assert_eq!(s.effective_penalty, 9000.0);
-        assert!(s.expected_fraud_value_per_round <= 0.0);
-        assert!(s.economically_secure);
-    }
-
-    #[test]
-    fn insecure_when_slash_is_too_small() {
-        let econ = RunEconomics {
-            reward_per_round: 1000.0,
-            bond: 100_000.0,
-            slash_when_caught: 1000.0,
-        };
-        let s = assess_security(0.1, &econ);
-        assert!(s.expected_fraud_value_per_round > 0.0);
-        assert!(!s.economically_secure);
-    }
-
-    #[test]
-    fn bond_caps_the_effective_penalty() {
-        let econ = RunEconomics {
-            reward_per_round: 1000.0,
-            bond: 500.0,
-            slash_when_caught: 1_000_000.0,
-        };
-        let s = assess_security(0.1, &econ);
-        assert_eq!(s.effective_penalty, 500.0);
-        assert!(!s.economically_secure);
-    }
-
-    #[test]
-    fn zero_audit_probability_is_never_secure() {
-        let econ = RunEconomics {
-            reward_per_round: 1000.0,
-            bond: 1_000_000.0,
-            slash_when_caught: 1_000_000.0,
-        };
-        let s = assess_security(0.0, &econ);
-        assert_eq!(s.break_even_penalty, None);
-        assert!(!s.economically_secure);
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(json.contains("\"economically_secure\":false"));
-    }
-
-    #[test]
     fn telemetry_carries_security_when_set() {
         let mut coordinator = Coordinator::zeroed();
         coordinator.config.verification_percent = 10;
@@ -265,53 +181,12 @@ mod tests {
         t.security = Some(assess_security(
             t.audit_probability,
             &RunEconomics {
-                reward_per_round: 1000.0,
+                reward: 1000.0,
                 bond: 100_000.0,
                 slash_when_caught: 9000.0,
             },
         ));
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"economically_secure\":true"));
-    }
-
-    #[test]
-    fn overflow_break_even_serializes_as_absent() {
-        let econ = RunEconomics {
-            reward_per_round: f64::MAX,
-            bond: f64::MAX,
-            slash_when_caught: f64::MAX,
-        };
-        let s = assess_security(1e-300, &econ);
-        assert_eq!(s.break_even_penalty, None);
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(json.contains("\"break_even_penalty\":null"));
-    }
-
-    #[test]
-    fn non_finite_or_negative_economics_are_rejected() {
-        assert!(RunEconomics {
-            reward_per_round: 1000.0,
-            bond: 500.0,
-            slash_when_caught: 100.0,
-        }
-        .is_well_formed());
-        assert!(!RunEconomics {
-            reward_per_round: f64::INFINITY,
-            bond: 500.0,
-            slash_when_caught: 100.0,
-        }
-        .is_well_formed());
-        assert!(!RunEconomics {
-            reward_per_round: f64::NAN,
-            bond: 500.0,
-            slash_when_caught: 100.0,
-        }
-        .is_well_formed());
-        assert!(!RunEconomics {
-            reward_per_round: 1000.0,
-            bond: -1.0,
-            slash_when_caught: 100.0,
-        }
-        .is_well_formed());
     }
 }

@@ -18,6 +18,8 @@ on:
       - "shared/data-provider/**"
       - "config/leviathan/**"
       - "scripts/replay-smoke.sh"
+      - "tools/rust-tools/leviathan-telemetry/**"
+      - "telemetry/**"
       - ".github/workflows/leviathan-substrate.yml"
   pull_request:
     paths:
@@ -36,6 +38,8 @@ on:
       - "shared/data-provider/**"
       - "config/leviathan/**"
       - "scripts/replay-smoke.sh"
+      - "tools/rust-tools/leviathan-telemetry/**"
+      - "telemetry/**"
       - ".github/workflows/leviathan-substrate.yml"
 
 concurrency:
@@ -71,16 +75,49 @@ jobs:
           cargo fmt --check
           -p psyche-verifier
           -p leviathan-indexer
+          -p leviathan-telemetry
 
-      - name: Security core and aggregation
+      # The indexer's chain reader and its exporter, and the telemetry
+      # endpoint, are behind features; test them too (wienerlabs/leviathan-net#57).
+      - name: Security core, aggregation and telemetry
         run: >
           cargo test --locked
           -p psyche-verifier
           -p psyche-coordinator
           -p leviathan-indexer
+          -p leviathan-telemetry
+          --features leviathan-indexer/live,leviathan-telemetry/server
 
       - name: Solana programs in-process (memnet)
         run: cargo test --locked -p psyche-solana-tooling
+
+  # The kill-switch rules Prometheus loads: they parse, the scrape config that
+  # loads them parses, and every alert fires on the series it is written for
+  # and stays quiet on the rest (wienerlabs/leviathan-net#57).
+  rules:
+    name: kill-switch rules (promtool)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROMETHEUS_IMAGE: prom/prometheus:v3.5.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: The rules and the scrape config parse
+        run: |
+          docker run --rm \
+            -v "$PWD/telemetry/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+            -v "$PWD/telemetry/leviathan-killswitch.rules.yml:/etc/prometheus/leviathan-killswitch.rules.yml:ro" \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" \
+            check config /etc/prometheus/prometheus.yml
+
+      - name: Every alert fires when it should and only then
+        run: |
+          docker run --rm -v "$PWD/telemetry:/telemetry:ro" \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" \
+            test rules /telemetry/tests/leviathan-killswitch.test.yml
 
   # The crates that link libtorch: the model, the payload encoding, the client
   # that keeps peers' payloads, the replay verifier and the daemon that

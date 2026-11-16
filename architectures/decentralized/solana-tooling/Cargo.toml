@@ -68,6 +68,8 @@ daemon = [
     "dep:psyche-data-provider",
     "dep:psyche-modeling",
     "dep:tch",
+    "dep:leviathan-telemetry",
+    "dep:prometheus-client",
 ]
 
 [dependencies.clap]
@@ -103,6 +105,15 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.leviathan-telemetry]
+path = "../../../tools/rust-tools/leviathan-telemetry"
+features = ["server"]
+optional = true
+
+[dependencies.prometheus-client]
+version = "0.26"
+optional = true
+
 [dev-dependencies]
 tokio = "1.42.0"
 tokio-util = { workspace = true }
@@ -111,3 +122,6 @@ psyche-core = { path = "../../../shared/core", features = ["rand"] }
 psyche-solana-rpc = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+leviathan-indexer = { path = "../../../tools/rust-tools/leviathan-indexer", features = ["live"] }
+leviathan-telemetry = { path = "../../../tools/rust-tools/leviathan-telemetry" }
+prometheus-client = "0.26"

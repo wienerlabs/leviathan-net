@@ -1,0 +1,449 @@
+# promtool unit tests of every kill switch, run in CI:
+#   promtool test rules telemetry/tests/leviathan-killswitch.test.yml
+# Each alert gets a run it must fire on and a run it must leave alone. The
+# series carry the job and instance labels a scrape adds.
+rule_files:
+  - ../leviathan-killswitch.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: economic insecurity fires on a run where a cheat pays, after two minutes
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_economically_secure{run_id="insecure",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x10'
+      - series: 'leviathan_run_economically_secure{run_id="secure",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LeviathanEconomicInsecurity
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LeviathanEconomicInsecurity
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kill_switch: economic_insecurity
+              run_id: insecure
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "Run insecure is not economically secure"
+              description: "At the run's own epoch rates and bond minimum, a cheat makes money in expectation: either the penalty is below the break-even penalty at the run's audit probability, or a round seats too few verifiers to convict anyone. Raise the slashing rate and the bond, or the audit percent, or lower the earning rate."
+
+  - name: a vault below its bonds is a drain at once, and is not also reported as underfunded
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_bond_shortfall{run_id="drained",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0 0 200x20'
+      - series: 'leviathan_run_obligation_shortfall{run_id="drained",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0 0 950x20'
+      - series: 'leviathan_run_bond_shortfall{run_id="backed",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x22'
+      - series: 'leviathan_run_obligation_shortfall{run_id="backed",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LeviathanTreasuryDrain
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LeviathanTreasuryDrain
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kill_switch: treasury_drain
+              run_id: drained
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "The vault of drained holds less than the bonds posted into it"
+              description: "Short by 200 base units. Every outflow the treasurer allows keeps the bonds covered, so the vault was drained."
+      - eval_time: 20m
+        alertname: LeviathanTreasuryUnderfunded
+        exp_alerts: []
+
+  - name: a vault that covers the bonds but not the earnings is underfunded after fifteen minutes
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_bond_shortfall{run_id="unpaid",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x20'
+      - series: 'leviathan_run_obligation_shortfall{run_id="unpaid",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '250x20'
+      - series: 'leviathan_run_bond_shortfall{run_id="paid",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x20'
+      - series: 'leviathan_run_obligation_shortfall{run_id="paid",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LeviathanTreasuryUnderfunded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: LeviathanTreasuryUnderfunded
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: treasury_underfunded
+              run_id: unpaid
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "The vault of unpaid cannot pay out every point earned"
+              description: "Short by 250 base units of the bonds plus every point credited and not yet claimed, each claimable once its holder keeps the bond minimum posted. Claims will start failing; top up the run's rewards."
+      - eval_time: 16m
+        alertname: LeviathanTreasuryDrain
+        exp_alerts: []
+
+  - name: a partition is a training epoch that lost more than half its roster
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_active_clients{run_id="split",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '2x15'
+      - series: 'leviathan_run_epoch_roster_size{run_id="split",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '6x15'
+      - series: 'leviathan_run_training{run_id="split",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+      - series: 'leviathan_run_active_clients{run_id="between-epochs",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_run_epoch_roster_size{run_id="between-epochs",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '6x15'
+      - series: 'leviathan_run_training{run_id="between-epochs",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_run_active_clients{run_id="empty",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_run_epoch_roster_size{run_id="empty",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_run_training{run_id="empty",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+      - series: 'leviathan_run_active_clients{run_id="whole",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '5x15'
+      - series: 'leviathan_run_epoch_roster_size{run_id="whole",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '6x15'
+      - series: 'leviathan_run_training{run_id="whole",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: LeviathanMeshPartition
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LeviathanMeshPartition
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: mesh_partition
+              run_id: split
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "Mesh partition risk on split"
+              description: "Fewer than half of the clients this epoch started with are still healthy in it."
+
+  - name: an overturned conviction fires at once, and only on the run it happened in
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_overturned_convictions_total{run_id="wronged",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0 0 0 1x10'
+      - series: 'leviathan_run_overturned_convictions_total{run_id="clean",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x13'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: LeviathanHonestFalsePositive
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LeviathanHonestFalsePositive
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kill_switch: honest_fpr
+              run_id: wronged
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "A conviction on wronged was overturned on appeal"
+              description: "A verifier quorum convicted a target the tie-breakers found innocent. Zero honest-node slashes is a hard PRD metric."
+
+  - name: an indexer trailing the chain by more than a hundred slots for five minutes is lagging
+    interval: 1m
+    input_series:
+      - series: 'leviathan_indexer_slot_lag{run_id="behind",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '150x10'
+      - series: 'leviathan_indexer_slot_lag{run_id="current",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '20x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LeviathanIndexerLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LeviathanIndexerLag
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: indexer_lag
+              run_id: behind
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "Indexer lagging chain by 150 slots on behind"
+              description: "Dashboard and automated responses are untrustworthy until caught up."
+
+  - name: a snapshot that stops moving goes stale, one that keeps up does not
+    interval: 1m
+    input_series:
+      # promtool's clock starts at the epoch, so a snapshot read every minute
+      # carries the minute's own timestamp.
+      - series: 'leviathan_indexer_snapshot_timestamp_seconds{run_id="frozen",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_indexer_snapshot_timestamp_seconds{run_id="fresh",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0+60x15'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: LeviathanIndexerStale
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LeviathanIndexerStale
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: indexer_lag
+              run_id: frozen
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "The indexer's view of frozen is more than five minutes old"
+              description: "Either its polls are failing or its RPC is behind the cluster. Every other alert on this run is reading old state."
+
+  - name: an indexer whose polls of a run keep failing is not reading it
+    interval: 1m
+    input_series:
+      - series: 'leviathan_indexer_last_poll_success{run_id="unread",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x10'
+      - series: 'leviathan_indexer_last_poll_success{run_id="blip",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1 0 0 1x8'
+      - series: 'leviathan_indexer_last_poll_success{run_id="read",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LeviathanIndexerNotReading
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LeviathanIndexerNotReading
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: indexer_lag
+              run_id: unread
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "The indexer cannot read unread off chain"
+              description: "Every poll for five minutes failed. A run it never read once has no other series, so no other alert on it can fire; read the indexer's log."
+
+  - name: an indexer that cannot be scraped for five minutes is down
+    interval: 1m
+    input_series:
+      - series: 'up{job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x10'
+      - series: 'up{job="leviathan-indexer",instance="indexer-2:9464"}'
+        values: '1x10'
+      - series: 'up{job="leviathan-verifier",instance="verifier:9465"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LeviathanIndexerDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LeviathanIndexerDown
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: indexer_lag
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "The indexer at indexer:9464 cannot be scraped"
+              description: "No kill switch that reads the chain can fire while it is down."
+
+  - name: a verifier that cannot be scraped for five minutes is down
+    interval: 1m
+    input_series:
+      - series: 'up{job="leviathan-verifier",instance="verifier:9465"}'
+        values: '0x10'
+      - series: 'up{job="leviathan-verifier",instance="verifier-2:9465"}'
+        values: '1x10'
+      - series: 'up{job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LeviathanVerifierDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LeviathanVerifierDown
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: uncaught_fraud
+              job: leviathan-verifier
+              instance: verifier:9465
+            exp_annotations:
+              summary: "The verifier at verifier:9465 cannot be scraped"
+              description: "A verifier that is down audits nothing, and a fraud proof it holds goes unseen."
+
+  - name: a fraud vote that lapsed without a quorum is uncaught fraud
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_lapsed_disputes_total{run_id="escaped",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0 0 1x10'
+      - series: 'leviathan_run_lapsed_disputes_total{run_id="settled",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LeviathanUncaughtFraudSuspect
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LeviathanUncaughtFraudSuspect
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kill_switch: uncaught_fraud
+              run_id: escaped
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "A fraud vote on escaped lapsed without a quorum"
+              description: "A bonded verifier voted fraud with the target's signed commitment and the rest of its committee never joined it. Either a cheat escaped conviction or a verifier accused an honest node; replay the batch the verdict account names."
+
+  - name: a conviction replaced before its appeal was seen is reported
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_unseen_dispute_outcomes_total{run_id="hurried",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0 0 1x10'
+      - series: 'leviathan_run_unseen_dispute_outcomes_total{run_id="watched",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LeviathanDisputeOutcomeUnseen
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LeviathanDisputeOutcomeUnseen
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: honest_fpr
+              run_id: hurried
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "A conviction on hurried was replaced before its outcome was seen"
+              description: "A new dispute took the verdict account over before the indexer saw whether an appeal overturned the conviction. Read the account's transaction history: an overturn there is an honest node convicted."
+
+  - name: a verifier whose passes keep failing audits nothing
+    interval: 1m
+    input_series:
+      - series: 'leviathan_verifier_pass_errors_total{run_id="genesis",job="leviathan-verifier",instance="verifier:9465"}'
+        values: '0+1x30'
+      - series: 'leviathan_verifier_pass_errors_total{run_id="genesis",job="leviathan-verifier",instance="verifier-2:9465"}'
+        values: '0 1 1x28'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: LeviathanVerifierFailing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: LeviathanVerifierFailing
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: uncaught_fraud
+              run_id: genesis
+              job: leviathan-verifier
+              instance: verifier:9465
+            exp_annotations:
+              summary: "The verifier at verifier:9465 keeps failing its passes on genesis"
+              description: "Its audit passes have failed for ten minutes before judging anything, so it audits nothing. Read its log."
+      - eval_time: 25m
+        alertname: LeviathanVerifierFailing
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: uncaught_fraud
+              run_id: genesis
+              job: leviathan-verifier
+              instance: verifier:9465
+            exp_annotations:
+              summary: "The verifier at verifier:9465 keeps failing its passes on genesis"
+              description: "Its audit passes have failed for ten minutes before judging anything, so it audits nothing. Read its log."
+
+  - name: a fraud proof the verifier could not submit is uncaught fraud
+    interval: 1m
+    input_series:
+      - series: 'leviathan_verifier_submission_failures_total{run_id="genesis",job="leviathan-verifier",instance="verifier:9465"}'
+        values: '0 0 1x10'
+      - series: 'leviathan_verifier_submission_failures_total{run_id="genesis",job="leviathan-verifier",instance="verifier-2:9465"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LeviathanFraudNotSubmitted
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LeviathanFraudNotSubmitted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kill_switch: uncaught_fraud
+              run_id: genesis
+              job: leviathan-verifier
+              instance: verifier:9465
+            exp_annotations:
+              summary: "A verifier proved fraud on genesis and could not put it on chain"
+              description: "The verifier at verifier:9465 holds a fraud proof the chain never saw. Read its log for the refused submission."
+
+  - name: a committee too small to convict fires only while verification is on and the run trains
+    interval: 1m
+    input_series:
+      - series: 'leviathan_run_verifier_committee_size{run_id="small",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+      - series: 'leviathan_run_min_verifier_committee{run_id="small",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '2x15'
+      - series: 'leviathan_run_audit_probability{run_id="small",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0.1x15'
+      - series: 'leviathan_run_training{run_id="small",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+      - series: 'leviathan_run_verifier_committee_size{run_id="unaudited",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_run_min_verifier_committee{run_id="unaudited",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '2x15'
+      - series: 'leviathan_run_audit_probability{run_id="unaudited",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_run_training{run_id="unaudited",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+      - series: 'leviathan_run_verifier_committee_size{run_id="idle",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+      - series: 'leviathan_run_min_verifier_committee{run_id="idle",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '2x15'
+      - series: 'leviathan_run_audit_probability{run_id="idle",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0.1x15'
+      - series: 'leviathan_run_training{run_id="idle",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0x15'
+      - series: 'leviathan_run_verifier_committee_size{run_id="large",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '3x15'
+      - series: 'leviathan_run_min_verifier_committee{run_id="large",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '2x15'
+      - series: 'leviathan_run_audit_probability{run_id="large",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '0.1x15'
+      - series: 'leviathan_run_training{run_id="large",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: LeviathanCommitteeCannotConvict
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LeviathanCommitteeCannotConvict
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: committee_too_small
+              run_id: small
+              job: leviathan-indexer
+              instance: indexer:9464
+            exp_annotations:
+              summary: "The verifier committee of small is too small to convict"
+              description: "A round draws 1 verifier seats over this roster, and the treasurer refuses a verdict from fewer than its minimum committee. Only the run authority can convict until the roster grows or the audit percent rises."

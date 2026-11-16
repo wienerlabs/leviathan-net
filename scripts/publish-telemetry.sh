@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Read a run's coordinator account and write the dashboard telemetry JSON.
-# leviathan-indexer is libtorch-free, so this is cheap and runs anywhere.
+# Read a run off chain and write its telemetry JSON. leviathan-indexer is
+# libtorch-free, so this is cheap and runs anywhere.
 #
 # Usage:
-#   ./scripts/publish-telemetry.sh --coordinator-account <pubkey> [options] > telemetry.json
+#   ./scripts/publish-telemetry.sh --run-id <run> [options] > telemetry.json
 #
 # Or with the operator settings file (~/.leviathan/env) providing RPC:
-#   OUT=path/to/telemetry.json ./scripts/publish-telemetry.sh --coordinator-account <pubkey>
+#   OUT=path/to/telemetry.json ./scripts/publish-telemetry.sh --run-id <run>
 #
-# Options are passed straight through to leviathan-indexer: --run-id, --rpc,
-# --leaderboard, --reward-per-round, --bond, --slash-when-caught. The economics
-# flags add the security verdict.
+# Options are passed straight through to leviathan-indexer: --rpc and
+# --leaderboard. The run's accounts are found from its id, and a
+# treasurer-managed run carries its economic security verdict, computed from
+# its own epoch rates and bond minimum.
 
 LEVIATHAN_ENV="${LEVIATHAN_ENV:-$HOME/.leviathan/env}"
 if [[ -f "$LEVIATHAN_ENV" ]]; then
