@@ -85,7 +85,12 @@ pub struct ParticipantJoinRunAccounts<'info> {
     #[account()]
     pub coordinator_instance: Box<Account<'info, CoordinatorInstance>>,
 
-    #[account(mut)]
+    // An account of another version is refused, not loaded: loading one
+    // of another size panics (wienerlabs/leviathan-net#62).
+    #[account(
+        mut,
+        constraint = CoordinatorAccount::is_current(&coordinator_account)?,
+    )]
     pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
 
     #[account()]

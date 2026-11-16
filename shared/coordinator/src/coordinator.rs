@@ -229,9 +229,13 @@ pub enum CoordinatorError {
     SlashOutsideEpoch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickResult {
     Ticked,
     EpochEnd(bool), // if successfully finished
+    /// The run is due to start a round and had no seed for it, so it waits
+    /// where it is (wienerlabs/leviathan-net#62).
+    NeedsSeed,
 }
 
 pub type HealthChecks = Vec<(NodeIdentity, CommitteeProof)>;
@@ -440,11 +444,15 @@ impl Client {
 }
 
 impl Coordinator {
+    /// Advances the run. `random_seed` is the seed of a round this tick may
+    /// start: with none, a tick that would start a round leaves the run where
+    /// it is, so a round never starts on a seed the caller has not got
+    /// (wienerlabs/leviathan-net#62).
     pub fn tick<'a, 'b>(
         &'a mut self,
         new_clients: Option<impl ExactSizeIterator<Item = &'b NodeIdentity>>,
         unix_timestamp: u64,
-        random_seed: u64,
+        random_seed: Option<u64>,
     ) -> std::result::Result<TickResult, CoordinatorError> {
         match self.run_state {
             RunState::Uninitialized | RunState::Finished | RunState::Paused => {
@@ -465,7 +473,7 @@ impl Coordinator {
         from: &NodeIdentity,
         witness: Witness,
         unix_timestamp: u64,
-        random_seed: u64,
+        random_seed: Option<u64>,
     ) -> std::result::Result<(), CoordinatorError> {
         if self.halted() {
             return Err(CoordinatorError::Halted);
@@ -505,7 +513,15 @@ impl Coordinator {
 
         let round = self.current_round().unwrap();
         for witness in round.witnesses.iter() {
-            if self.epoch_state.clients[witness.proof.index as usize].id == *from {
+            // Stored witnesses move with their clients when a warmup tick
+            // drops clients from the roster, so an index names its sender;
+            // read it bounded all the same.
+            if self
+                .epoch_state
+                .clients
+                .get(witness.proof.index as usize)
+                .is_some_and(|client| client.id == *from)
+            {
                 return Err(CoordinatorError::DuplicateWitness);
             }
         }
@@ -516,8 +532,13 @@ impl Coordinator {
             .push(witness)
             .map_err(|_| CoordinatorError::WitnessesFull)?;
 
-        if round.witnesses.len() == witness_nodes {
-            self.start_round_train(unix_timestamp, random_seed, 0);
+        // The last witness starts the first round when a seed is ready; when
+        // not, the warmup's next tick does, and witnesses keep arriving in the
+        // meantime, so it is enough to have as many as the round waits for.
+        if round.witnesses.len() >= witness_nodes {
+            if let Some(random_seed) = random_seed {
+                self.start_round_train(unix_timestamp, random_seed, 0);
+            }
         }
 
         Ok(())
@@ -1072,15 +1093,61 @@ impl Coordinator {
         Ok(TickResult::Ticked)
     }
 
+    /// Drops the clients that left during the warmup, and keeps the warmup
+    /// witnesses in step. A witness names its client by roster position,
+    /// which the clients that left shift: left alone, it would name another
+    /// client, refuse that client's own witness as a duplicate, and count
+    /// towards a first round its sender is no longer in. A witness of a
+    /// client that left is dropped, and the others move with their client.
+    fn compact_warmup_roster(&mut self) {
+        let clients = &self.epoch_state.clients;
+        let healthy = |client: &Client| client.state == ClientState::Healthy;
+        if clients.iter().all(healthy) {
+            return;
+        }
+        // Where the client at `index` sits once the roster is compacted, if
+        // it stays.
+        let compacted = |index: u64| {
+            let index = usize::try_from(index).ok()?;
+            let client = clients.get(index)?;
+            healthy(client)
+                .then(|| clients.iter().take(index).filter(|c| healthy(c)).count() as u64)
+        };
+        let round = &mut self.epoch_state.rounds[self.epoch_state.rounds_head as usize];
+        round
+            .witnesses
+            .retain(|witness| compacted(witness.proof.index).is_some());
+        for witness in round.witnesses.iter_mut() {
+            if let Some(index) = compacted(witness.proof.index) {
+                witness.proof.index = index;
+            }
+        }
+        self.move_clients_to_exited(0);
+    }
+
+    /// Whether every warmup witness the first round waits for is in.
+    fn warmup_witnessed(&self) -> bool {
+        let witness_nodes = if self.config.witness_nodes == 0 {
+            self.epoch_state.clients.len().min(SOLANA_MAX_NUM_WITNESSES)
+        } else {
+            self.config.witness_nodes as usize
+        };
+        self.current_round()
+            .is_some_and(|round| round.witnesses.len() >= witness_nodes)
+    }
+
     fn tick_warmup(
         &mut self,
         unix_timestamp: u64,
-        random_seed: u64,
+        random_seed: Option<u64>,
     ) -> std::result::Result<TickResult, CoordinatorError> {
-        if self.check_timeout(unix_timestamp, self.config.warmup_time) {
+        if self.check_timeout(unix_timestamp, self.config.warmup_time) || self.warmup_witnessed() {
+            let Some(random_seed) = random_seed else {
+                return Ok(TickResult::NeedsSeed);
+            };
             self.start_round_train(unix_timestamp, random_seed, 0);
         } else {
-            self.move_clients_to_exited(0);
+            self.compact_warmup_roster();
         }
         if (self.epoch_state.clients.len() as u16) < self.config.min_clients {
             self.start_waiting_for_members(unix_timestamp);
@@ -1103,9 +1170,15 @@ impl Coordinator {
     fn tick_round_witness(
         &mut self,
         unix_timestamp: u64,
-        random_seed: u64,
+        random_seed: Option<u64>,
     ) -> std::result::Result<TickResult, CoordinatorError> {
         if self.check_timeout(unix_timestamp, self.config.round_witness_time) {
+            // The witness phase may end in the next round, so it ends only on a
+            // tick that has that round's seed. Without one it waits, for a
+            // slot or two, rather than run the end of the round twice.
+            let Some(random_seed) = random_seed else {
+                return Ok(TickResult::NeedsSeed);
+            };
             // TODO: Punish idle witnesses
             self.epoch_state.first_round = false.into();
             self.progress.step += 1;

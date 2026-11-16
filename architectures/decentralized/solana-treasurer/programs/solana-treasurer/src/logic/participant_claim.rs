@@ -38,7 +38,7 @@ pub struct ParticipantClaimAccounts<'info> {
     pub run_collateral: Box<Account<'info, TokenAccount>>,
 
     #[account(
-        constraint = coordinator_account.load()?.version == CoordinatorAccount::VERSION,
+        constraint = CoordinatorAccount::is_current(&coordinator_account)?,
     )]
     pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
 

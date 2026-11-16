@@ -22,7 +22,7 @@ use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_participant;
 use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
+use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
@@ -433,7 +433,7 @@ impl Harness {
             .forward_clock_unix_timestamp(seconds)
             .await
             .unwrap();
-        process_coordinator_tick(
+        process_coordinator_tick_and_reveal(
             &mut self.endpoint,
             &self.payer,
             &self.ticker,

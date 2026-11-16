@@ -452,7 +452,9 @@ impl App {
                         &from_identity,
                         witness,
                         Self::get_timestamp(),
-                        rand::rng().next_u64(),
+                        // The server is the run's trusted coordinator here, and
+                        // draws the seed itself.
+                        Some(rand::rng().next_u64()),
                     ),
                 } {
                     warn!("Error when processing witness: {error}");
@@ -504,7 +506,7 @@ impl App {
                 self.backend.pending_clients.len(),
             )),
             Self::get_timestamp(),
-            rand::rng().next_u64(),
+            Some(rand::rng().next_u64()),
         ) {
             Ok(TickResult::EpochEnd(result)) => {
                 if result {
@@ -533,7 +535,8 @@ impl App {
                     warn!("Epoch abandoned")
                 }
             }
-            Ok(TickResult::Ticked) | Err(CoordinatorError::Halted) => {}
+            // The server always has a seed, so it never waits for one.
+            Ok(TickResult::Ticked | TickResult::NeedsSeed) | Err(CoordinatorError::Halted) => {}
             Err(err) => warn!("Coordinator tick error: {err}"),
         }
         self.post_state_change(true).await;

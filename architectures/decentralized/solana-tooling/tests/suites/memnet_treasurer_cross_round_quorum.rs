@@ -48,7 +48,7 @@ use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
+use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
@@ -569,9 +569,15 @@ async fn tick(
     coordinator_instance: &Pubkey,
     coordinator_account: &Pubkey,
 ) {
-    process_coordinator_tick(endpoint, payer, ticker, coordinator_instance, coordinator_account)
-        .await
-        .unwrap();
+    process_coordinator_tick_and_reveal(
+        endpoint,
+        payer,
+        ticker,
+        coordinator_instance,
+        coordinator_account,
+    )
+    .await
+    .unwrap();
 }
 
 /// Witnesses with every client, then closes the round. Witnessing is required:
@@ -624,7 +630,7 @@ async fn advance_one_round(
         .forward_clock_unix_timestamp(round_witness_time)
         .await
         .unwrap();
-    let _ = process_coordinator_tick(
+    let _ = process_coordinator_tick_and_reveal(
         endpoint,
         payer,
         ticker,

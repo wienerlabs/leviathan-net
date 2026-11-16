@@ -7,6 +7,7 @@ pub mod clients_state;
 mod instance_state;
 pub mod logic;
 mod program_error;
+pub mod round_seed;
 
 use anchor_lang::prelude::*;
 pub use client::Client;
@@ -161,11 +162,29 @@ impl CoordinatorAccount {
     /// version 1 had padding. The padding of a real version 1 account holds
     /// whatever the program's stack held, so a version 1 account is refused
     /// rather than read with that as a setting (wienerlabs/leviathan-net#60).
-    pub const VERSION: u64 = 2;
+    /// Version 3 added `seed_commit_slot`, the slot the next round's seed is
+    /// committed to (wienerlabs/leviathan-net#62).
+    pub const VERSION: u64 = 3;
 
     pub fn space_with_discriminator() -> usize {
         CoordinatorAccount::DISCRIMINATOR.len()
             + std::mem::size_of::<CoordinatorAccount>()
+    }
+
+    /// Whether `account` holds a coordinator account of this version: this
+    /// version's size, checked before the account is loaded, since loading an
+    /// account of another size panics, and the version it declares. An
+    /// account of another version is refused with a constraint error rather
+    /// than read as this one.
+    pub fn is_current(
+        account: &AccountLoader<CoordinatorAccount>,
+    ) -> Result<bool> {
+        if account.to_account_info().data_len()
+            != CoordinatorAccount::space_with_discriminator()
+        {
+            return Ok(false);
+        }
+        Ok(account.load()?.version == CoordinatorAccount::VERSION)
     }
 
     pub fn increment_nonce(&mut self) {
@@ -273,9 +292,10 @@ pub mod psyche_solana_coordinator {
     }
 
     pub fn tick(ctx: Context<PermissionlessCoordinatorAccounts>) -> Result<()> {
+        let slot_hashes = ctx.accounts.slot_hashes.try_borrow_data()?;
         let mut account = ctx.accounts.coordinator_account.load_mut()?;
         account.increment_nonce();
-        account.state.tick()
+        account.state.tick(Some(&slot_hashes))
     }
 
     #[allow(unused_variables)] // for the metadata field. adding a _ prefix results in anchor's IDL not matching the actual types. lol.
@@ -287,6 +307,7 @@ pub mod psyche_solana_coordinator {
         broadcast_merkle: MerkleRoot,
         metadata: WitnessMetadata,
     ) -> Result<()> {
+        let slot_hashes = ctx.accounts.slot_hashes.try_borrow_data()?;
         let mut account = ctx.accounts.coordinator_account.load_mut()?;
         account.increment_nonce();
         account.state.witness(
@@ -297,6 +318,7 @@ pub mod psyche_solana_coordinator {
                 broadcast_bloom,
                 broadcast_merkle,
             },
+            &slot_hashes,
         )
     }
 
@@ -308,6 +330,7 @@ pub mod psyche_solana_coordinator {
         broadcast_bloom: WitnessBloom,
         broadcast_merkle: MerkleRoot,
     ) -> Result<()> {
+        let slot_hashes = ctx.accounts.slot_hashes.try_borrow_data()?;
         let mut account = ctx.accounts.coordinator_account.load_mut()?;
         account.increment_nonce();
         account.state.warmup_witness(
@@ -318,6 +341,7 @@ pub mod psyche_solana_coordinator {
                 broadcast_bloom,
                 broadcast_merkle,
             },
+            &slot_hashes,
         )
     }
 
@@ -328,6 +352,7 @@ pub mod psyche_solana_coordinator {
         position: u64,
         index: u64,
     ) -> Result<()> {
+        let slot_hashes = ctx.accounts.slot_hashes.try_borrow_data()?;
         let mut account = ctx.accounts.coordinator_account.load_mut()?;
         account.increment_nonce();
         account.state.health_check(
@@ -340,6 +365,7 @@ pub mod psyche_solana_coordinator {
                     index,
                 },
             )],
+            &slot_hashes,
         )
     }
 
@@ -347,9 +373,12 @@ pub mod psyche_solana_coordinator {
         ctx: Context<PermissionlessCoordinatorAccounts>,
         repo: psyche_coordinator::model::Checkpoint,
     ) -> Result<()> {
+        let slot_hashes = ctx.accounts.slot_hashes.try_borrow_data()?;
         let mut account = ctx.accounts.coordinator_account.load_mut()?;
         account.increment_nonce();
-        account.state.checkpoint(ctx.accounts.user.key, repo)
+        account
+            .state
+            .checkpoint(ctx.accounts.user.key, repo, &slot_hashes)
     }
 
     pub fn slash_client(
@@ -401,7 +430,7 @@ pub struct OwnerCoordinatorAccounts<'info> {
     #[account(
         mut,
         constraint = coordinator_instance.coordinator_account == coordinator_account.key(),
-        constraint = coordinator_account.load()?.version == CoordinatorAccount::VERSION,
+        constraint = CoordinatorAccount::is_current(&coordinator_account)?,
     )]
     pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
 }
@@ -423,7 +452,13 @@ pub struct PermissionlessCoordinatorAccounts<'info> {
     #[account(
         mut,
         constraint = coordinator_instance.coordinator_account == coordinator_account.key(),
-        constraint = coordinator_account.load()?.version == CoordinatorAccount::VERSION,
+        constraint = CoordinatorAccount::is_current(&coordinator_account)?,
     )]
     pub coordinator_account: AccountLoader<'info, CoordinatorAccount>,
+
+    /// CHECK: the `SlotHashes` sysvar, by address. A round's seed is read
+    /// from it (wienerlabs/leviathan-net#62); it is read in place, being too
+    /// large to deserialize on chain.
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
 }

@@ -4,7 +4,10 @@
 //! Version 2 added the run's aggregation rule to the DisTrO optimizer, in what
 //! version 1 had as padding (wienerlabs/leviathan-net#60). The padding of a
 //! real version 1 account is whatever the program's stack held, so a version 1
-//! account has to be refused, not read with that as a setting.
+//! account has to be refused, not read with that as a setting. Version 3
+//! appended the commitment a round's seed is revealed from to the instance
+//! state (wienerlabs/leviathan-net#62), which moved the account's `nonce` and
+//! grew it by eight bytes.
 
 use std::collections::HashMap;
 
@@ -32,6 +35,7 @@ use psyche_solana_coordinator::coordinator_account_from_bytes;
 use psyche_solana_coordinator::logic::InitCoordinatorParams;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_coordinator::CoordinatorInstance;
+use psyche_solana_coordinator::CoordinatorInstanceState;
 use psyche_solana_coordinator::DeserializeCoordinatorFromBytes;
 use psyche_solana_coordinator::ProgramError;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
@@ -107,15 +111,34 @@ pub async fn a_version_one_account_is_refused_rather_than_misread() {
         padding > 1,
         "the version 1 padding holds {padding:#04x}, which happens to be a bool"
     );
+    // Version 3 is longer, so the size alone refuses it before its version is
+    // read; a version 2 account, the same size as version 1, is refused by
+    // its version.
     match coordinator_account_from_bytes(&bytes) {
-        Err(DeserializeCoordinatorFromBytes::InvalidVersion {
+        Err(DeserializeCoordinatorFromBytes::IncorrectSize {
             expected,
             actual,
         }) => {
-            assert_eq!((expected, actual), (2, 1));
+            assert_eq!(
+                expected,
+                CoordinatorAccount::space_with_discriminator()
+            );
+            assert_eq!(actual, bytes.len());
         },
         Err(other) => panic!("refused for the wrong reason: {other}"),
-        Ok(_) => panic!("a version 1 account was read as version 2"),
+        Ok(_) => panic!("a version 1 account was read as the current version"),
+    }
+    let mut same_size = as_current_version(bytes);
+    let version = CoordinatorAccount::DISCRIMINATOR.len()
+        + std::mem::offset_of!(CoordinatorAccount, version);
+    same_size[version..version + 8].copy_from_slice(&2u64.to_le_bytes());
+    match coordinator_account_from_bytes(&same_size) {
+        Err(DeserializeCoordinatorFromBytes::InvalidVersion {
+            expected,
+            actual,
+        }) => assert_eq!((expected, actual), (CoordinatorAccount::VERSION, 2)),
+        Err(other) => panic!("refused for the wrong reason: {other}"),
+        Ok(_) => panic!("a version 2 account was read as the current version"),
     }
 }
 
@@ -206,30 +229,37 @@ pub async fn the_aggregation_rule_round_trips_through_the_programs() {
 const VERSION_ONE: &[u8] =
     include_bytes!("../fixtures/coordinator-account-v1.so");
 
-/// What a version 1 account becomes in version 2: the same bytes, the version
-/// raised, and the byte that was padding set to the plain mean version 1 nodes
-/// took by default.
-fn as_version_two(mut bytes: Vec<u8>) -> Vec<u8> {
+/// What a version 1 account becomes in the current version: the same bytes,
+/// the version raised, the byte that was padding set to the plain mean version
+/// 1 nodes took by default, and an empty round seed commitment where version 3
+/// appended one, before the `nonce`.
+fn as_current_version(mut bytes: Vec<u8>) -> Vec<u8> {
     let version = CoordinatorAccount::DISCRIMINATOR.len()
         + std::mem::offset_of!(CoordinatorAccount, version);
     bytes[version..version + 8]
         .copy_from_slice(&CoordinatorAccount::VERSION.to_le_bytes());
     bytes[robust_aggregation_offset()] = 0;
+    let commitment = CoordinatorAccount::DISCRIMINATOR.len()
+        + std::mem::offset_of!(CoordinatorAccount, state)
+        + std::mem::offset_of!(CoordinatorInstanceState, seed_commit_slot);
+    bytes.splice(commitment..commitment, 0u64.to_le_bytes());
     bytes
 }
 
-/// Every field of the real version 1 account reads back as it did, once the
-/// version is raised and the old padding byte holds a valid rule: version 2
-/// moved nothing.
+/// Every field of the real version 1 account reads back as it did, once it is
+/// brought to the current version: version 2 moved nothing, and version 3 only
+/// appended.
 #[tokio::test]
-pub async fn version_two_moved_no_field_of_a_real_version_one_account() {
-    let coordinator_bytes = as_version_two(VERSION_ONE.to_vec());
+pub async fn the_current_version_moved_no_field_of_a_real_version_one_account()
+{
+    let coordinator_bytes = as_current_version(VERSION_ONE.to_vec());
     let coordinator_account =
         coordinator_account_from_bytes(&coordinator_bytes).unwrap();
     // Check the general layout for corruption
     assert_eq!(coordinator_account.version, CoordinatorAccount::VERSION);
     assert_eq!(coordinator_account.nonce, 2);
     let state = coordinator_account.state;
+    assert_eq!(state.seed_commit_slot, 0);
     assert_eq!(state.is_warmup_first_tick, SmallBoolean::FALSE);
     assert_eq!(state.is_training_first_tick, SmallBoolean::FALSE);
     assert_eq!(state.client_version, fixed_str("test"));
@@ -398,16 +428,18 @@ async fn chain_holding(
     (endpoint, coordinator_instance, coordinator_account)
 }
 
-/// The programs refuse to act on a version 1 account, whose old padding they
-/// would take for the run's aggregation rule. Its authority can still close
-/// it and take its rent back. The same account at version 2 is accepted, so
-/// the version is what is refused.
+/// The programs refuse to act on an account of another version, with a
+/// constraint error, which is why a program is never upgraded in place across
+/// an account version (docs/OPS_RUNBOOK.md). The same account brought to the
+/// current version is accepted, so the version is what is refused. Its
+/// authority can still close it and take its rent back, a power it already
+/// has over any run of its own, which it can pause and then close.
 #[tokio::test]
-pub async fn the_programs_refuse_a_version_one_account_except_to_close_it() {
+pub async fn the_programs_refuse_an_account_of_another_version() {
     let rehearsal = genesis_rehearsal();
     for (bytes, current) in [
         (VERSION_ONE.to_vec(), false),
-        (as_version_two(VERSION_ONE.to_vec()), true),
+        (as_current_version(VERSION_ONE.to_vec()), true),
     ] {
         let main_authority = Keypair::new();
         let (mut endpoint, coordinator_instance, coordinator_account) =
@@ -446,7 +478,7 @@ pub async fn the_programs_refuse_a_version_one_account_except_to_close_it() {
         }
 
         let spill = Keypair::new().pubkey();
-        process_coordinator_free(
+        let freed = process_coordinator_free(
             &mut endpoint,
             &payer,
             &main_authority,
@@ -454,15 +486,17 @@ pub async fn the_programs_refuse_a_version_one_account_except_to_close_it() {
             &coordinator_instance,
             &coordinator_account,
         )
-        .await
-        .unwrap();
+        .await;
+        freed.unwrap();
+        for closed in [coordinator_account, coordinator_instance] {
+            assert!(
+                endpoint.get_account(&closed).await.unwrap().is_none(),
+                "{closed} was not closed"
+            );
+        }
         assert!(
-            endpoint
-                .get_account(&coordinator_account)
-                .await
-                .unwrap()
-                .is_none(),
-            "the closed coordinator account is still there"
+            endpoint.get_account(&spill).await.unwrap().is_some(),
+            "the rent went nowhere"
         );
     }
 }

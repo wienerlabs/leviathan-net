@@ -50,7 +50,7 @@ Twelve steps, in order. The audit and counsel run on outside calendars, so they 
 7. **Milestone: 350M rehearsal and the retro.** Internal nodes train 350M, then the telemetry retro turns today's no-go into a go for 1B, or names what still blocks it. *Waits on GPUs.* ([net#10](https://github.com/wienerlabs/leviathan-net/issues/10), [leviathan#3](https://github.com/wienerlabs/leviathan/issues/3))
 8. **Milestone: first public run.** The 1B flagship, open to outsiders through the admission service, bondless as stage one and on devnet while the audit runs (owner decision 2), with a token target and a live loss curve. Until bonds switch on, a caught cheater forfeits its rewards and nothing else. *Waits on steps 1 to 7.* ([net#11](https://github.com/wienerlabs/leviathan-net/issues/11))
 9. **Audit, counsel, tokenomics, name and license close.** The audit closes its critical and high findings, counsel's memo lands, and the token numbers, the license and the name are locked. *Outside calendar: waits on outside parties and the owner.* ([leviathan#6](https://github.com/wienerlabs/leviathan/issues/6), [leviathan#10](https://github.com/wienerlabs/leviathan/issues/10))
-10. **Milestone: deploy to mainnet.** Fresh program keys made offline, Squads as upgrade and run authority, round seeds from VRF or a recent blockhash, a dedicated RPC, monitoring with on-call. *Waits on step 9.* ([leviathan#7](https://github.com/wienerlabs/leviathan/issues/7))
+10. **Milestone: deploy to mainnet.** Fresh program keys made offline, Squads as upgrade and run authority, a dedicated RPC, monitoring with on-call. *Waits on step 9.* ([leviathan#7](https://github.com/wienerlabs/leviathan/issues/7))
 11. **Milestone: mainnet Genesis Run with bonds on, and the TGE.** A written go memo from engineering, ops and counsel, the red team live with a funded endowment, then unpause. For the first 24 hours, nothing changes except an emergency pause. *Waits on step 10.* ([leviathan#8](https://github.com/wienerlabs/leviathan/issues/8), [leviathan#2](https://github.com/wienerlabs/leviathan/issues/2))
 12. **Milestone: close the second loop.** Inference v0 pays the treasury, a Wienerpad futarchy market picks the next model, and the treasury funds its run. *Waits on step 11.*
 
@@ -115,7 +115,7 @@ Sourced from the issues in the three repositories, the task ladder and the launc
 | Open, milestone | **Telemetry retro: go or no-go for 1B.** The decision is no-go until the Phase 2 gates pass. | Training and data | [leviathan#3](https://github.com/wienerlabs/leviathan/issues/3) |
 | Open, milestone | **First public run: the 1B flagship, bondless stage one.** Public invitation, a finish line in tokens, a loss curve anyone can watch. | Training and data | [net#11](https://github.com/wienerlabs/leviathan-net/issues/11) |
 
-### Phase 3, Mainnet: 5 of 21 done
+### Phase 3, Mainnet: 6 of 21 done
 
 | Status | Item | Track | Ref |
 |---|---|---|---|
@@ -124,10 +124,10 @@ Sourced from the issues in the three repositories, the task ladder and the launc
 | Done | **Tokenomics and TGE design for $LEVI.** Squads custody, no launchpad, no yield; final numbers wait on counsel. | Economics | [TOKENOMICS](https://github.com/wienerlabs/leviathan/blob/main/docs/TOKENOMICS.md) |
 | Done | **Mainnet deploy runbook.** Prerequisites, program order, authority handover, emergency path. | Network | [MAINNET_DEPLOY](https://github.com/wienerlabs/leviathan/blob/main/docs/launch/MAINNET_DEPLOY.md) |
 | Done | **Genesis launch checklist and disclosures.** Launch-day sequence and the kill criteria. | Product | [GENESIS_LAUNCH](https://github.com/wienerlabs/leviathan/blob/main/docs/launch/GENESIS_LAUNCH.md) |
+| Done | **Round seeds no client or ticker can grind.** Committed to a slot before its hash exists and revealed from the `SlotHashes` sysvar, with no witness, health check or pause taken in between, in place of sha256 of the timestamp and slot. The committed slot's leader still chooses; see the risks below. | Protocol | [net#62](https://github.com/wienerlabs/leviathan-net/issues/62) |
 | Open | **Outside security audit, critical and high closed.** The gate for bonds, mainnet and the TGE. | Audit and legal | [leviathan#4](https://github.com/wienerlabs/leviathan/issues/4) |
 | Open | **Legal opinion on the bond and the token.** Classification, collateral and payout structure. | Audit and legal | [leviathan#5](https://github.com/wienerlabs/leviathan/issues/5) |
 | Open | **Token numbers locked after counsel.** Allocation, vesting, emission and the real bond parameters. | Economics | [leviathan#6](https://github.com/wienerlabs/leviathan/issues/6) |
-| Open | **Round seeds that cannot be ground.** VRF or a recent blockhash in place of sha256 of the timestamp and slot. | Protocol | [TASKS](https://github.com/wienerlabs/leviathan/blob/main/docs/TASKS.md) |
 | Open | **Fresh mainnet program keys under Squads.** Made offline; Squads holds the upgrade authority and the run authority. | Protocol | [MAINNET_DEPLOY](https://github.com/wienerlabs/leviathan/blob/main/docs/launch/MAINNET_DEPLOY.md) |
 | Open | **Collateral mint chosen.** A stable token or the network token, per the legal structure. | Economics | [MAINNET_DEPLOY](https://github.com/wienerlabs/leviathan/blob/main/docs/launch/MAINNET_DEPLOY.md) |
 | Open | **Dedicated mainnet RPC and websocket.** No public free endpoints on the critical path. | Network | [MAINNET_DEPLOY](https://github.com/wienerlabs/leviathan/blob/main/docs/launch/MAINNET_DEPLOY.md) |
@@ -191,7 +191,7 @@ Survival over speed. The alerts are already written in [docs/ops](https://github
 
 - CI does not compile the verifier, the daemon, the network or the client, so a broken verifier passes every gate ([leviathan#17](https://github.com/wienerlabs/leviathan/issues/17)).
 - The collusion capital figure ignores committee sampling and reads about an order of magnitude low ([leviathan#18](https://github.com/wienerlabs/leviathan/issues/18)).
-- Round seeds are sha256 of the timestamp and slot, which can be ground, until VRF or a recent blockhash replaces them.
+- A round's seed is the hash of the slot that committed it, and that slot's leader can try block variants until the seed suits it: a validator chooses the seeds of about its stake share of rounds, somewhat more if it also ticks. Whoever lands a conviction's last step can also land it before or after the round starts, one choice between two committees per conviction. A VRF would remove the first; a committee drawn from the roster as it stood at the commitment, the second.
 - Config strings written on chain are cut short without an error (192 bytes for a URL, 64 for a file template). The run-config test catches it. A multi-file data set needs a short mirror domain, because the verifier replays only Http data locations, not WeightedHttp.
 - Training data on one public host. At swarm scale the Hugging Face rate limits call for a mirror.
 - GPU supply and price for the 1B run.

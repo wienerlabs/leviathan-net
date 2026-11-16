@@ -97,6 +97,31 @@ pub fn coordinator_set_paused(
     )
 }
 
+/// The instructions that pause a run, or resume it, given whether the next
+/// round's seed is committed. While it is, the coordinator refuses a pause,
+/// which could cancel a round whose seed is about to be known
+/// (wienerlabs/leviathan-net#62), so `tick` goes first and starts that round,
+/// and the pause lets it finish. Only when nothing is committed does the
+/// pause go alone: a tick there could commit, and the pause behind it would
+/// be refused. `set_paused` is the coordinator's `set_paused`, or the
+/// treasurer's `run_update` that pauses through it.
+///
+/// Refused all the same, the pause is sent again a slot later, after `tick`
+/// alone: in the committed slot itself the round cannot start yet, and to a
+/// slot the sysvar no longer holds the tick in front renews the commitment,
+/// which the refused pause reverts with it.
+pub fn set_paused_instructions(
+    seed_committed: bool,
+    tick: Instruction,
+    set_paused: Instruction,
+) -> Vec<Instruction> {
+    if seed_committed {
+        vec![tick, set_paused]
+    } else {
+        vec![set_paused]
+    }
+}
+
 pub fn coordinator_join_run(
     coordinator_instance: &Pubkey,
     coordinator_account: &Pubkey,
@@ -166,6 +191,7 @@ pub fn coordinator_tick(
             user: *user,
             coordinator_instance: *coordinator_instance,
             coordinator_account: *coordinator_account,
+            slot_hashes: anchor_client::solana_sdk::sysvar::slot_hashes::ID,
         },
         psyche_solana_coordinator::instruction::Tick {},
     )
@@ -184,6 +210,7 @@ pub fn coordinator_witness(
             user: *user,
             coordinator_instance: *coordinator_instance,
             coordinator_account: *coordinator_account,
+            slot_hashes: anchor_client::solana_sdk::sysvar::slot_hashes::ID,
         },
         psyche_solana_coordinator::instruction::Witness {
             proof: witness.proof,
@@ -207,6 +234,7 @@ pub fn coordinator_warmup_witness(
             user: *user,
             coordinator_instance: *coordinator_instance,
             coordinator_account: *coordinator_account,
+            slot_hashes: anchor_client::solana_sdk::sysvar::slot_hashes::ID,
         },
         psyche_solana_coordinator::instruction::WarmupWitness {
             proof: witness.proof,
@@ -230,6 +258,7 @@ pub fn coordinator_health_check(
             user: *user,
             coordinator_instance: *coordinator_instance,
             coordinator_account: *coordinator_account,
+            slot_hashes: anchor_client::solana_sdk::sysvar::slot_hashes::ID,
         },
         psyche_solana_coordinator::instruction::HealthCheck {
             id: client_id,
@@ -252,6 +281,7 @@ pub fn coordinator_checkpoint(
             user: *user,
             coordinator_instance: *coordinator_instance,
             coordinator_account: *coordinator_account,
+            slot_hashes: anchor_client::solana_sdk::sysvar::slot_hashes::ID,
         },
         psyche_solana_coordinator::instruction::Checkpoint { repo },
     )
@@ -572,5 +602,47 @@ fn anchor_instruction<Accounts: ToAccountMetas, Args: InstructionData>(
         program_id,
         accounts: accounts.to_account_metas(None),
         data: args.data(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anchor_client::solana_sdk::signature::Keypair;
+    use anchor_client::solana_sdk::signer::Signer;
+
+    use super::*;
+
+    fn instructions_for(seed_committed: bool) -> (Vec<Instruction>, Instruction, Instruction) {
+        let run_id = "leviathan pause";
+        let authority = Keypair::new().pubkey();
+        let coordinator_instance = psyche_solana_coordinator::find_coordinator_instance(run_id);
+        let coordinator_account = Keypair::new().pubkey();
+        let tick = coordinator_tick(&coordinator_instance, &coordinator_account, &authority);
+        let pause = coordinator_set_paused(run_id, &coordinator_account, &authority, true);
+        (
+            set_paused_instructions(seed_committed, tick.clone(), pause.clone()),
+            tick,
+            pause,
+        )
+    }
+
+    /// With a round's seed committed, the pause is preceded by the tick that
+    /// starts that round, which reads the `SlotHashes` sysvar.
+    #[test]
+    fn a_pause_behind_a_committed_seed_ticks_first() {
+        let (sent, tick, pause) = instructions_for(true);
+        assert_eq!(sent, vec![tick.clone(), pause]);
+        assert!(tick
+            .accounts
+            .iter()
+            .any(|meta| meta.pubkey == anchor_client::solana_sdk::sysvar::slot_hashes::ID));
+    }
+
+    /// With nothing committed the pause goes alone: a tick in front of it
+    /// could commit, and the pause would then be refused.
+    #[test]
+    fn a_pause_with_nothing_committed_goes_alone() {
+        let (sent, _, pause) = instructions_for(false);
+        assert_eq!(sent, vec![pause]);
     }
 }

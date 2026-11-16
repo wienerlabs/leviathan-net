@@ -31,7 +31,7 @@ use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
-use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
+use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
@@ -337,7 +337,7 @@ async fn run() -> Result<()> {
 
     println!("[+] driving into an active epoch");
     sleep_seconds(WAITING_EXTRA as u64).await;
-    let _ = process_coordinator_tick(
+    let _ = process_coordinator_tick_and_reveal(
         &mut endpoint,
         &payer,
         &ticker,
@@ -346,7 +346,7 @@ async fn run() -> Result<()> {
     )
     .await;
     sleep_seconds(WARMUP_TIME).await;
-    let _ = process_coordinator_tick(
+    let _ = process_coordinator_tick_and_reveal(
         &mut endpoint,
         &payer,
         &ticker,
@@ -525,7 +525,7 @@ async fn run() -> Result<()> {
     let mut target_slashed = 0;
     for _ in 0..24 {
         sleep_seconds(COOLDOWN_TIME).await;
-        let _ = process_coordinator_tick(
+        let _ = process_coordinator_tick_and_reveal(
             &mut endpoint,
             &payer,
             &ticker,

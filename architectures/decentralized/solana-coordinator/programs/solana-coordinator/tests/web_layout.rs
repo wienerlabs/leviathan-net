@@ -203,10 +203,12 @@ fn layout_matches_the_web_decoder() {
 /// field, so both have to be what the web repo checks for. Version 2 added the
 /// run's aggregation rule where version 1 had padding: no field moved and the
 /// account kept its size, but the dashboard has to accept the new version
-/// (wienerlabs/leviathan-net#60).
+/// (wienerlabs/leviathan-net#60). Version 3 appended the round seed's
+/// commitment to the instance state, which moved `nonce` and grew the account
+/// by eight bytes (wienerlabs/leviathan-net#62).
 #[test]
 fn account_is_the_size_the_dashboard_expects() {
-    assert_eq!(CoordinatorAccount::VERSION, 2);
+    assert_eq!(CoordinatorAccount::VERSION, 3);
     assert_eq!(
         CoordinatorAccount::space_with_discriminator(),
         8 + size_of::<CoordinatorAccount>()

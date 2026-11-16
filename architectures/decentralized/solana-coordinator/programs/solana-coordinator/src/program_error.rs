@@ -83,6 +83,12 @@ pub enum ProgramError {
 
     #[msg("A run's optimizer, its aggregation rule included, cannot change once the run has started")]
     ModelOptimizerFrozen,
+
+    #[msg("The next round's seed is committed: its witnesses and health checks are closed")]
+    RoundSeedCommitted,
+
+    #[msg("The SlotHashes sysvar could not be read")]
+    SlotHashesUnreadable,
 }
 
 impl From<CoordinatorError> for ProgramError {

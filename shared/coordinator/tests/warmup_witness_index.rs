@@ -66,7 +66,7 @@ fn an_out_of_range_warmup_witness_is_refused() {
     let mut coordinator = warming_up();
     assert!(
         coordinator
-            .warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, 7)
+            .warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, Some(7))
             .is_err(),
         "an index nobody can resolve is not a witness"
     );
@@ -82,10 +82,10 @@ fn an_out_of_range_warmup_witness_is_refused() {
 #[test]
 fn a_later_warmup_witness_is_unaffected() {
     let mut coordinator = warming_up();
-    let _ = coordinator.warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, 7);
+    let _ = coordinator.warmup_witness(&client(1).id, witness_with_index(u64::MAX), 1_000, Some(7));
 
     coordinator
-        .warmup_witness(&client(2).id, witness_with_index(1), 1_001, 7)
+        .warmup_witness(&client(2).id, witness_with_index(1), 1_001, Some(7))
         .expect("an honest witness with its own index still goes through");
     assert_eq!(coordinator.current_round().unwrap().witnesses.len(), 1);
 }
@@ -98,14 +98,14 @@ fn a_warmup_witness_cannot_claim_another_clients_index() {
     let mut coordinator = warming_up();
     assert!(
         coordinator
-            .warmup_witness(&client(1).id, witness_with_index(2), 1_000, 7)
+            .warmup_witness(&client(1).id, witness_with_index(2), 1_000, Some(7))
             .is_err(),
         "client 1 sits at index 0, not index 2"
     );
 
     // And the client whose index was borrowed can still witness for itself.
     coordinator
-        .warmup_witness(&client(3).id, witness_with_index(2), 1_001, 7)
+        .warmup_witness(&client(3).id, witness_with_index(2), 1_001, Some(7))
         .expect("client 3 does sit at index 2");
 }
 
@@ -116,14 +116,14 @@ fn every_client_may_witness_once_from_its_own_index() {
     let mut coordinator = warming_up();
     for (index, seed) in [(0u64, 1u8), (1, 2)] {
         coordinator
-            .warmup_witness(&client(seed).id, witness_with_index(index), 1_000, 7)
+            .warmup_witness(&client(seed).id, witness_with_index(index), 1_000, Some(7))
             .expect("warmup is open to everyone");
     }
     assert_eq!(coordinator.current_round().unwrap().witnesses.len(), 2);
 
     assert!(
         coordinator
-            .warmup_witness(&client(1).id, witness_with_index(0), 1_002, 7)
+            .warmup_witness(&client(1).id, witness_with_index(0), 1_002, Some(7))
             .is_err(),
         "twice is still a duplicate"
     );
