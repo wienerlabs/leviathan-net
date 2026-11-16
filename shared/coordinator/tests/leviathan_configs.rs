@@ -1,4 +1,5 @@
 use psyche_coordinator::{CoordinatorConfig, model::Model};
+use psyche_core::OptimizerDefinition;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
@@ -34,6 +35,20 @@ fn leviathan_run_configs_parse_and_pass_checks() {
         assert!(
             run.model.check(),
             "{} fails the model check",
+            path.display()
+        );
+        // A Leviathan run defends against a poisoning coalition, and says so
+        // on chain, where every node reads it (wienerlabs/leviathan-net#60).
+        let Model::LLM(llm) = run.model;
+        assert!(
+            matches!(
+                llm.optimizer,
+                OptimizerDefinition::Distro {
+                    robust_aggregation: true,
+                    ..
+                }
+            ),
+            "{} does not aggregate robustly",
             path.display()
         );
 

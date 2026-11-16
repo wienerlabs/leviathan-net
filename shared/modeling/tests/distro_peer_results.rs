@@ -219,11 +219,39 @@ fn values_beyond_the_safe_range_are_skipped_and_values_within_it_stay_finite() {
     ));
     assert_eq!(distro.check_results(&*model, &at_bound), Ok(()));
 
-    let after = applied(&recipe, &[honest, at_bound]).unwrap();
+    // Under either rule a run can choose: the mean sums them through the
+    // decode, robust aggregation also squares them to measure each peer.
+    for robust_aggregation in [false, true] {
+        let after = applied(
+            &recipe.aggregating(robust_aggregation),
+            &[honest.clone(), at_bound.clone()],
+        )
+        .unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|parameter| bool::try_from(parameter.isfinite().all()).unwrap()),
+            "values at the safe bound left a parameter non-finite (robust: {robust_aggregation})"
+        );
+    }
+}
+
+/// A run's aggregation rule decides with nothing set in the process's
+/// environment: a node of a run that aggregates robustly does so, and one of a
+/// run that takes the mean does that. The robust suite shows the reverse, that
+/// the environment cannot turn a mean run robust (wienerlabs/leviathan-net#60).
+#[test]
+fn a_runs_aggregation_rule_decides_on_its_own() {
+    let recipe = genesis_recipe();
+    let peers = [
+        peer_results(&recipe, &batch(&recipe, 3)),
+        peer_results(&recipe, &batch(&recipe, 11)),
+        peer_results(&recipe, &batch(&recipe, 17)),
+    ];
+    let robust = applied(&recipe.aggregating(true), &peers).unwrap();
+    let mean = applied(&recipe.aggregating(false), &peers).unwrap();
     assert!(
-        after
-            .iter()
-            .all(|parameter| bool::try_from(parameter.isfinite().all()).unwrap()),
-        "values at the safe bound left a parameter non-finite"
+        !same(&robust, &mean),
+        "a robust run and a mean run applied the same update"
     );
 }

@@ -350,6 +350,7 @@ impl From<ConstantLR> for LearningRateSchedule {
     Debug,
     Zeroable,
     Copy,
+    PartialEq,
     TS,
 )]
 #[repr(C)]
@@ -368,6 +369,15 @@ pub enum OptimizerDefinition {
         compression_topk: u16,
         compression_chunk: u16,
         quantize_1bit: bool,
+        /// How every node combines its peers' results: robustly, excising
+        /// outliers and clipping each peer's deviation to the median radius,
+        /// or by their plain mean. It is the run's choice, read from chain by
+        /// every node, because the aggregate is what each node applies to its
+        /// own copy of the model, and two rules applied to the same results
+        /// leave two different models (wienerlabs/leviathan-net#60). A config
+        /// that does not say keeps the mean.
+        #[serde(default)]
+        robust_aggregation: bool,
     },
 }
 

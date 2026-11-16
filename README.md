@@ -171,7 +171,7 @@ curl -fsSL https://raw.githubusercontent.com/wienerlabs/leviathan-net/main/scrip
 
 ## Where it stands
 
-The protocol is live on devnet. Not there yet: the model is a test model (Nano-Llama, 30-token vocabulary); joining needs a per-node authorization from the run's join authority; bonds with real value wait on the external audit (wienerlabs/leviathan#4), so the planned first mainnet stage is bondless ([config/leviathan/mainnet-genesis-bondless.toml](config/leviathan/mainnet-genesis-bondless.toml)); the programs are not deployed on mainnet-beta; the verifier daemon can replay only a run's first step (#48); robust aggregation sits behind `LEVIATHAN_ROBUST_AGG` and is off by default. The internal security review is public in [docs/SECURITY_REVIEW_INTERNAL.md](docs/SECURITY_REVIEW_INTERNAL.md).
+The protocol is live on devnet. Not there yet: the model is a test model (Nano-Llama, 30-token vocabulary); joining needs a per-node authorization from the run's join authority; bonds with real value wait on the external audit (wienerlabs/leviathan#4), so the planned first mainnet stage is bondless ([config/leviathan/mainnet-genesis-bondless.toml](config/leviathan/mainnet-genesis-bondless.toml)); the programs are not deployed on mainnet-beta; the verifier daemon can replay only a run's first step (#48); robust aggregation is now a per-run rule on chain (`robust_aggregation` in the DisTrO optimizer), on in every Leviathan config, but the deployed programs predate it (#60). The internal security review is public in [docs/SECURITY_REVIEW_INTERNAL.md](docs/SECURITY_REVIEW_INTERNAL.md).
 
 ## Phones
 

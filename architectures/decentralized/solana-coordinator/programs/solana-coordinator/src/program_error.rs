@@ -80,6 +80,9 @@ pub enum ProgramError {
 
     #[msg("Coordinator error: Slash outside an epoch that will be charged")]
     CoordinatorErrorSlashOutsideEpoch,
+
+    #[msg("A run's optimizer, its aggregation rule included, cannot change once the run has started")]
+    ModelOptimizerFrozen,
 }
 
 impl From<CoordinatorError> for ProgramError {

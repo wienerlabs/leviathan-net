@@ -49,6 +49,7 @@ fn distro_optimizer() -> OptimizerDefinition {
         compression_topk: 8,
         compression_chunk: 64,
         quantize_1bit: false,
+        robust_aggregation: false,
         weight_decay: None,
     }
 }

@@ -170,6 +170,14 @@ Build the program first with `cargo build-sbf --manifest-path <program>/Cargo.to
 a frame-size warning on a new instruction means it may not fit the BPF stack.
 Never re-run the create-run deploy path, which mints a new id.
 
+Check `CoordinatorAccount::VERSION` before upgrading in place. A coordinator
+program refuses accounts of any other version, and the treasurer's claim and
+withdrawal check it too, so upgrading a program whose accounts are an older
+version leaves every run on it unable to pay out or release a bond, until a
+migration instruction exists. Version 2 (wienerlabs/leviathan-net#60) has none:
+deploy it under new ids, as `DEVNET.md` describes, where no older account
+exists.
+
 ## Going to mainnet
 
 Mainnet arrives in two stages, because the audit gates money and nothing else.

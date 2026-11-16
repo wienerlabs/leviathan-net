@@ -49,6 +49,7 @@ impl Optimizer {
                 compression_topk,
                 compression_chunk,
                 quantize_1bit,
+                robust_aggregation,
             } => Self::Distro {
                 optimizer: Distro::new(
                     model,
@@ -56,6 +57,7 @@ impl Optimizer {
                     compression_chunk as i64,
                     compression_topk as i64,
                     weight_decay.unwrap_or(0.0) as f64,
+                    robust_aggregation,
                 )
                 .into(),
                 clip_grad_norm,

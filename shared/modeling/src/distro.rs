@@ -559,6 +559,11 @@ pub struct Distro {
     compression_decay: f64,
     compression_topk: i64,
     weight_decay: f64,
+    /// The run's aggregation rule, `OptimizerDefinition::Distro`'s
+    /// `robust_aggregation`. Nothing about the process this runs in can
+    /// change it, so every node of a run applies the same update
+    /// (wienerlabs/leviathan-net#60).
+    robust_aggregation: bool,
     state: Vec<State>,
     transform: TransformDCT,
 }
@@ -570,6 +575,7 @@ impl Distro {
         compression_chunk: i64,
         compression_topk: i64,
         weight_decay: f64,
+        robust_aggregation: bool,
     ) -> Self {
         let _no_grad = tch::no_grad_guard();
         let mut sgd = COptimizer::sgd(0.1, 0.0, 0.0, 0.0, false).unwrap();
@@ -592,6 +598,7 @@ impl Distro {
             compression_decay,
             compression_topk,
             weight_decay,
+            robust_aggregation,
             state,
             transform,
         }
@@ -910,9 +917,7 @@ impl Distro {
             return;
         }
 
-        let robust = std::env::var("LEVIATHAN_ROBUST_AGG")
-            .map(|value| !value.is_empty())
-            .unwrap_or(false);
+        let robust = self.robust_aggregation;
 
         for (index, var) in vars.variables().enumerate() {
             let variable = var.logical_tensor();

@@ -1,42 +1,45 @@
-//! Robust aggregation squares every value of a variable when it measures a
-//! peer's distance, so the safe range the check enforces has to hold there as
-//! well (wienerlabs/leviathan-net#41). Its own test binary, because it turns
-//! robust aggregation on for the whole process.
+//! How a node combines its peers' results is the run's rule, read from chain,
+//! and nothing else: it used to be whatever `LEVIATHAN_ROBUST_AGG` said in the
+//! process a node ran in, so two honest nodes of one run could apply different
+//! updates to the same results and silently hold different models
+//! (wienerlabs/leviathan-net#60). Its own test binary, because it sets that
+//! variable for the whole process to show it is ignored.
 
 mod common;
 
 use common::*;
-use tch::Kind;
 
 #[test]
-fn values_at_the_safe_bound_stay_finite_under_robust_aggregation() {
-    // Set before any `apply` runs in this process; nothing else here reads it.
+fn the_runs_rule_alone_decides_how_peers_are_combined() {
+    // Set before any `apply` runs in this process, to show it decides nothing.
     unsafe { std::env::set_var("LEVIATHAN_ROBUST_AGG", "1") };
 
-    let recipe = genesis_recipe();
-    let honest = peer_results_quantized(&recipe, &batch(&recipe, 3), false);
-    let second = peer_results_quantized(&recipe, &batch(&recipe, 11), false);
-    let mut at_bound = honest.clone();
-    for (index, result) in honest.iter().enumerate() {
-        let numel: i64 = result.xshape.iter().product();
-        let bound = (f32::MAX / numel as f32).sqrt() / 2.0;
-        at_bound[index] = rebuilt(
-            result,
-            result.sparse_idx.copy(),
-            result
-                .sparse_val
-                .to_kind(Kind::Float)
-                .full_like(bound as f64),
-        );
-    }
-
-    let (model, distro) = trained_node(&recipe);
-    assert_eq!(distro.check_results(&*model, &at_bound), Ok(()));
-    let after = applied(&recipe, &[honest, second, at_bound]).unwrap();
+    let genesis = genesis_recipe();
     assert!(
-        after
-            .iter()
-            .all(|parameter| bool::try_from(parameter.isfinite().all()).unwrap()),
-        "values at the safe bound left a parameter non-finite under robust aggregation"
+        genesis.robust_aggregation,
+        "the genesis rehearsal aggregates robustly"
+    );
+    let peers = [
+        peer_results(&genesis, &batch(&genesis, 3)),
+        peer_results(&genesis, &batch(&genesis, 11)),
+        peer_results(&genesis, &batch(&genesis, 17)),
+    ];
+
+    // Two nodes of a run that aggregates robustly apply the same update.
+    let robust = applied(&genesis.aggregating(true), &peers).unwrap();
+    let robust_again = applied(&genesis.aggregating(true), &peers).unwrap();
+    assert!(same(&robust, &robust_again));
+
+    // Two nodes of a run that takes the mean apply the same update too, the
+    // environment saying otherwise notwithstanding.
+    let mean = applied(&genesis.aggregating(false), &peers).unwrap();
+    let mean_again = applied(&genesis.aggregating(false), &peers).unwrap();
+    assert!(same(&mean, &mean_again));
+
+    // And the rule is what tells them apart: robust aggregation clips each
+    // peer's deviation, so it is not the mean even over honest peers.
+    assert!(
+        !same(&robust, &mean),
+        "the two rules applied the same update, so the run's rule decided nothing"
     );
 }

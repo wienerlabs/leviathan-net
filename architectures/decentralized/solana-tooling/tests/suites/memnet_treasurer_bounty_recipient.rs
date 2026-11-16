@@ -218,6 +218,7 @@ pub async fn the_slashed_client_cannot_name_itself_as_the_bounty_recipient() {
                     compression_topk: 1,
                     compression_chunk: 1,
                     quantize_1bit: false,
+                    robust_aggregation: false,
                     weight_decay: None,
                 },
                 cold_start_warmup_steps: 0,

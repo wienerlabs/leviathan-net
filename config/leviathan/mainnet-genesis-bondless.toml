@@ -78,3 +78,6 @@ compression_decay = 0.999
 compression_chunk = 64
 compression_topk = 8
 quantize_1bit = true
+# Every node combines its peers' results robustly, by the run's rule rather
+# than its own (wienerlabs/leviathan-net#60).
+robust_aggregation = true

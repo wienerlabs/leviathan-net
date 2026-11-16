@@ -16,6 +16,13 @@ the published operating point.
 - `min_clients = 2` so the swarm actually aggregates across nodes.
 - The DisTrO block is the SparseLoCo transport: chunked top-k at chunk 64, topk 8,
   1-bit sign, decay 0.999. `max_round_train_time` sets the DiLoCo outer cadence.
+- `robust_aggregation = true`: every node combines its peers' results robustly,
+  excising outliers and clipping each peer's deviation to the median radius,
+  which bounds what a poisoning coalition can move the model. It is the run's
+  rule, on chain, so every node applies the same update (#60). It holds every
+  peer's result for a variable densely at once, so its memory grows with the
+  peers times the largest variable; a run too large for that can set it to
+  false and take the plain mean, which a config that omits it also does.
 - The model and data are the same real, HTTP-fetchable ones a client trained on
   live devnet, so remote volunteers can join.
 

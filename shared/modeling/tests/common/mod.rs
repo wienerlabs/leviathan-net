@@ -25,6 +25,7 @@ pub struct RunConfig {
 }
 
 /// The model and the DisTrO settings the genesis rehearsal runs with.
+#[derive(Clone)]
 pub struct Recipe {
     pub repo_files: Vec<PathBuf>,
     pub max_seq_len: usize,
@@ -32,7 +33,18 @@ pub struct Recipe {
     pub compression_chunk: i64,
     pub compression_topk: i64,
     pub quantize_1bit: bool,
+    pub robust_aggregation: bool,
     pub lr: f64,
+}
+
+impl Recipe {
+    /// The same run, aggregating by `robust_aggregation` instead.
+    pub fn aggregating(&self, robust_aggregation: bool) -> Recipe {
+        Recipe {
+            robust_aggregation,
+            ..self.clone()
+        }
+    }
 }
 
 pub fn genesis_recipe() -> Recipe {
@@ -50,6 +62,7 @@ pub fn genesis_recipe() -> Recipe {
         compression_chunk,
         compression_topk,
         quantize_1bit,
+        robust_aggregation,
         ..
     } = llm.optimizer
     else {
@@ -70,6 +83,7 @@ pub fn genesis_recipe() -> Recipe {
         compression_chunk: compression_chunk as i64,
         compression_topk: compression_topk as i64,
         quantize_1bit,
+        robust_aggregation,
         lr: llm.lr_schedule.get_lr(llm.lr_schedule.get_warmup_steps()),
     }
 }
@@ -95,6 +109,7 @@ pub fn distro(recipe: &Recipe, model: &dyn CausalLM) -> Distro {
         recipe.compression_chunk,
         recipe.compression_topk,
         0.0,
+        recipe.robust_aggregation,
     )
 }
 

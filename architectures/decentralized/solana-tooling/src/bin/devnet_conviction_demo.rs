@@ -23,6 +23,7 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_participant;
+use psyche_solana_tooling::get_accounts::ensure_coordinator_version;
 use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::payload_dump_digest;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
@@ -211,6 +212,8 @@ async fn main() -> Result<()> {
     println!("    on-chain bond_amount = {}", participant.bond_amount);
 
     println!("[+] configuring and unpausing the run (slashing_rate = {})", SLASHING_RATE);
+    // The run's model goes on chain next, in the layout this build speaks.
+    ensure_coordinator_version(&mut endpoint, &coordinator_account).await?;
     process_treasurer_run_update(
         &mut endpoint,
         &payer,
@@ -249,6 +252,7 @@ async fn main() -> Result<()> {
                     compression_topk: 1,
                     compression_chunk: 1,
                     quantize_1bit: false,
+                    robust_aggregation: true,
                     weight_decay: None,
                 },
                 cold_start_warmup_steps: 0,
