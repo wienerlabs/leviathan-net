@@ -4,21 +4,27 @@ use std::path::PathBuf;
 
 use anyhow::anyhow;
 use anyhow::Result;
+use leviathan_telemetry::verifier::PassReport;
 use leviathan_verifier::decompress_dump;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
 use psyche_coordinator::select_audits_for_current_round;
+use psyche_coordinator::ClientState;
 use psyche_coordinator::Coordinator;
 use psyche_core::BatchId;
+use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::state::commitment_run;
 use psyche_solana_treasurer::state::committee_matches_roster;
+use psyche_solana_treasurer::state::AuditVerdict;
 use psyche_solana_treasurer::state::CommitmentEvidence;
+use psyche_solana_treasurer::state::VerdictStatus;
 use psyche_verifier::hash_delta;
 use psyche_verifier::verify_within_band;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
 use tch::Device;
 
 use crate::get_accounts::get_coordinator_account_state;
@@ -85,6 +91,69 @@ fn audit_assignments(
     }
 }
 
+/// Whether the chain already holds what a refused submission would have put
+/// there: a conviction of `target` in this epoch, landed or still in its
+/// windows, or `verifier`'s own vote against it in the round under way. A
+/// refusal for that reason is a proof the chain already has, not one it never
+/// saw (wienerlabs/leviathan-net#57).
+async fn already_on_chain(
+    endpoint: &mut solana_toolbox_endpoint::ToolboxEndpoint,
+    coordinator_account: &Pubkey,
+    run: &Pubkey,
+    target: &Pubkey,
+    verifier: &Pubkey,
+) -> Result<bool> {
+    let (epoch, round_height, ejected) = {
+        let state =
+            get_coordinator_account_state(endpoint, coordinator_account)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "coordinator account {coordinator_account} not found"
+                    )
+                })?;
+        let coordinator = &state.coordinator;
+        let roster = coordinator.epoch_state.clients.iter();
+        let exited = coordinator.epoch_state.exited_clients.iter();
+        let ejected = roster.chain(exited).any(|client| {
+            *client.id.signer() == target.to_bytes()
+                && client.state == ClientState::Ejected
+        });
+        let round_height =
+            coordinator.current_round().map_or(0, |round| round.height);
+        (coordinator.progress.epoch, round_height, ejected)
+    };
+    if ejected {
+        return Ok(true);
+    }
+    let Some(account) = endpoint
+        .get_account(&find_audit_verdict(run, target))
+        .await?
+    else {
+        return Ok(false);
+    };
+    let Some(verdict) =
+        AuditVerdict::from_pda_account(&account.owner, &account.data)?
+    else {
+        return Ok(false);
+    };
+    let this_epoch = verdict.epoch == epoch;
+    Ok(match verdict.status {
+        VerdictStatus::SlashPending
+        | VerdictStatus::Challenged
+        | VerdictStatus::Upheld
+        | VerdictStatus::Due => this_epoch,
+        VerdictStatus::Voting => {
+            this_epoch
+                && verdict.round_height == round_height
+                && verdict.voters.contains(verifier)
+        },
+        // The chain found the target innocent of its last dispute, and holds
+        // nothing of this one.
+        VerdictStatus::Overturned => false,
+    })
+}
+
 pub async fn audit_pass(
     endpoint: &mut solana_toolbox_endpoint::ToolboxEndpoint,
     authority: &Keypair,
@@ -93,10 +162,13 @@ pub async fn audit_pass(
     config: &AuditConfig,
     replay: Option<&(dyn psyche_verifier::ReplayEngine + Sync)>,
     // What this session has settled: convicted committers by signer, and
-    // contributions already found within band by file key, so a long-running
-    // daemon neither slashes twice nor replays the same file every pass.
+    // contributions by file key once judged for good (within band, convicted,
+    // withheld, already on chain, or malformed), so a long-running daemon
+    // neither slashes twice nor replays the same file every pass. A
+    // contribution whose submission failed is not settled, and is judged and
+    // submitted again on the next pass.
     judged: &mut HashSet<String>,
-) -> Result<usize> {
+) -> Result<PassReport> {
     // The tie-breaker count comes from the run, because that is what the
     // treasurer gates votes with. Deriving it any other way picks a different
     // verifier set and every verdict is refused as `VerifierNotAssigned`
@@ -128,7 +200,7 @@ pub async fn audit_pass(
         ));
     }
     let device = Device::Cpu;
-    let mut new_convictions = 0usize;
+    let mut report = PassReport::default();
 
     for (key, submitted_path) in &submitted {
         let Some(committer) = parse_committer(submitted_path) else {
@@ -218,7 +290,18 @@ pub async fn audit_pass(
                 let Some(reference_path) = reference.get(key) else {
                     continue;
                 };
-                decompress_dump(reference_path, device)?
+                // This verifier's own reference: a dump it cannot read is its
+                // problem, not the target's, and is retried.
+                match decompress_dump(reference_path, device) {
+                    Ok(delta) => delta,
+                    Err(err) => {
+                        println!(
+                            "[verifier-daemon] retry {key} committer {committer}: cannot read the reference: {err:#}"
+                        );
+                        report.unreplayable += 1;
+                        continue;
+                    },
+                }
             }
             (None, Some(engine)) => {
                 // A replay reproduces only the first step of a cold-start
@@ -234,6 +317,7 @@ pub async fn audit_pass(
                         println!(
                             "[verifier-daemon] skip  {key} committer {committer} cannot be replayed: {err}"
                         );
+                        report.unreplayable += 1;
                         continue;
                     }
                 }
@@ -241,14 +325,36 @@ pub async fn audit_pass(
             (None, None) => unreachable!("checked above"),
         };
 
-        let submitted_delta = decompress_dump(submitted_path, device)?;
-        let verdict = verify_within_band(&submitted_delta, &reference_delta, config.band)?;
+        // A signed payload that does not decode, or does not fit the model the
+        // reference was replayed on, cannot be judged against it. It is set
+        // aside and the pass goes on: failing the pass here would let one such
+        // payload, retried every pass, stop this verifier judging anyone.
+        let verdict = match decompress_dump(submitted_path, device).and_then(
+            |submitted_delta| {
+                Ok(verify_within_band(
+                    &submitted_delta,
+                    &reference_delta,
+                    config.band,
+                )?)
+            },
+        ) {
+            Ok(verdict) => verdict,
+            Err(err) => {
+                println!(
+                    "[verifier-daemon] skip  {key} committer {committer}: its payload cannot be judged: {err:#}"
+                );
+                report.malformed += 1;
+                judged.insert(key.clone());
+                continue;
+            },
+        };
 
         if !verdict.fraud {
             println!(
                 "[verifier-daemon] ok    {key} committer {committer} distance {:.4} within band {:.4}",
                 verdict.distance, config.band
             );
+            report.cleared += 1;
             judged.insert(key.clone());
             continue;
         }
@@ -266,6 +372,7 @@ pub async fn audit_pass(
             signature: record.signature,
         };
         let replayed_hash = hash_delta(&reference_delta);
+        report.fraud_found += 1;
         println!(
             "[verifier-daemon] FRAUD {key} committer {committer} distance {:.4} exceeds band {:.4} (committed {} replayed {})",
             verdict.distance,
@@ -276,6 +383,7 @@ pub async fn audit_pass(
 
         if judged.contains(&committer) {
             println!("  already convicted {committer} this session, skipping");
+            judged.insert(key.clone());
             continue;
         }
 
@@ -286,7 +394,8 @@ pub async fn audit_pass(
         };
         if config.dry_run {
             println!("  [dry-run] would submit {action} for {committer} at epoch index {index}");
-            new_convictions += 1;
+            report.withheld += 1;
+            judged.insert(key.clone());
             continue;
         }
 
@@ -324,13 +433,43 @@ pub async fn audit_pass(
                 println!("  {action} submitted for {committer} at epoch index {index}");
                 judged.insert(committer);
                 judged.insert(key.clone());
-                new_convictions += 1;
+                report.submitted += 1;
             }
             Err(err) => {
-                println!("  {action} submission failed for {committer} at index {index}: {err:#}")
+                let target_signer = Pubkey::new_from_array(*target.signer());
+                match already_on_chain(
+                    endpoint,
+                    coordinator_account,
+                    run,
+                    &target_signer,
+                    &authority.pubkey(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        println!(
+                            "  {action} for {committer} refused, the chain already holds it: {err:#}"
+                        );
+                        judged.insert(committer);
+                        judged.insert(key.clone());
+                        report.already_on_chain += 1;
+                    },
+                    Ok(false) => {
+                        println!(
+                            "  {action} submission failed for {committer} at index {index}, retrying next pass: {err:#}"
+                        );
+                        report.submission_failures += 1;
+                    },
+                    Err(check) => {
+                        println!(
+                            "  {action} submission failed for {committer} at index {index}, and the chain could not be read to tell why: {err:#}; {check:#}"
+                        );
+                        report.submission_failures += 1;
+                    },
+                }
             }
         }
     }
 
-    Ok(new_convictions)
+    Ok(report)
 }

@@ -125,7 +125,7 @@ This fork carries the layer upstream left as dead code, wired to the reward engi
 | Bond-gated claim (`solana-treasurer`) | a participant whose unforfeited bond (posted, less convictions not yet settled) is below the minimum cannot claim its earnings, so nothing is taken without something left to slash |
 | Replay verifier (`shared/verifier`, `leviathan-verifier-daemon`) | relative L2 distance against a tolerance band. The daemon replays what peers broadcast and convicts on what they signed: every conviction carries the target's own p2p signature over its payload commitment (run, step, nonce, batch, and the sha256 of the payload bytes), which the treasurer checks on chain through the ed25519 precompile. The committed side of a fraud proof is therefore verified on chain; the replay side remains the committee's claim, which the appeals court exists to contest (#43) |
 | Band calibration (`tools/rust-tools/leviathan-verifier`) | `calibrate-band` measures honest drift per hardware class on the production replay path ([docs/BAND_CALIBRATION.md](docs/BAND_CALIBRATION.md)) |
-| Indexer (`tools/rust-tools/leviathan-indexer`) | reads a coordinator account and prints run telemetry and the economic security verdict as JSON |
+| Indexer (`tools/rust-tools/leviathan-indexer`) | reads a run off chain from its run id: prints its telemetry and economic security verdict as JSON, or serves them to Prometheus, where the kill-switch alerts in `telemetry/` watch them (#57) |
 
 Upstream's verifier dispatch was `Committee::Verifier => todo!()`, its `verification_percent` was pinned to zero by an assert, `ClientState::Ejected` was never set by any path, and the `slashed` counter no program read. All four are now live.
 

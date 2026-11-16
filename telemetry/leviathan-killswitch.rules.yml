@@ -1,3 +1,9 @@
+# Mainnet kill switches. Every series here is exported by
+# `leviathan-indexer --metrics-listen` (leviathan_run_*, leviathan_indexer_*),
+# which reads it off chain, or by `leviathan-verifier-daemon --metrics-listen`
+# (leviathan_verifier_*). `cargo test -p leviathan-indexer --test rules`
+# fails on a series no exporter has, and `telemetry/tests/` holds the
+# promtool tests of every alert (wienerlabs/leviathan-net#57).
 groups:
   - name: leviathan-killswitch
     rules:
@@ -9,40 +15,50 @@ groups:
           kill_switch: economic_insecurity
         annotations:
           summary: "Run {{ $labels.run_id }} is not economically secure"
-          description: "expected fraud value per round is positive at the published (p, bond, slash, reward)."
+          description: "At the run's own epoch rates and bond minimum, a cheat makes money in expectation: either the penalty is below the break-even penalty at the run's audit probability, or a round seats too few verifiers to convict anyone. Raise the slashing rate and the bond, or the audit percent, or lower the earning rate."
 
       - alert: LeviathanTreasuryDrain
-        expr: |
-          delta(leviathan_run_vault_balance[15m]) < -1 * leviathan_run_expected_claims_15m
-        for: 5m
+        expr: leviathan_run_bond_shortfall > 0
+        for: 0m
         labels:
           severity: critical
           kill_switch: treasury_drain
         annotations:
-          summary: "Unexpected vault drain on {{ $labels.run_id }}"
-          description: "Vault balance fell faster than explained claims/bounties in 15m."
+          summary: "The vault of {{ $labels.run_id }} holds less than the bonds posted into it"
+          description: "Short by {{ $value }} base units. Every outflow the treasurer allows keeps the bonds covered, so the vault was drained."
+
+      - alert: LeviathanTreasuryUnderfunded
+        expr: leviathan_run_obligation_shortfall > 0 and leviathan_run_bond_shortfall == 0
+        for: 15m
+        labels:
+          severity: high
+          kill_switch: treasury_underfunded
+        annotations:
+          summary: "The vault of {{ $labels.run_id }} cannot pay out every point earned"
+          description: "Short by {{ $value }} base units of the bonds plus every point credited and not yet claimed, each claimable once its holder keeps the bond minimum posted. Claims will start failing; top up the run's rewards."
 
       - alert: LeviathanMeshPartition
         expr: |
-          (leviathan_run_active_clients / clamp_min(leviathan_run_registered_clients, 1)) < 0.5
-          and leviathan_run_state == 1
+          leviathan_run_active_clients / clamp_min(leviathan_run_epoch_roster_size, 1) < 0.5
+          and leviathan_run_epoch_roster_size > 0
+          and leviathan_run_training == 1
         for: 10m
         labels:
           severity: high
           kill_switch: mesh_partition
         annotations:
           summary: "Mesh partition risk on {{ $labels.run_id }}"
-          description: "Active clients below 50% of registered while run is live."
+          description: "Fewer than half of the clients this epoch started with are still healthy in it."
 
       - alert: LeviathanHonestFalsePositive
-        expr: increase(leviathan_honest_slash_total[1h]) > 0
+        expr: increase(leviathan_run_overturned_convictions_total[1h]) > 0
         for: 0m
         labels:
           severity: critical
           kill_switch: honest_fpr
         annotations:
-          summary: "Honest client slash detected"
-          description: "Zero honest-node slashes is a hard PRD metric."
+          summary: "A conviction on {{ $labels.run_id }} was overturned on appeal"
+          description: "A verifier quorum convicted a target the tie-breakers found innocent. Zero honest-node slashes is a hard PRD metric."
 
       - alert: LeviathanIndexerLag
         expr: leviathan_indexer_slot_lag > 100
@@ -51,15 +67,98 @@ groups:
           severity: high
           kill_switch: indexer_lag
         annotations:
-          summary: "Indexer lagging chain by {{ $value }} slots"
+          summary: "Indexer lagging chain by {{ $value }} slots on {{ $labels.run_id }}"
           description: "Dashboard and automated responses are untrustworthy until caught up."
 
+      - alert: LeviathanIndexerStale
+        expr: time() - leviathan_indexer_snapshot_timestamp_seconds > 300
+        for: 5m
+        labels:
+          severity: high
+          kill_switch: indexer_lag
+        annotations:
+          summary: "The indexer's view of {{ $labels.run_id }} is more than five minutes old"
+          description: "Either its polls are failing or its RPC is behind the cluster. Every other alert on this run is reading old state."
+
+      - alert: LeviathanIndexerNotReading
+        expr: leviathan_indexer_last_poll_success == 0
+        for: 5m
+        labels:
+          severity: high
+          kill_switch: indexer_lag
+        annotations:
+          summary: "The indexer cannot read {{ $labels.run_id }} off chain"
+          description: "Every poll for five minutes failed. A run it never read once has no other series, so no other alert on it can fire; read the indexer's log."
+
+      - alert: LeviathanIndexerDown
+        expr: up{job="leviathan-indexer"} == 0
+        for: 5m
+        labels:
+          severity: high
+          kill_switch: indexer_lag
+        annotations:
+          summary: "The indexer at {{ $labels.instance }} cannot be scraped"
+          description: "No kill switch that reads the chain can fire while it is down."
+
       - alert: LeviathanUncaughtFraudSuspect
-        expr: increase(leviathan_fraud_proofs_total[1h]) > increase(leviathan_slash_events_total[1h])
-        for: 30m
+        expr: increase(leviathan_run_lapsed_disputes_total[1h]) > 0
+        for: 0m
         labels:
           severity: critical
           kill_switch: uncaught_fraud
         annotations:
-          summary: "Fraud proofs without matching slash events"
-          description: "Double-sell analogue kill switch: proof observed, conviction missing."
+          summary: "A fraud vote on {{ $labels.run_id }} lapsed without a quorum"
+          description: "A bonded verifier voted fraud with the target's signed commitment and the rest of its committee never joined it. Either a cheat escaped conviction or a verifier accused an honest node; replay the batch the verdict account names."
+
+      - alert: LeviathanDisputeOutcomeUnseen
+        expr: increase(leviathan_run_unseen_dispute_outcomes_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: high
+          kill_switch: honest_fpr
+        annotations:
+          summary: "A conviction on {{ $labels.run_id }} was replaced before its outcome was seen"
+          description: "A new dispute took the verdict account over before the indexer saw whether an appeal overturned the conviction. Read the account's transaction history: an overturn there is an honest node convicted."
+
+      - alert: LeviathanFraudNotSubmitted
+        expr: increase(leviathan_verifier_submission_failures_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          kill_switch: uncaught_fraud
+        annotations:
+          summary: "A verifier proved fraud on {{ $labels.run_id }} and could not put it on chain"
+          description: "The verifier at {{ $labels.instance }} holds a fraud proof the chain never saw. Read its log for the refused submission."
+
+      - alert: LeviathanVerifierDown
+        expr: up{job="leviathan-verifier"} == 0
+        for: 5m
+        labels:
+          severity: high
+          kill_switch: uncaught_fraud
+        annotations:
+          summary: "The verifier at {{ $labels.instance }} cannot be scraped"
+          description: "A verifier that is down audits nothing, and a fraud proof it holds goes unseen."
+
+      - alert: LeviathanVerifierFailing
+        expr: increase(leviathan_verifier_pass_errors_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: high
+          kill_switch: uncaught_fraud
+        annotations:
+          summary: "The verifier at {{ $labels.instance }} keeps failing its passes on {{ $labels.run_id }}"
+          description: "Its audit passes have failed for ten minutes before judging anything, so it audits nothing. Read its log."
+
+      - alert: LeviathanCommitteeCannotConvict
+        expr: |
+          leviathan_run_verifier_committee_size < leviathan_run_min_verifier_committee
+          and leviathan_run_audit_probability > 0
+          and leviathan_run_training == 1
+        for: 10m
+        labels:
+          severity: high
+          kill_switch: committee_too_small
+        annotations:
+          summary: "The verifier committee of {{ $labels.run_id }} is too small to convict"
+          description: "A round draws {{ $value }} verifier seats over this roster, and the treasurer refuses a verdict from fewer than its minimum committee. Only the run authority can convict until the roster grows or the audit percent rises."

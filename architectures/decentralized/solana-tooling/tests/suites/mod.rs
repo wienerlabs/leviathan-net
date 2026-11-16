@@ -9,6 +9,7 @@ mod memnet_coordinator_slash;
 mod memnet_distributor_claim_vesting;
 mod memnet_distributor_many_claims;
 mod memnet_distributor_single_claim;
+mod memnet_indexer;
 mod memnet_mining_pool_cap_deposits;
 mod memnet_mining_pool_full_cycle;
 mod memnet_mining_pool_live_freeze;

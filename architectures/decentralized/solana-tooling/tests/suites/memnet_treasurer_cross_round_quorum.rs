@@ -21,6 +21,9 @@
 //! from a later draw opens a fresh count rather than completing an old one.
 //! This test casts exactly those two votes and holds that nobody is convicted.
 
+use leviathan_indexer::live::read_run;
+use leviathan_indexer::verdicts::VerdictLedger;
+use leviathan_indexer::verdicts::VerdictTally;
 use psyche_coordinator::Committee;
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
@@ -340,6 +343,13 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         "one vote is below quorum, nothing should have happened yet"
     );
 
+    // The indexer reads the same story off chain (wienerlabs/leviathan-net#57):
+    // a vote below quorum in its own round is an open dispute, not a lapse.
+    let mut ledger = VerdictLedger::default();
+    let open = indexer_tally(&mut endpoint, &mut ledger).await;
+    assert_eq!(open.by_status[0], 1, "one dispute, voting");
+    assert_eq!((open.new_lapsed, open.new_convictions), (0, 0));
+
     let first_vote_round = round_height(&state_of(&mut endpoint, &coordinator_account).await);
 
     // Now wait. Each round reseeds the draw, so keep going until somebody who
@@ -370,6 +380,16 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         }
     }
     let second_voter = second_voter.expect("no newly seated verifier appeared in twenty rounds");
+
+    // Its round is over and the quorum never came: a fraud vote that lapsed,
+    // which the uncaught-fraud kill switch fires on. Counted once.
+    let lapsed = indexer_tally(&mut endpoint, &mut ledger).await;
+    assert_eq!(lapsed.by_status[0], 1);
+    assert_eq!(lapsed.new_lapsed, 1);
+    assert_eq!(
+        indexer_tally(&mut endpoint, &mut ledger).await.new_lapsed,
+        0
+    );
 
     // This is the whole finding in one assertion: the account about to complete
     // the quorum was not on the committee that cast the first vote.
@@ -409,6 +429,10 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         "an honest node is not ejected by two verifiers who were never seated \
          on the same committee"
     );
+    // The account now shows the fresh dispute, open in today's round.
+    let reopened = indexer_tally(&mut endpoint, &mut ledger).await;
+    assert_eq!(reopened.by_status[0], 1);
+    assert_eq!((reopened.new_lapsed, reopened.new_convictions), (0, 0));
 
     // And the count really did restart rather than merely falling short: a
     // second vote from this round's committee, on top of the first, does convict.
@@ -431,7 +455,24 @@ pub async fn votes_from_different_committees_do_not_add_up() {
             target_is_ejected(&state_of(&mut endpoint, &coordinator_account).await, &target_key),
             "two verifiers seated together still convict"
         );
+        let convicted = indexer_tally(&mut endpoint, &mut ledger).await;
+        assert_eq!(convicted.new_convictions, 1);
+        assert_eq!(convicted.new_lapsed, 0);
     }
+}
+
+/// What `leviathan-indexer` reads off the run's verdict accounts.
+async fn indexer_tally(
+    endpoint: &mut ToolboxEndpoint,
+    ledger: &mut VerdictLedger,
+) -> VerdictTally {
+    read_run(endpoint, None, RUN_ID)
+        .await
+        .unwrap()
+        .observe(ledger)
+        .treasurer
+        .expect("the run is treasurer-managed")
+        .verdicts
 }
 
 fn keypair_for<'a>(clients: &'a [Keypair], key: &Pubkey) -> &'a Keypair {

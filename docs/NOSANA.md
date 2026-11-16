@@ -172,18 +172,17 @@ nodes that finish building at different times still converge quickly.
 
 ## Watching without the dashboard
 
-`leviathan-indexer` reads run state straight off the coordinator account and is
-libtorch-free, so it runs anywhere and does not depend on scraping container
-logs:
+`leviathan-indexer` reads run state straight off chain and is libtorch-free, so
+it runs anywhere and does not depend on scraping container logs:
 
 ```
 cargo build -p leviathan-indexer --features live --bin leviathan-indexer
-./target/debug/leviathan-indexer \
-  --coordinator-account <pubkey> --run-id <run> --rpc <endpoint>
+./target/debug/leviathan-indexer --run-id <run> --rpc <endpoint>
 ```
 
 It prints run state, epoch, registered and active client counts and the
-leaderboard. The coordinator account for a run id is on its
+leaderboard, and for a treasurer-managed run the economic security verdict. It
+finds the run's accounts itself: the coordinator account is on the run's
 `CoordinatorInstance` PDA, derived from `["coordinator", run_id]`.
 
 The other check that needs nothing at all is the chain: a node that joined is

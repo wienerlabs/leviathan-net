@@ -35,18 +35,26 @@ The cheater node broadcasts fraudulent gradients (LEVIATHAN_FAKE_DELTA); audit
 its dump against an honest node's with `leviathan-verifier`, and watch the
 telemetry with `leviathan-indexer --features live`.
 
-Pass the run economics to the indexer and it also reports whether the run is
-economically secure at its audit probability, using the break-even penalty
-`reward * (1 - p) / p`:
+The indexer also reports whether the run is economically secure at its audit
+probability, using the break-even penalty `reward * (1 - p) / p`. It reads every
+input off chain: the reward is a client's share of the epoch's earnings rate, the
+slash is the epoch's slashing rate, and the bond is the run's bond minimum.
 
 ```
-leviathan-indexer --coordinator-account <pubkey> \
-  --reward-per-round 1000 --bond 500000 --slash-when-caught 9000
+leviathan-indexer --run-id leviathan-genesis
 ```
 
-The verdict is secure when the effective penalty, capped at the posted bond,
-meets or exceeds the break-even penalty, so a persistent cheater loses money in
-expectation.
+The verdict is secure when the effective penalty, capped at the bond, meets or
+exceeds the break-even penalty, so a cheater loses money in expectation. A
+committee smaller than the treasurer takes a verdict from convicts nobody, so a
+run with one is judged as audited with probability zero. The rates above are a
+rehearsal's and are not secure. At 10% a round seats no verifier until the run
+has ten nodes, so on three nodes no committee can convict and a cheat keeps its
+whole 333 share; only the run authority can convict, and
+`LeviathanCommitteeCannotConvict` fires. With a committee that can convict, a
+slash of 100 audited one time in ten still pays a cheater about 290 an epoch. A
+run meant to be secure needs enough nodes for a committee, and a slashing rate
+and a bond of at least the break-even penalty, about 3,000 at that share.
 
 ## fineweb-rehearsal.toml
 

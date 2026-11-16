@@ -131,13 +131,16 @@ to the reference config, which is currently fp32 on CPU.
 From `assess_security` in the indexer:
 
 ```
-break_even_penalty        = reward_per_round * (1 - p) / p
-effective_penalty         = min(slash_when_caught, bond)
-expected_fraud_per_round  = (1 - p) * reward_per_round - p * effective_penalty
+break_even_penalty    = reward * (1 - p) / p
+effective_penalty     = min(slash_when_caught, bond)
+expected_fraud_value  = (1 - p) * reward - p * effective_penalty
 ```
 
-At `verification_percent = 10`, deterrence alone needs a bond of nine times the
-per-round reward. But deterrence is not the binding constraint. From the
+The indexer reads every input off chain: `reward` is a client's share of the
+epoch's earnings rate, the most one cheat can take from an epoch;
+`slash_when_caught` is the epoch's slashing rate; `bond` is the run's bond
+minimum. At `verification_percent = 10`, deterrence alone needs a penalty of
+nine times the reward. But deterrence is not the binding constraint. From the
 economics doc, at `p = 0.1` with a 50% bounty:
 
 | Committee | Quorum | Deterrence bond | Verifier-sustainable bond | Required | Collusion capital |

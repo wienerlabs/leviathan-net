@@ -38,12 +38,12 @@ cross-repo write token to keep alive. The hourly `publish telemetry` action that
 used to do this is gone.
 
 `leviathan-indexer` still prints a run as JSON when you want one on the command
-line rather than in a browser:
+line rather than in a browser. It finds the run's accounts from its id, and for
+a treasurer-managed run computes the economic verdict from the run's own rates
+and bond:
 
 ```
-OUT=telemetry.json ./scripts/publish-telemetry.sh \
-  --coordinator-account <coordinator> --run-id leviathan-devnet --rpc <rpc> \
-  --reward-per-round <r> --bond <b> --slash-when-caught <s>
+OUT=telemetry.json ./scripts/publish-telemetry.sh --run-id leviathan-devnet --rpc <rpc>
 ```
 
 ### Publish the fleet summary
@@ -93,17 +93,28 @@ skipped contributions rather than a loud error.
 
 ## Signals to watch
 
-The economic security verdict and the kill-switch signals come out of the
-telemetry and the sim. The prometheus alert rules that pair with these live in
-the telemetry stack (leviathan-net#12).
+The kill switches are Prometheus alerts over what `leviathan-indexer
+--metrics-listen` reads off chain and what `leviathan-verifier-daemon
+--metrics-listen` judged. `telemetry/README.md` says how to stand them up
+(leviathan-net#57).
 
-| Signal | Where | Meaning | Action |
-|---|---|---|---|
-| `economically_secure: false` | telemetry `security` | expected fraud value per round is positive | raise the bond or the audit percent, or lower the reward, until it flips |
-| `audit_probability` 0 | telemetry | verification is off, no audits happen | set `verification_percent` above 0 |
-| uncaught fraud > slash events | derived (fraud proofs vs slashes) | the double-sell kill switch, cheats not being convicted | halt the run, investigate the verifier path |
-| convicted count climbing fast | telemetry | either real fraud or a broken verifier | sample the verdicts, confirm they are true positives |
-| `total_slashed` rising with no convictions | telemetry inconsistency | accounting drift | dump the run and reconcile |
+| Alert | Meaning | Action |
+|---|---|---|
+| `LeviathanEconomicInsecurity` | at the run's own epoch rates and bond minimum, a cheat makes money in expectation: the penalty is below break-even at the audit probability, or a round seats too few verifiers to convict anyone | raise the slashing rate and the bond, or the audit percent, or lower the earning rate; grow the roster if the committee is the cause |
+| `LeviathanTreasuryDrain` | the vault holds less than the bonds posted into it, which no instruction the treasurer allows can cause | halt the run and treat it as an exploit |
+| `LeviathanTreasuryUnderfunded` | the vault covers the bonds but not the earnings still to be claimed | top up the run's rewards |
+| `LeviathanMeshPartition` | less than half of the epoch's roster is still healthy while it trains | check the relay and the nodes' connectivity; `leviathan_run_epoch_clients` says whether they dropped, withdrew or were ejected |
+| `LeviathanHonestFalsePositive` | the appeals court overturned a conviction: a quorum convicted an innocent target | see "Suspected wrongful conviction" below |
+| `LeviathanDisputeOutcomeUnseen` | a conviction's verdict account was handed to a new dispute before the indexer saw how its appeal ended | read the verdict account's transaction history; an overturn there is a wrongful conviction |
+| `LeviathanUncaughtFraudSuspect` | a bonded verifier voted fraud, with the target's signed commitment, and the quorum never came | replay the batch the verdict account names: either a cheat escaped or a verifier accused an honest node |
+| `LeviathanFraudNotSubmitted` | a verifier holds a fraud proof the chain does not hold: refused for a reason other than already having it, or never received | read that verifier's log for the refused submission; the daemon retries every pass |
+| `LeviathanCommitteeCannotConvict` | verification is on, but a round seats fewer verifiers than the treasurer takes a verdict from | grow the roster or raise `verification_percent`; until then only the run authority can convict |
+| `LeviathanIndexerLag`, `LeviathanIndexerStale`, `LeviathanIndexerNotReading`, `LeviathanIndexerDown`, `LeviathanVerifierDown`, `LeviathanVerifierFailing` | the alerts above are reading old state or none, or a verifier audits nothing | fix the RPC, the indexer or the verifier before trusting anything else |
+
+A verifier also counts signed payloads it cannot judge at all
+(`leviathan_verifier_contributions_malformed_total`): they do not decode, or do
+not fit the replayed model. It sets each aside and goes on with the rest, so one
+such payload cannot stop it judging everyone else.
 
 ## Bond and slash economics
 
@@ -135,11 +146,14 @@ alone. Size it from the committee table for the committee size you are running.
 
 ### Suspected wrongful conviction
 
-There is no on-chain penalty yet for verifiers who convict an innocent target
-(leviathan-net#4, the losing-side penalty, is open). Until that lands, treat a
-disputed conviction as a manual review: pull the verdict hashes from the slash
-log, replay the target's batch off chain, and if the conviction was wrong, do not
-reuse those verifiers.
+A target that believes it was convicted wrongly opens a challenge, and a
+separately drawn tie-breaker bench re-audits. An overturn spares the target and
+makes the convicting verifiers forfeit their bonds once the losing-verifier
+crank reaches them (`docs/DISPUTE_DESIGN.md`). `LeviathanHonestFalsePositive`
+fires on every overturn. Crank the losing verifiers, then pull the verdict
+account (it names the batch and holds what the target signed), replay that batch
+off chain, and find out why the quorum disagreed: a band too tight for the
+hardware, a verifier on the wrong data, or a colluding committee.
 
 ### Redeploy a program
 
@@ -219,7 +233,6 @@ programs can never be upgraded again.
 
 ## What is not yet operational
 
-- Alerting rules wired to a live prometheus (the rules exist, the scrape target
-  does not).
+- An always-on Prometheus with on-call routing for the kill switches. The
+  exporters, the rules and the scrape targets exist; nothing pages anyone yet.
 - Multi-node relay for a large swarm (leviathan-net#9).
-- The losing-side penalty for wrongful convictions (leviathan-net#4).

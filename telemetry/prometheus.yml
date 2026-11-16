@@ -13,6 +13,19 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
+  # The kill-switch rules read these two. Start them on the host:
+  #   leviathan-indexer --run-id <run> --metrics-listen 0.0.0.0:9464
+  #   leviathan-verifier-daemon ... --metrics-listen 0.0.0.0:9465
+  # A target that cannot be scraped is an alert of its own
+  # (LeviathanIndexerDown, LeviathanVerifierDown).
+  - job_name: 'leviathan-indexer'
+    static_configs:
+      - targets: ['host.docker.internal:9464']
+
+  - job_name: 'leviathan-verifier'
+    static_configs:
+      - targets: ['host.docker.internal:9465']
+
 otlp:
   keep_identifying_resource_attributes: true
 
