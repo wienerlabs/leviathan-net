@@ -234,7 +234,13 @@ step from being skipped:
   deadlines of disputes in flight, as it always has. The run authority's
   `run_slash` and a committee verdict are separate convictions, each charged
   once: an authority that slashes a target the committee also convicts
-  charges it twice.
+  charges it twice. A committee conviction of a target the authority already
+  ejected this epoch is recorded as due, because the coordinator refuses a
+  second ejection, and is settled at the target's withdrawal; that refusal used
+  to undo the vote that reached the quorum (wienerlabs/leviathan-net#40). The
+  other way round, `run_slash` still has nothing to record a refusal in: an
+  authority slash of a target the committee already ejected this epoch is
+  refused, and the target is charged once.
 
 ### What a conviction proves on chain
 

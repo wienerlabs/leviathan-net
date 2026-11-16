@@ -1,6 +1,13 @@
 [config]
 warmup_time = 20
-cooldown_time = 5
+# A fraud in an epoch's final round has the round's witness phase and the
+# cooldown to be convicted (wienerlabs/leviathan-net#40). A verifier daemon
+# polling every 8 seconds needs up to the interval plus two passes, so the old
+# 10 s window was short of twice that for any model. A 25 s window covers it
+# for a pass of up to 2.25 s. This model's pass is not measured yet (the
+# genesis rehearsal's is, in docs/FIRST_RUN.md section 3); the daemon exports
+# it, and LeviathanAuditWindowTooShort says when 25 s is not enough.
+cooldown_time = 20
 epoch_time = 90
 max_round_train_time = 30
 round_witness_time = 5

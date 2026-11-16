@@ -491,6 +491,11 @@ pub async fn run() {
             })
             .expect("the node is in the epoch roster") as u64
     };
+    // Timed as the daemon times a pass: building the replay engine from the
+    // run's model, replaying, judging and submitting. It is the figure the
+    // final round's audit window is sized against
+    // (wienerlabs/leviathan-net#40).
+    let pass_started = std::time::Instant::now();
     let (trainer, replay_config) = trainer_for(&llm);
     let engine = TrainerReplayEngine::new(
         trainer,
@@ -536,6 +541,11 @@ pub async fn run() {
     )
     .await
     .unwrap();
+    println!(
+        "[audit-latency] engine and pass replaying 2 contributions of the genesis rehearsal model on {}: {:.3}s",
+        std::env::consts::ARCH,
+        pass_started.elapsed().as_secs_f64()
+    );
 
     // The honest node's contribution replays within band, the cheater's does
     // not and is convicted.

@@ -447,3 +447,40 @@ tests:
             exp_annotations:
               summary: "The verifier committee of small is too small to convict"
               description: "A round draws 1 verifier seats over this roster, and the treasurer refuses a verdict from fewer than its minimum committee. Only the run authority can convict until the roster grows or the audit percent rises."
+
+  - name: a final-round audit window under twice a verifier's worst latency fires after ten minutes, and one at it does not
+    interval: 1m
+    input_series:
+      # A verifier that polls every 8 seconds and whose slowest pass in the
+      # last hour, as the daemon keeps it, reaches 1 second: a payload landing
+      # just after a pass began waits out that pass, the interval and the next
+      # pass, so it can need 10 seconds, and the window has to leave twice that.
+      - series: 'leviathan_verifier_slowest_pass_seconds{run_id="tight",job="leviathan-verifier",instance="verifier:9465"}'
+        values: '0.5 0.5 1x21'
+      - series: 'leviathan_verifier_poll_interval_seconds{run_id="tight",job="leviathan-verifier",instance="verifier:9465"}'
+        values: '8x23'
+      - series: 'leviathan_run_final_round_audit_window_seconds{run_id="tight",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '19x23'
+      # The same verifier on a run whose final round leaves exactly the margin.
+      - series: 'leviathan_verifier_slowest_pass_seconds{run_id="exact",job="leviathan-verifier",instance="verifier:9465"}'
+        values: '0.5 0.5 1x21'
+      - series: 'leviathan_verifier_poll_interval_seconds{run_id="exact",job="leviathan-verifier",instance="verifier:9465"}'
+        values: '8x23'
+      - series: 'leviathan_run_final_round_audit_window_seconds{run_id="exact",job="leviathan-indexer",instance="indexer:9464"}'
+        values: '20x23'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LeviathanAuditWindowTooShort
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: LeviathanAuditWindowTooShort
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              kill_switch: uncaught_fraud
+              run_id: tight
+              job: leviathan-verifier
+              instance: verifier:9465
+            exp_annotations:
+              summary: "The verifier at verifier:9465 has no margin to audit the final round of tight"
+              description: "Twice its worst audit latency is 20 seconds: its polling interval and two of its slowest passes in the last hour, since a payload that lands just after a pass began waits for the next. The final round's witness phase and the epoch's cooldown leave less than that margin, so a fraud in an epoch's final round may outlast them and go uncharged. Raise cooldown_time, poll more often, or audit on faster hardware."

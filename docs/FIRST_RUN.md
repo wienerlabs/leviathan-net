@@ -205,6 +205,81 @@ One correction to the framing: the bond is a **floor**, not a ceiling. The
 mechanism has `bond_minimum_amount` and no maximum. Sizing it is choosing how
 much a cheat costs, and the answer is the larger of the two floors above.
 
+### The final round of an epoch has a measured audit window
+
+A fraud in an epoch's final round has to be convicted while that round's
+committee is still in force and an ejection is still charged. That is through
+the round's witness phase and the epoch's cooldown: `round_witness_time +
+cooldown_time` (wienerlabs/leviathan-net#40). Two things used to cut that
+window short:
+
+- **One client leaving the final round shut the cooldown.** The end of the
+  round compacted the roster, so a committee seat read by roster index no
+  longer matched the round's draw, and every vote in the cooldown was refused.
+  The round that ends an epoch now keeps its roster as drawn until the
+  cooldown ends. The cooldown's end then compacts it, at the same height,
+  before the epoch is charged.
+- **A target the coordinator could not eject undid the vote that convicted
+  it.** This happens when the target was withdrawn because the run paused or
+  lost its witnesses, or was already ejected by another conviction. Such a
+  conviction is now recorded as due and settled against the bond.
+
+The window closes at the end of the cooldown:
+
+- The epoch is charged.
+- A target whose withdrawal delay has run out may leave.
+- The next warmup replaces the roster.
+- The next epoch refuses a commitment from this one.
+
+Until the warmup, a vote may still land if nobody left, and is recorded as
+due. Nothing guarantees it reaches a target that has already left, so it does
+not count toward the window.
+
+Carrying a dispute into the next epoch was weighed and set aside. The
+coordinator keeps neither the ended epoch's first step nor its end time once
+the next warmup starts. A cheater can also join each epoch with a new p2p key,
+so its old signature no longer checks against the roster.
+
+**The decision.**
+
+- **The window is at least twice the slowest verifier's worst audit latency.**
+  A verifier daemon polls every `--poll-secs`. A payload that lands just after
+  a pass began waits out that pass, the interval, and the next pass, so its
+  vote can come as late as `poll + 2 × pass`. A pass covers preparing the
+  replay, judging and submitting.
+- **Measured here, as a lower bound:** building the replay engine and running
+  a pass over the two contributions of the genesis rehearsal's 1-bit
+  Nano-Llama step took 0.233, 0.238 and 0.265 s on an Apple M1 Pro CPU.
+  `memnet_verifier_daemon_replay` prints it on every run.
+  - In memnet the vote lands in-process.
+  - The daemon binary also reads its model from disk and scans its payload
+    directory.
+  - A pass grows with the number of payloads it judges.
+  - On a cluster, the vote's confirmation adds to the pass.
+- **Rehearsal sizing:** with the default 8 s poll, the rehearsal's old window
+  of 10 s (5 + 5) was short of twice the latency for any model. Its
+  `cooldown_time` is now 20, a 25 s window. That covers a pass of up to
+  2.25 s, which is far above the measured lower bound and leaves room for what
+  it leaves out.
+- **The flagship's window** is sized the same way once its model is chosen
+  (section 2), from the pass time the daemon reports on that model.
+
+**How it is held live.**
+
+- The daemon exports `leviathan_verifier_slowest_pass_seconds` and
+  `leviathan_verifier_poll_interval_seconds`.
+- The indexer exports `leviathan_run_final_round_audit_window_seconds` from the
+  run's config on chain.
+- `LeviathanAuditWindowTooShort` fires when the window is less than twice a
+  verifier's interval plus two of its slowest passes in the last hour.
+- It needs both exporters up. The alerts on a down or stale indexer or verifier
+  cover that.
+
+Today the binding window is wider. The verifier replays only a run's first
+step (wienerlabs/leviathan-net#48), whose window is the rest of epoch 0. The
+final round's window binds once later steps are replayable, and the alert says
+whether the run is ready for it.
+
 ### Stage one is still bondless
 
 `config/leviathan/mainnet-genesis-bondless.toml` sets `bond_minimum_amount = 0`
@@ -215,8 +290,10 @@ works, the appeals court works, the economic argument does not. Stage two is one
 `run_bond_config_update`, no redeploy, no migration.
 
 Settled: `verification_percent = 10`, band `0.05` default (3060 Ti measured at
-0.029). Open: committee size, and whether the first public run is stage one
-(bondless) or waits for the audit.
+0.029), and the final round's audit window: at least twice a verifier's worst
+latency, measured, with the rehearsals at 25 s. Open: committee size, the
+flagship's `cooldown_time` once its model's pass is measured, and whether the
+first public run is stage one (bondless) or waits for the audit.
 
 ## 4. The finish line
 

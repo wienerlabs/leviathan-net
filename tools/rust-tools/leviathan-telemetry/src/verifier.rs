@@ -1,7 +1,12 @@
+use std::collections::VecDeque;
 use std::ops::AddAssign;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+use std::time::Instant;
 
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 
 use crate::labels::RunLabels;
@@ -115,7 +120,11 @@ const PASS_COUNTERS: [(&str, &str, Count); 8] = [
 pub struct VerifierMetrics {
     pass: Vec<(Family<RunLabels, Counter>, Count)>,
     pass_errors: Family<RunLabels, Counter>,
+    slowest_pass: Family<RunLabels, Seconds>,
+    poll_interval: Family<RunLabels, Seconds>,
 }
+
+type Seconds = Gauge<f64, AtomicU64>;
 
 impl VerifierMetrics {
     pub fn register(registry: &mut Registry) -> Self {
@@ -133,7 +142,40 @@ impl VerifierMetrics {
             "Audit passes that failed before judging anything",
             pass_errors.clone(),
         );
-        Self { pass, pass_errors }
+        let slowest_pass = Family::<RunLabels, Seconds>::default();
+        registry.register(
+            "leviathan_verifier_slowest_pass_seconds",
+            "The slowest of this verifier's audit passes in the last hour, preparing the replay and submitting included",
+            slowest_pass.clone(),
+        );
+        let poll_interval = Family::<RunLabels, Seconds>::default();
+        registry.register(
+            "leviathan_verifier_poll_interval_seconds",
+            "How long this verifier waits between audit passes",
+            poll_interval.clone(),
+        );
+        Self {
+            pass,
+            pass_errors,
+            slowest_pass,
+            poll_interval,
+        }
+    }
+
+    /// Records the slowest pass over `run_id` in the last hour, as
+    /// [`SlowestPass`] keeps it, and how long the daemon waits between passes.
+    /// Together they bound how late this verifier can vote on a fraud: a
+    /// payload that lands just after a pass started waits out that pass, the
+    /// interval, and the next pass. The final round of an epoch has to leave
+    /// at least that long (wienerlabs/leviathan-net#40).
+    pub fn record_timing(&self, run_id: &str, pass: Duration, poll_interval: Duration) {
+        let labels = RunLabels::new(run_id);
+        self.slowest_pass
+            .get_or_create(&labels)
+            .set(pass.as_secs_f64());
+        self.poll_interval
+            .get_or_create(&labels)
+            .set(poll_interval.as_secs_f64());
     }
 
     /// Counts what one pass over `run_id` judged.
@@ -156,6 +198,44 @@ impl VerifierMetrics {
         for (family, _) in &self.pass {
             let _ = family.get_or_create(&labels);
         }
+    }
+}
+
+/// The slowest audit pass within a trailing window, kept by the daemon itself.
+///
+/// A gauge of the last pass alone could be overwritten by a fast pass before a
+/// scrape reads a slow one, and the slow one is what bounds how late a vote can
+/// come. Kept here, a slow pass stays in the series for the whole window
+/// however often Prometheus scrapes.
+pub struct SlowestPass {
+    window: Duration,
+    passes: VecDeque<(Instant, Duration)>,
+}
+
+impl SlowestPass {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            passes: VecDeque::new(),
+        }
+    }
+
+    /// Records a pass that took `pass` and ended at `now`, and returns the
+    /// slowest pass that ended within the window before `now`.
+    pub fn record(&mut self, now: Instant, pass: Duration) -> Duration {
+        self.passes.push_back((now, pass));
+        while self
+            .passes
+            .front()
+            .is_some_and(|(ended, _)| now.saturating_duration_since(*ended) > self.window)
+        {
+            self.passes.pop_front();
+        }
+        self.passes
+            .iter()
+            .map(|(_, took)| *took)
+            .max()
+            .unwrap_or(pass)
     }
 }
 
@@ -234,5 +314,46 @@ mod tests {
             }
         );
         assert_eq!(total.convictions(), 2);
+    }
+
+    #[test]
+    fn a_pass_and_the_wait_before_the_next_are_exported_in_seconds() {
+        let mut registry = Registry::default();
+        let metrics = VerifierMetrics::register(&mut registry);
+        metrics.record_timing(
+            "run-a",
+            std::time::Duration::from_millis(2_500),
+            std::time::Duration::from_secs(8),
+        );
+        // The gauge holds what it was last given: `SlowestPass` decides what
+        // that is.
+        metrics.record_timing(
+            "run-a",
+            std::time::Duration::from_millis(1_250),
+            std::time::Duration::from_secs(8),
+        );
+        let scrape = render(&registry).unwrap();
+        for line in [
+            r#"leviathan_verifier_slowest_pass_seconds{run_id="run-a"} 1.25"#,
+            r#"leviathan_verifier_poll_interval_seconds{run_id="run-a"} 8.0"#,
+        ] {
+            assert!(scrape.contains(line), "missing {line} in\n{scrape}");
+        }
+    }
+
+    #[test]
+    fn the_slowest_pass_in_the_window_is_kept_until_it_ages_out() {
+        let hour = Duration::from_secs(3_600);
+        let mut slowest = SlowestPass::new(hour);
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let took = Duration::from_millis;
+        assert_eq!(slowest.record(at(0), took(300)), took(300));
+        assert_eq!(slowest.record(at(10), took(2_000)), took(2_000));
+        // Faster passes after a slow one do not hide it.
+        assert_eq!(slowest.record(at(20), took(250)), took(2_000));
+        assert_eq!(slowest.record(at(3_610), took(400)), took(2_000));
+        // An hour and more after it ended, it no longer counts.
+        assert_eq!(slowest.record(at(3_611), took(400)), took(400));
     }
 }

@@ -26,6 +26,7 @@ mod memnet_treasurer_committee_slash;
 mod memnet_treasurer_cross_round_quorum;
 mod memnet_treasurer_create_claim;
 mod memnet_treasurer_create_update;
+mod memnet_treasurer_final_round_audit;
 mod memnet_treasurer_full_epoch;
 mod memnet_treasurer_join_gate;
 mod memnet_treasurer_slash_accounting_order;

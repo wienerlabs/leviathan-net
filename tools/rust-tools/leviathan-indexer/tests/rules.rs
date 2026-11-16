@@ -83,6 +83,7 @@ fn full_observation() -> RunObservation {
         registered_clients: 3,
         epoch_clients: [3, 0, 0, 0],
         min_clients: 2,
+        final_round_audit_window_seconds: 25,
         audit_probability: 0.1,
         earned_points: 0,
         slashed_points: 0,
@@ -118,6 +119,12 @@ fn exported() -> BTreeSet<String> {
     let verifier = VerifierMetrics::register(&mut registry);
     indexer.observe("run", &full_observation());
     verifier.record("run", &PassReport::default());
+    // What a daemon records after each pass it completes.
+    verifier.record_timing(
+        "run",
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(8),
+    );
     sample_names(&render(&registry).unwrap())
 }
 
