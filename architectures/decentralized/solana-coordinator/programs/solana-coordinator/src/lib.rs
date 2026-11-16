@@ -95,13 +95,24 @@ fn validate_coordinator_account_bytes(
     Ok(())
 }
 
+/// The version a coordinator account's bytes declare, read before the bytes
+/// are taken for a `CoordinatorAccount`: an account of another version can
+/// hold bytes that are no valid value of this one's fields (a `bool` in what
+/// was padding, for one), and casting them is not sound.
 fn validate_coordinator_account_version(
-    coordinator_account: &CoordinatorAccount,
+    bytes: &[u8],
 ) -> std::result::Result<(), DeserializeCoordinatorFromBytes> {
-    if coordinator_account.version != CoordinatorAccount::VERSION {
+    let start = CoordinatorAccount::DISCRIMINATOR.len()
+        + std::mem::offset_of!(CoordinatorAccount, version);
+    let version = u64::from_le_bytes(
+        bytes[start..start + std::mem::size_of::<u64>()]
+            .try_into()
+            .expect("the account was checked to be the full size"),
+    );
+    if version != CoordinatorAccount::VERSION {
         return Err(DeserializeCoordinatorFromBytes::InvalidVersion {
             expected: CoordinatorAccount::VERSION,
-            actual: coordinator_account.version,
+            actual: version,
         });
     }
     Ok(())
@@ -111,11 +122,11 @@ pub fn coordinator_account_from_bytes(
     bytes: &[u8],
 ) -> std::result::Result<&CoordinatorAccount, DeserializeCoordinatorFromBytes> {
     validate_coordinator_account_bytes(bytes)?;
+    validate_coordinator_account_version(bytes)?;
     let coordinator_account: &CoordinatorAccount = bytemuck::try_from_bytes(
         &bytes[CoordinatorAccount::DISCRIMINATOR.len()
             ..CoordinatorAccount::space_with_discriminator()],
     )?;
-    validate_coordinator_account_version(coordinator_account)?;
     Ok(coordinator_account)
 }
 
@@ -124,11 +135,11 @@ pub fn coordinator_account_from_bytes_mut(
 ) -> std::result::Result<&mut CoordinatorAccount, DeserializeCoordinatorFromBytes>
 {
     validate_coordinator_account_bytes(bytes)?;
+    validate_coordinator_account_version(bytes)?;
     let coordinator_account = bytemuck::try_from_bytes_mut(
         &mut bytes[CoordinatorAccount::DISCRIMINATOR.len()
             ..CoordinatorAccount::space_with_discriminator()],
     )?;
-    validate_coordinator_account_version(coordinator_account)?;
     Ok(coordinator_account)
 }
 
@@ -142,7 +153,11 @@ pub struct CoordinatorAccount {
 }
 
 impl CoordinatorAccount {
-    pub const VERSION: u64 = 1;
+    /// Version 2 added `robust_aggregation` to the DisTrO optimizer, where
+    /// version 1 had padding. The padding of a real version 1 account holds
+    /// whatever the program's stack held, so a version 1 account is refused
+    /// rather than read with that as a setting (wienerlabs/leviathan-net#60).
+    pub const VERSION: u64 = 2;
 
     pub fn space_with_discriminator() -> usize {
         CoordinatorAccount::DISCRIMINATOR.len()

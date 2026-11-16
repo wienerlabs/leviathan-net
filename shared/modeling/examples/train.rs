@@ -132,6 +132,11 @@ struct RunArgs {
     #[arg(long, default_value_t = false)]
     distro_quantization: bool,
 
+    /// Combine the data-parallel replicas' results robustly rather than by
+    /// their mean, as a run with `robust_aggregation` does.
+    #[arg(long, default_value_t = false)]
+    distro_robust_aggregation: bool,
+
     #[arg(long)]
     attn_implementation: Option<AttnImpl>,
 
@@ -251,6 +256,7 @@ async fn main() -> Result<()> {
             compression_topk: args.compression_topk,
             compression_chunk: args.compression_chunk,
             quantize_1bit: args.distro_quantization,
+            robust_aggregation: args.distro_robust_aggregation,
             weight_decay: Some(args.weight_decay),
         },
         false => OptimizerDefinition::AdamW {

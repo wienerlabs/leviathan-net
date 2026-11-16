@@ -219,11 +219,19 @@ fn values_beyond_the_safe_range_are_skipped_and_values_within_it_stay_finite() {
     ));
     assert_eq!(distro.check_results(&*model, &at_bound), Ok(()));
 
-    let after = applied(&recipe, &[honest, at_bound]).unwrap();
-    assert!(
-        after
-            .iter()
-            .all(|parameter| bool::try_from(parameter.isfinite().all()).unwrap()),
-        "values at the safe bound left a parameter non-finite"
-    );
+    // Under either rule a run can choose: the mean sums them through the
+    // decode, robust aggregation also squares them to measure each peer.
+    for robust_aggregation in [false, true] {
+        let after = applied(
+            &recipe.aggregating(robust_aggregation),
+            &[honest.clone(), at_bound.clone()],
+        )
+        .unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|parameter| bool::try_from(parameter.isfinite().all()).unwrap()),
+            "values at the safe bound left a parameter non-finite (robust: {robust_aggregation})"
+        );
+    }
 }

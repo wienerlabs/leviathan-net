@@ -281,6 +281,7 @@ async fn run() -> Result<()> {
                     compression_topk: 1,
                     compression_chunk: 1,
                     quantize_1bit: false,
+                    robust_aggregation: true,
                     weight_decay: None,
                 },
                 cold_start_warmup_steps: 0,
