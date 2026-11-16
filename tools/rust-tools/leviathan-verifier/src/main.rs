@@ -197,9 +197,9 @@ async fn main() -> Result<()> {
                 hex8(&proof.committed_hash),
                 hex8(&proof.replayed_hash)
             ),
-            ContributionOutcome::LengthMismatch { key, submitted, reference } => println!(
-                "FRAUD {key}: length mismatch ({submitted} vs {reference}) is itself a fraud signal"
-            ),
+            ContributionOutcome::Unfit { key, reason } => {
+                println!("FRAUD {key}: it does not fit the run's model: {reason}")
+            }
             ContributionOutcome::NoReference { key } => {
                 println!("skip  {key}: no reference contribution to replay against")
             }

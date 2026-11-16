@@ -112,12 +112,26 @@ The kill switches are Prometheus alerts over what `leviathan-indexer
 | `LeviathanCommitteeCannotConvict` | verification is on, but a round seats fewer verifiers than the treasurer takes a verdict from | grow the roster or raise `verification_percent`; until then only the run authority can convict |
 | `LeviathanIndexerLag`, `LeviathanIndexerStale`, `LeviathanIndexerNotReading`, `LeviathanIndexerDown`, `LeviathanVerifierDown`, `LeviathanVerifierFailing` | the alerts above are reading old state or none, or a verifier audits nothing | fix the RPC, the indexer or the verifier before trusting anything else |
 
-A verifier also counts signed payloads it cannot judge at all
-(`leviathan_verifier_contributions_malformed_total`): they do not decode, or do
-not fit the replayed model. Equivocation records that prove nothing count
-there too. A node writes one only after checking it, so one that fails was
-damaged or tampered with on its disk. It sets each aside and goes on with the rest, so one
-such payload cannot stop it judging everyone else.
+A signed payload that does not fit the run's model is fraud. It may not decode,
+not hold together as an encoding, or not have the honest result's length. The
+verifier convicts it at an infinite distance like any other fraud, and counts
+it in `leviathan_verifier_fraud_found_total` (wienerlabs/leviathan-net#59). The
+verifier checks a payload's size and encoding before it decompresses it, so no
+payload can take it down. A payload or reference it cannot read at all is its
+own trouble: it counts in `leviathan_verifier_contributions_unreplayable_total`
+and is looked at again on the next pass.
+
+The length rule, like the band, trusts the verifier's reference to be the
+run's own model. A verifier replaying the wrong model convicts honest nodes
+whether their lengths disagree or their values do. If one verifier's fraud
+count jumps across every trainer at once, stop it and check its model before
+its votes reach a quorum. `LeviathanHonestFalsePositive` fires on any
+conviction the appeals court overturns.
+
+`leviathan_verifier_contributions_malformed_total` counts equivocation records
+that prove nothing. A node writes one only after checking it, so one that
+fails was damaged or tampered with on its disk. The verifier sets each aside
+and goes on with the rest.
 
 A verifier counts the peers it caught signing two different payloads for one
 batch (`leviathan_verifier_equivocations_found_total`). Each is a proof the

@@ -778,6 +778,52 @@ impl Distro {
         Ok(())
     }
 
+    /// Checks each of a stranger's results as a DisTrO encoding of its own
+    /// shape, with no model at hand: its `totalk` is the one its encoded shape
+    /// gives, and its indices and values are what that encoding scatters, as
+    /// `check_results` checks them against the model's shapes.
+    ///
+    /// `CompressDCT::decompress` allocates the shape a result claims and
+    /// scatters into it with libtorch's infallible operations. A result that
+    /// does not hold together makes it index past that tensor and panic, so
+    /// nothing that decompresses a stranger's results may do so before this
+    /// passes. It does not say the results fit any model: one result short of
+    /// the model, or another variable's shape, holds together, and only
+    /// `check_results`, or a comparison with an honest result, finds it out
+    /// (wienerlabs/leviathan-net#59).
+    pub fn check_encodings(results: &[DistroResult]) -> Result<(), DistroResultMismatch> {
+        for (index, result) in results.iter().enumerate() {
+            let name = format!("result {index}");
+            let flat = flattened(&result.xshape);
+            let Some(&totalk) = flat.last() else {
+                return Err(DistroResultMismatch::Unencodable { index, name });
+            };
+            if result.totalk != totalk {
+                return Err(DistroResultMismatch::Totalk {
+                    index,
+                    name,
+                    expected: totalk,
+                    got: result.totalk,
+                });
+            }
+            Self::check_sparse(&flat, totalk, result).map_err(|(on_indices, reason)| {
+                match on_indices {
+                    true => DistroResultMismatch::Indices {
+                        index,
+                        name: name.clone(),
+                        reason,
+                    },
+                    false => DistroResultMismatch::Values {
+                        index,
+                        name: name.clone(),
+                        reason,
+                    },
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     /// The sparse half of `check_results`: `Err((true, _))` for the indices,
     /// `Err((false, _))` for the values. Every tensor operation here is the
     /// fallible one, because the input is a stranger's.

@@ -363,7 +363,6 @@ pub async fn run() {
         .unwrap();
     }
 
-    let cheater_committer = clients[cheater].pubkey().to_string();
     let state = coordinator_state(&mut endpoint, &coordinator_account).await;
     let tie_breakers = get_run(&mut endpoint, &run)
         .await
@@ -444,10 +443,12 @@ pub async fn run() {
         &run_id,
         header,
     );
-    // Beside it, another node's payload, signed by that node, that does not
-    // fit the model: one result short of what the reference holds. It cannot
-    // be judged. It used to fail the whole pass, and since it was retried
-    // every pass, it stopped this verifier judging anyone at all
+    // Beside it, two more nodes' payloads, each signed by its node, that do
+    // not fit the model. One is a result short of what the reference holds.
+    // Its sender did none of the work it claims, and every honest node's
+    // `apply` refuses it, so it is fraud at an infinite distance and convicted
+    // like any other. It used to be set aside, costing its sender nothing
+    // (wienerlabs/leviathan-net#59), and before that it failed the whole pass
     // (wienerlabs/leviathan-net#57).
     let short = (cheater + 1) % clients.len();
     let short_header = payload_header(
@@ -478,6 +479,43 @@ pub async fn run() {
         &run_id,
         short_header,
     );
+    // The other has one result's shape shrunk under its indices. Decompressed
+    // as it claims, it scattered past the end of its tensor and panicked the
+    // daemon, on every pass and every restart while it was kept.
+    let shrunk = (cheater + 2) % clients.len();
+    let shrunk_header = payload_header(
+        &state.coordinator,
+        tie_breakers,
+        &identity(&clients[shrunk], &p2ps[shrunk]),
+    );
+    keep_reference(
+        &reference_dir,
+        &fixture(HONEST_PAYLOAD),
+        &clients[shrunk],
+        shrunk_header,
+    );
+    let mut results =
+        leviathan_verifier::read_dump(&fixture(HONEST_PAYLOAD)).unwrap();
+    let target = results
+        .iter()
+        .position(|r| r.xshape.last().is_some_and(|last| *last > 1))
+        .expect("a result with a last dimension above 1");
+    let last = results[target].xshape.len() - 1;
+    results[target].xshape[last] /= 2;
+    let shrunk_source = scratch("shrunk").join("shrunk.vec-postcard");
+    fs::write(
+        &shrunk_source,
+        psyche_network::distro_results_to_bytes(&results).unwrap(),
+    )
+    .unwrap();
+    keep_signed_payload(
+        &submitted_dir,
+        &shrunk_source,
+        &clients[shrunk],
+        &p2ps[shrunk],
+        &run_id,
+        shrunk_header,
+    );
     let config = config_for(submitted_dir);
 
     let mut convicted = HashSet::new();
@@ -496,14 +534,15 @@ pub async fn run() {
     assert_eq!(
         report,
         PassReport {
-            fraud_found: 1,
-            submitted: 1,
-            malformed: 1,
+            fraud_found: 3,
+            submitted: 3,
             ..PassReport::default()
         }
     );
-    assert_eq!(report.convictions(), 1);
-    assert!(convicted.contains(&cheater_committer));
+    assert_eq!(report.convictions(), 3);
+    for node in [cheater, short, shrunk] {
+        assert!(convicted.contains(&clients[node].pubkey().to_string()));
+    }
 
     // Everything in the directory is settled: a second pass judges nothing.
     assert_eq!(
@@ -540,9 +579,8 @@ pub async fn run() {
     assert_eq!(
         restarted,
         PassReport {
-            fraud_found: 1,
-            already_on_chain: 1,
-            malformed: 1,
+            fraud_found: 3,
+            already_on_chain: 3,
             ..PassReport::default()
         }
     );
@@ -562,12 +600,14 @@ pub async fn run() {
     .unwrap();
 
     let state = coordinator_state(&mut endpoint, &coordinator_account).await;
-    let cheater_state = state
-        .clients_state
-        .clients
-        .iter()
-        .find(|c| *c.id.signer() == clients[cheater].pubkey().to_bytes())
-        .unwrap();
-    assert_eq!(cheater_state.slashed, SLASHING_RATE);
-    assert_eq!(cheater_state.earned, 0);
+    for node in [cheater, short, shrunk] {
+        let convicted_state = state
+            .clients_state
+            .clients
+            .iter()
+            .find(|c| *c.id.signer() == clients[node].pubkey().to_bytes())
+            .unwrap();
+        assert_eq!(convicted_state.slashed, SLASHING_RATE);
+        assert_eq!(convicted_state.earned, 0);
+    }
 }
