@@ -26,10 +26,12 @@ pub struct Run {
     pub tie_breaker_committee_size: u16,
 
     /// How long a challenge may hold a conviction open before the verdict the
-    /// verifiers already reached is allowed to finalise anyway. Zero means the
-    /// appeal never times out, which is the old behaviour and lets a guilty
-    /// target park a correct conviction for free
-    /// (wienerlabs/leviathan#15, finding 10).
+    /// verifiers already reached is allowed to finalise anyway
+    /// (wienerlabs/leviathan#15, finding 10). Zero only with appeals off: an
+    /// appeal still open then has no deadline left to wait for and finalises
+    /// at once. It used to mean the appeal never timed out, which let a guilty
+    /// target park a correct conviction, and every vote on it, for free
+    /// (wienerlabs/leviathan-net#39).
     pub appeal_window_seconds: i64,
 }
 

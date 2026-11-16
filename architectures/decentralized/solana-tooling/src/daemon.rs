@@ -31,6 +31,8 @@ use crate::get_accounts::get_coordinator_account_state;
 use crate::get_accounts::get_run;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
+use crate::verdict_votes::settle_previous_dispute;
+use crate::verdict_votes::DisputeSettlement;
 use crate::signed_commitment::SignedCommitment;
 
 pub struct AuditConfig {
@@ -399,6 +401,36 @@ pub async fn audit_pass(
             continue;
         }
 
+        let target_signer = Pubkey::new_from_array(*target.signer());
+        if config.verdict_mode {
+            // The target's verdict account holds one dispute at a time, and it
+            // is taken over only once the last one holds nobody's bond and
+            // owes the bench nothing. What nobody's consent is needed for is
+            // settled first, so a lapsed, standing or overturned dispute does
+            // not refuse this one (wienerlabs/leviathan-net#39). Anything still
+            // at stake stays, and the vote below is refused as before.
+            match settle_previous_dispute(
+                endpoint,
+                authority,
+                run,
+                coordinator_account,
+                &target_signer,
+            )
+            .await
+            {
+                Ok(settled) if settled == DisputeSettlement::default() => {},
+                Ok(settled) => println!(
+                    "  settled the last dispute against {committer}: conviction finalised {}, {} vote(s) freed, {} loser(s) charged, {} tie-breaker(s) credited",
+                    settled.conviction_finalized,
+                    settled.votes_freed,
+                    settled.losers_charged,
+                    settled.bench_paid
+                ),
+                Err(err) => println!(
+                    "  could not settle the last dispute against {committer}: {err:#}"
+                ),
+            }
+        }
         let result = if config.verdict_mode {
             process_treasurer_run_submit_audit_verdict(
                 endpoint,
@@ -407,7 +439,7 @@ pub async fn audit_pass(
                 run,
                 coordinator_account,
                 &config.run_id,
-                &Pubkey::new_from_array(*target.signer()),
+                &target_signer,
                 index as u64,
                 &signed,
                 replayed_hash,
@@ -436,7 +468,6 @@ pub async fn audit_pass(
                 report.submitted += 1;
             }
             Err(err) => {
-                let target_signer = Pubkey::new_from_array(*target.signer());
                 match already_on_chain(
                     endpoint,
                     coordinator_account,

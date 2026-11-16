@@ -10,6 +10,7 @@ use crate::state::AuditVerdict;
 use crate::state::Run;
 use crate::state::VerdictStatus;
 use crate::state::Landing;
+use crate::state::appeal_window_open;
 use crate::state::conviction_landing;
 use crate::ProgramError;
 
@@ -100,11 +101,17 @@ pub fn run_finalize_slash_processor(
             // conviction for ever. Past the appeal window the verdict the
             // verifiers already reached finalises, which is what a target with
             // nothing to say in its defence would have got anyway (finding 10).
-            // `appeal_window_seconds == 0` keeps the old behaviour: no timeout.
+            // Appeals are on only with a deadline (#36), so a zero window means
+            // the run switched appeals off while this one was open: there is no
+            // deadline left to wait for. It used to mean no timeout at all,
+            // which parked the conviction, and since #39 every vote on it,
+            // for good.
             VerdictStatus::Challenged => {
-                if appeal_window_seconds == 0
-                    || now < verdict.challenged_since_unix + appeal_window_seconds
-                {
+                if appeal_window_open(
+                    appeal_window_seconds,
+                    verdict.challenged_since_unix,
+                    now,
+                ) {
                     return err!(ProgramError::AppealWindowOpen);
                 }
             },

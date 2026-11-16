@@ -106,7 +106,7 @@ The kill switches are Prometheus alerts over what `leviathan-indexer
 | `LeviathanMeshPartition` | less than half of the epoch's roster is still healthy while it trains | check the relay and the nodes' connectivity; `leviathan_run_epoch_clients` says whether they dropped, withdrew or were ejected |
 | `LeviathanHonestFalsePositive` | the appeals court overturned a conviction: a quorum convicted an innocent target | see "Suspected wrongful conviction" below |
 | `LeviathanDisputeOutcomeUnseen` | a conviction's verdict account was handed to a new dispute before the indexer saw how its appeal ended | read the verdict account's transaction history; an overturn there is a wrongful conviction |
-| `LeviathanUncaughtFraudSuspect` | a bonded verifier voted fraud, with the target's signed commitment, and the quorum never came | replay the batch the verdict account names: either a cheat escaped or a verifier accused an honest node |
+| `LeviathanUncaughtFraudSuspect` | a bonded verifier voted fraud, with the target's signed commitment, and the quorum never came. This includes a dispute whose voters withdrew their votes during its round, for instance with `bond-withdraw-finalize --withdraw-live-votes`: a fraud claim that was retracted is still one that never became a conviction | replay the batch the verdict account names: either a cheat escaped or a verifier accused an honest node |
 | `LeviathanFraudNotSubmitted` | a verifier holds a fraud proof the chain does not hold: refused for a reason other than already having it, or never received | read that verifier's log for the refused submission; the daemon retries every pass |
 | `LeviathanCommitteeCannotConvict` | verification is on, but a round seats fewer verifiers than the treasurer takes a verdict from | grow the roster or raise `verification_percent`; until then only the run authority can convict |
 | `LeviathanIndexerLag`, `LeviathanIndexerStale`, `LeviathanIndexerNotReading`, `LeviathanIndexerDown`, `LeviathanVerifierDown`, `LeviathanVerifierFailing` | the alerts above are reading old state or none, or a verifier audits nothing | fix the RPC, the indexer or the verifier before trusting anything else |
@@ -177,6 +177,13 @@ version leaves every run on it unable to pay out or release a bond, until a
 migration instruction exists. Versions 2 and 3 (wienerlabs/leviathan-net#60,
 #62) have none: deploy them under new ids, as `DEVNET.md` describes, where no
 older account exists.
+
+The treasurer's own accounts grow the same way. `Participant` gained
+`open_verdict_votes` (69 bytes) and `AuditVerdict` gained `released_voters`,
+`bench_bounty_owed` and `bench_paid` (4392 bytes) in
+wienerlabs/leviathan-net#39. An older, shorter account does not deserialize
+with the new layout, so the treasurer that carries them deploys under a new id
+too.
 
 ## Going to mainnet
 

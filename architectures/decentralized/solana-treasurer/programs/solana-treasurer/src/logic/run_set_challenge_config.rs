@@ -21,9 +21,11 @@ pub struct RunSetChallengeConfigParams {
     pub challenge_window_seconds: i64,
     pub tie_breaker_committee_size: u16,
     /// How long an opened challenge may hold a conviction before the verifiers'
-    /// verdict finalises anyway. Zero keeps the old behaviour, where a free
-    /// challenge could park a correct conviction indefinitely
-    /// (wienerlabs/leviathan#15, finding 10).
+    /// verdict finalises anyway (wienerlabs/leviathan#15, finding 10). It may
+    /// be zero only with appeals off. Switching appeals off ends the appeals in
+    /// flight in the verifiers' favour: an open challenge finalises at once
+    /// rather than holding the conviction, and every vote on it, for good
+    /// (wienerlabs/leviathan-net#39).
     pub appeal_window_seconds: i64,
 }
 

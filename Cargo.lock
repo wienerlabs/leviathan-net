@@ -8548,6 +8548,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bs58",
+ "bytemuck",
  "chrono",
  "clap",
  "clap-markdown",

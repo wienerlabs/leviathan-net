@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use clap::Args;
 
+use super::verdict_votes::free_wallet_votes;
 use crate::{SolanaBackend, instructions};
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use psyche_solana_rpc::utils::native_amount_to_ui_amount;
@@ -14,9 +15,10 @@ use psyche_solana_treasurer::state::{
 };
 
 /// How `user`'s withdrawal stands, read from chain exactly the way the
-/// treasurer reads it at finalize: the run, its coordinator, `user`'s own audit
-/// verdict, and the cluster clock (wienerlabs/leviathan-net#36). Also returns
-/// the verdict, which names the bounty recipients a settlement pays.
+/// treasurer reads it at finalize: the run, its coordinator, `user`'s
+/// participant account and own audit verdict, and the cluster clock
+/// (wienerlabs/leviathan-net#36, #39). Also returns the verdict, which names
+/// the bounty recipients a settlement pays.
 async fn current_withdrawal_standing(
     backend: &SolanaBackend,
     run_address: &Pubkey,
@@ -25,6 +27,12 @@ async fn current_withdrawal_standing(
 ) -> Result<(WithdrawalStanding, Option<AuditVerdict>)> {
     let coordinator_account = backend
         .get_coordinator_account(&run_state.coordinator_account)
+        .await?;
+    let participant = backend
+        .get_treasurer_participant(&psyche_solana_treasurer::find_participant(
+            run_address,
+            user,
+        ))
         .await?;
     let verdict_address = psyche_solana_treasurer::find_audit_verdict(run_address, user);
     let own_verdict = match backend.get_account(&verdict_address).await? {
@@ -36,6 +44,7 @@ async fn current_withdrawal_standing(
     let standing = withdrawal_standing(
         run_state,
         &coordinator_account,
+        &participant,
         own_verdict.as_ref(),
         user,
         now,
@@ -50,6 +59,9 @@ fn describe_withdrawal_hold(hold: WithdrawalHold) -> &'static str {
         },
         WithdrawalHold::EpochNotSettled => {
             "this wallet trains in an epoch that has not been charged yet; it can be finalized once the epoch ends"
+        },
+        WithdrawalHold::VotesAtStake => {
+            "this wallet voted on a verdict that can still cost it; bond-withdraw-finalize frees each vote once it can"
         },
     }
 }
@@ -83,6 +95,10 @@ async fn report_bond_standing(
     println!(
         "Committed bond: {}",
         native_amount_to_ui_amount(committed, decimals)
+    );
+    println!(
+        "Verdict votes that can still cost the bond: {}",
+        participant.open_verdict_votes
     );
     let open = |bond: u64| {
         if bond >= run_state.bond_minimum_amount {
@@ -338,6 +354,10 @@ pub struct CommandBondWithdrawFinalize {
     pub run_id: String,
     #[clap(long, env)]
     pub treasurer_index: Option<u64>,
+    /// Also withdraw this wallet's votes on verdicts whose round is still under
+    /// way. They stop counting toward a conviction.
+    #[clap(long)]
+    pub withdraw_live_votes: bool,
 }
 
 #[async_trait]
@@ -346,6 +366,7 @@ impl Command for CommandBondWithdrawFinalize {
         let Self {
             run_id,
             treasurer_index,
+            withdraw_live_votes,
         } = self;
 
         let treasurer_index = backend
@@ -359,6 +380,30 @@ impl Command for CommandBondWithdrawFinalize {
             .get_token_mint(&run_state.collateral_mint)
             .await?
             .decimals;
+
+        // Votes this wallet cast hold the bond until each can no longer cost
+        // it, so the ones that can be freed are freed first
+        // (wienerlabs/leviathan-net#39).
+        let participant_address = psyche_solana_treasurer::find_participant(&run_address, &user);
+        if backend
+            .get_treasurer_participant(&participant_address)
+            .await?
+            .open_verdict_votes
+            > 0
+        {
+            let held = free_wallet_votes(
+                &backend,
+                treasurer_index,
+                &run_address,
+                &run_state,
+                &user,
+                withdraw_live_votes,
+            )
+            .await?;
+            for (target, reason) in &held {
+                println!("A vote on the verdict against {target} still holds the bond: {reason}");
+            }
+        }
 
         let (standing, own_verdict) =
             current_withdrawal_standing(&backend, &run_address, &run_state, &user).await?;
@@ -406,8 +451,6 @@ impl Command for CommandBondWithdrawFinalize {
             .await?;
         println!("Finalized the bond withdraw in transaction: {signature}");
 
-        let participant_address =
-            psyche_solana_treasurer::find_participant(&run_address, &user);
         let participant = backend
             .get_treasurer_participant(&participant_address)
             .await?;

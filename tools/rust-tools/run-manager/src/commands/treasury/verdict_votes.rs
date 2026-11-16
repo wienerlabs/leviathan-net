@@ -1,0 +1,587 @@
+//! A verifier's votes hold its bond until each can no longer cost it
+//! (wienerlabs/leviathan-net#39). Before a withdrawal is finalized, the
+//! wallet's votes are freed where they can be:
+//!
+//! - a standing conviction's votes are released, and a lapsed dispute's
+//!   withdrawn;
+//! - a conviction whose windows have closed is finalized first;
+//! - an overturned verdict's losers are charged up to and including this
+//!   wallet.
+//!
+//! A tie-breaker's share of an overturn's forfeits is credited to its bond.
+
+use anchor_client::solana_sdk::instruction::Instruction;
+use anchor_client::solana_sdk::pubkey::Pubkey;
+use anyhow::Result;
+use psyche_coordinator::Coordinator;
+use psyche_solana_treasurer::state::{appeal_window_open, AuditVerdict, Run, VerdictStatus};
+
+use crate::{instructions, SolanaBackend};
+
+/// Planning runs twice: a finalized conviction's votes, and a bench share
+/// owed once the losers are charged, are only freeable after the first pass.
+const PASSES: usize = 2;
+
+/// What to do about one verdict that holds this wallet's bond or owes it a
+/// bench share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoteStep {
+    /// Release or withdraw the wallet's vote now.
+    Release { target: Pubkey },
+    /// Finalize the conviction: its windows have closed, or it is due and can
+    /// land now. Its votes are released on the next pass.
+    Finalize { target: Pubkey, target_index: u64 },
+    /// The verdict was overturned: charge its losers in order, from the next
+    /// one the crank has not reached through `through_position`.
+    SettleLosers {
+        target: Pubkey,
+        from_position: u16,
+        through_position: u16,
+    },
+    /// Credit the wallet's bench seat its share of the losers' forfeits.
+    CreditBenchSeat { target: Pubkey, seat: u16 },
+    /// The vote can still cost this wallet and nothing can be done yet.
+    Held {
+        target: Pubkey,
+        reason: &'static str,
+    },
+}
+
+/// The chain state a plan is made from.
+pub struct PlanContext<'a> {
+    pub coordinator: &'a Coordinator,
+    pub run: &'a Run,
+    pub now: i64,
+}
+
+/// Where `target` sits on the roster, or `None` off it.
+fn roster_index(coordinator: &Coordinator, target: &Pubkey) -> Option<u64> {
+    coordinator
+        .epoch_state
+        .clients
+        .iter()
+        .position(|client| *client.id.signer() == target.to_bytes())
+        .map(|index| index as u64)
+}
+
+/// What to do about a verdict holding an open vote of `user`'s, at `position`.
+fn vote_step(
+    verdict: &AuditVerdict,
+    position: usize,
+    context: &PlanContext,
+    user: &Pubkey,
+    withdraw_live_votes: bool,
+) -> VoteStep {
+    let target = verdict.target;
+    let consenting = withdraw_live_votes.then_some(user);
+    let round_over = verdict.round_over(context.coordinator);
+    if verdict
+        .releasable_votes(consenting, round_over)
+        .contains(user)
+    {
+        return VoteStep::Release { target };
+    }
+    // Off the roster the index is not read: the conviction is recorded due.
+    let finalize = VoteStep::Finalize {
+        target,
+        target_index: roster_index(context.coordinator, &target).unwrap_or_default(),
+    };
+    match verdict.status {
+        VerdictStatus::Overturned => VoteStep::SettleLosers {
+            target,
+            from_position: verdict.settled_count,
+            through_position: position as u16,
+        },
+        VerdictStatus::Voting => VoteStep::Held {
+            target,
+            reason: "the dispute's round is still under way; it lapses when the round ends, or pass --withdraw-live-votes to withdraw the vote now",
+        },
+        VerdictStatus::SlashPending
+            if context.now < verdict.pending_since_unix + context.run.challenge_window_seconds =>
+        {
+            VoteStep::Held {
+                target,
+                reason: "the conviction is inside its challenge window",
+            }
+        },
+        VerdictStatus::Challenged
+            if appeal_window_open(
+                context.run.appeal_window_seconds,
+                verdict.challenged_since_unix,
+                context.now,
+            ) =>
+        {
+            VoteStep::Held {
+                target,
+                reason: "the conviction is under appeal",
+            }
+        },
+        VerdictStatus::SlashPending | VerdictStatus::Challenged => finalize,
+        // A conviction that stands is releasable; reaching here means the
+        // release itself would be refused, which the chain will say.
+        VerdictStatus::Upheld | VerdictStatus::Due => VoteStep::Held {
+            target,
+            reason: "the vote could not be released",
+        },
+    }
+}
+
+/// What an overturn owes `user`, the tie-breaker at `seat`.
+fn bench_step(verdict: &AuditVerdict, seat: usize) -> Option<VoteStep> {
+    if verdict.status != VerdictStatus::Overturned || verdict.bench_seat_paid(seat) {
+        return None;
+    }
+    let target = verdict.target;
+    if !verdict.all_losers_settled() {
+        return Some(VoteStep::SettleLosers {
+            target,
+            from_position: verdict.settled_count,
+            through_position: verdict.voters.len().saturating_sub(1) as u16,
+        });
+    }
+    (verdict.bench_share() > 0).then_some(VoteStep::CreditBenchSeat {
+        target,
+        seat: seat as u16,
+    })
+}
+
+/// What each verdict in `verdicts` calls for: one holding an open vote of
+/// `user`'s, or one owing `user` a bench share.
+///
+/// A vote on a verdict still `Voting` is withdrawn only once its round is over,
+/// unless `withdraw_live_votes`: the wallet then signs its own withdrawal.
+pub fn plan_vote_steps(
+    verdicts: &[AuditVerdict],
+    context: &PlanContext,
+    user: &Pubkey,
+    withdraw_live_votes: bool,
+) -> Vec<VoteStep> {
+    let mut steps = vec![];
+    for verdict in verdicts {
+        if let Some(position) = verdict.voters.iter().position(|voter| voter == user) {
+            if !verdict.vote_released(position) {
+                steps.push(vote_step(
+                    verdict,
+                    position,
+                    context,
+                    user,
+                    withdraw_live_votes,
+                ));
+            }
+        }
+        if let Some(seat) = verdict.appeal_voters.iter().position(|voter| voter == user) {
+            if let Some(step) = bench_step(verdict, seat) {
+                if !steps.contains(&step) {
+                    steps.push(step);
+                }
+            }
+        }
+    }
+    steps
+}
+
+/// The instructions that carry out `step`, signed by `user`.
+fn step_instructions(
+    step: &VoteStep,
+    verdicts: &[AuditVerdict],
+    treasurer_index: u64,
+    run_state: &Run,
+    user: &Pubkey,
+) -> Vec<Instruction> {
+    match step {
+        VoteStep::Release { target } => {
+            vec![instructions::treasurer_participant_release_verdict_vote(
+                treasurer_index,
+                &run_state.coordinator_account,
+                user,
+                target,
+                user,
+            )]
+        }
+        VoteStep::Finalize {
+            target,
+            target_index,
+        } => vec![instructions::treasurer_run_finalize_slash(
+            treasurer_index,
+            &run_state.coordinator_instance,
+            &run_state.coordinator_account,
+            user,
+            target,
+            *target_index,
+        )],
+        VoteStep::SettleLosers {
+            target,
+            from_position,
+            through_position,
+        } => {
+            let Some(verdict) = verdicts.iter().find(|verdict| verdict.target == *target) else {
+                return vec![];
+            };
+            (*from_position..=*through_position)
+                .filter_map(|position| {
+                    let loser = verdict.voters.get(position as usize)?;
+                    Some(instructions::treasurer_run_slash_losing_verifier(
+                        treasurer_index,
+                        &run_state.coordinator_account,
+                        user,
+                        target,
+                        position,
+                        loser,
+                    ))
+                })
+                .collect()
+        }
+        VoteStep::CreditBenchSeat { target, seat } => {
+            vec![instructions::treasurer_run_pay_bench_bounty(
+                treasurer_index,
+                user,
+                target,
+                *seat,
+                user,
+            )]
+        }
+        VoteStep::Held { .. } => vec![],
+    }
+}
+
+/// Frees what it can of `user`'s open votes in the run, and credits the bench
+/// shares it is owed. Returns the votes that still hold its bond, with why.
+///
+/// Each instruction goes on its own, so one that fails, for instance because
+/// someone else just took the same step, does not stop the others; the next
+/// pass reads the chain again.
+pub async fn free_wallet_votes(
+    backend: &SolanaBackend,
+    treasurer_index: u64,
+    run_address: &Pubkey,
+    run_state: &Run,
+    user: &Pubkey,
+    withdraw_live_votes: bool,
+) -> Result<Vec<(Pubkey, &'static str)>> {
+    let mut held = vec![];
+    for _ in 0..PASSES {
+        let verdicts: Vec<AuditVerdict> = backend
+            .get_treasurer_audit_verdicts(run_address)
+            .await?
+            .into_iter()
+            .map(|(_, verdict)| verdict)
+            .collect();
+        let coordinator = backend
+            .get_coordinator_account(&run_state.coordinator_account)
+            .await?
+            .state
+            .coordinator;
+        let now = backend.get_clock().await?.unix_timestamp;
+        let context = PlanContext {
+            coordinator: &coordinator,
+            run: run_state,
+            now,
+        };
+        let steps = plan_vote_steps(&verdicts, &context, user, withdraw_live_votes);
+        held = steps
+            .iter()
+            .filter_map(|step| match step {
+                VoteStep::Held { target, reason } => Some((*target, *reason)),
+                _ => None,
+            })
+            .collect();
+        let mut sent = 0;
+        for step in &steps {
+            for instruction in step_instructions(step, &verdicts, treasurer_index, run_state, user)
+            {
+                sent += 1;
+                match backend
+                    .send_and_retry("Free verdict votes", &[instruction], &[])
+                    .await
+                {
+                    Ok(signature) => println!("{step:?} in transaction: {signature}"),
+                    Err(error) => println!("{step:?} was not taken: {error:#}"),
+                }
+            }
+        }
+        if sent == 0 {
+            break;
+        }
+    }
+    Ok(held)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+    use psyche_solana_treasurer::state::CommitmentEvidence;
+
+    fn verdict(status: VerdictStatus, voters: &[Pubkey], round_height: u32) -> AuditVerdict {
+        AuditVerdict {
+            bump: 0,
+            run: Pubkey::new_unique(),
+            target: Pubkey::new_unique(),
+            epoch: 0,
+            round_height,
+            status,
+            verdict_count: voters.len() as u16,
+            committed_hash: [0u8; 32],
+            replayed_hash: [0u8; 32],
+            target_index: 0,
+            batch_start: 0,
+            batch_end: 0,
+            evidence: CommitmentEvidence::default(),
+            pending_since_unix: 100,
+            challenged_since_unix: 100,
+            challenger: Pubkey::default(),
+            overturn_count: 0,
+            uphold_count: 0,
+            settled_count: 0,
+            released_voters: 0,
+            bench_bounty_owed: 0,
+            bench_paid: 0,
+            voters: voters.to_vec(),
+            appeal_voters: vec![Pubkey::new_unique()],
+        }
+    }
+
+    /// A coordinator in epoch 0 whose current round is `height`.
+    fn coordinator_in_round(height: u32) -> Coordinator {
+        let mut coordinator = Coordinator::zeroed();
+        let head = coordinator.epoch_state.rounds_head as usize;
+        coordinator.epoch_state.rounds[head].height = height;
+        coordinator
+    }
+
+    /// A run whose challenge window is 50 seconds and appeal window 100.
+    fn run() -> Run {
+        Run {
+            bump: 0,
+            index: 0,
+            main_authority: Pubkey::default(),
+            join_authority: Pubkey::default(),
+            coordinator_account: Pubkey::default(),
+            coordinator_instance: Pubkey::default(),
+            collateral_mint: Pubkey::default(),
+            total_claimed_collateral_amount: 0,
+            total_claimed_earned_points: 0,
+            total_bonded_amount: 0,
+            bond_minimum_amount: 0,
+            bond_withdraw_delay_seconds: 0,
+            slash_bounty_bps: 0,
+            challenge_window_seconds: 50,
+            tie_breaker_committee_size: 0,
+            appeal_window_seconds: 100,
+        }
+    }
+
+    fn plan(
+        verdicts: &[AuditVerdict],
+        coordinator: &Coordinator,
+        now: i64,
+        user: &Pubkey,
+        withdraw_live_votes: bool,
+    ) -> Vec<VoteStep> {
+        let run = run();
+        let context = PlanContext {
+            coordinator,
+            run: &run,
+            now,
+        };
+        plan_vote_steps(verdicts, &context, user, withdraw_live_votes)
+    }
+
+    #[test]
+    fn votes_the_wallet_did_not_cast_are_ignored() {
+        let user = Pubkey::new_unique();
+        let other = verdict(VerdictStatus::Upheld, &[Pubkey::new_unique()], 0);
+        assert!(plan(&[other], &coordinator_in_round(0), 0, &user, false).is_empty());
+    }
+
+    #[test]
+    fn a_standing_conviction_is_released_and_a_released_vote_skipped() {
+        let user = Pubkey::new_unique();
+        let upheld = verdict(VerdictStatus::Upheld, &[user], 0);
+        let due = verdict(VerdictStatus::Due, &[user], 0);
+        let mut released = verdict(VerdictStatus::Due, &[user], 0);
+        released.released_voters = 1;
+        let steps = plan(
+            &[upheld.clone(), due.clone(), released],
+            &coordinator_in_round(0),
+            0,
+            &user,
+            false,
+        );
+        assert_eq!(
+            steps,
+            vec![
+                VoteStep::Release {
+                    target: upheld.target
+                },
+                VoteStep::Release { target: due.target },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_live_vote_is_withdrawn_only_when_asked_and_a_lapsed_one_always() {
+        let user = Pubkey::new_unique();
+        let live = verdict(VerdictStatus::Voting, &[user], 3);
+        let lapsed = verdict(VerdictStatus::Voting, &[user], 2);
+        let coordinator = coordinator_in_round(3);
+        let steps = plan(
+            &[live.clone(), lapsed.clone()],
+            &coordinator,
+            0,
+            &user,
+            false,
+        );
+        assert!(matches!(steps[0], VoteStep::Held { target, .. } if target == live.target));
+        assert_eq!(
+            steps[1],
+            VoteStep::Release {
+                target: lapsed.target
+            }
+        );
+        let steps = plan(std::slice::from_ref(&live), &coordinator, 0, &user, true);
+        assert_eq!(
+            steps,
+            vec![VoteStep::Release {
+                target: live.target
+            }]
+        );
+    }
+
+    #[test]
+    fn a_vote_inside_its_windows_is_held_and_its_conviction_finalized_after() {
+        let user = Pubkey::new_unique();
+        let coordinator = coordinator_in_round(0);
+        // Opened at 100: the challenge window is 50, the appeal window 100.
+        for (status, closes) in [
+            (VerdictStatus::SlashPending, 150),
+            (VerdictStatus::Challenged, 200),
+        ] {
+            let open = verdict(status, &[user], 0);
+            let steps = plan(
+                std::slice::from_ref(&open),
+                &coordinator,
+                closes - 1,
+                &user,
+                true,
+            );
+            assert!(matches!(steps[0], VoteStep::Held { .. }), "{status:?}");
+            let steps = plan(
+                std::slice::from_ref(&open),
+                &coordinator,
+                closes,
+                &user,
+                true,
+            );
+            assert_eq!(
+                steps,
+                vec![VoteStep::Finalize {
+                    target: open.target,
+                    target_index: 0
+                }],
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overturned_verdict_is_cranked_through_the_wallet() {
+        let user = Pubkey::new_unique();
+        let first = Pubkey::new_unique();
+        let mut overturned = verdict(VerdictStatus::Overturned, &[first, user], 0);
+        let coordinator = coordinator_in_round(0);
+        let steps = plan(
+            std::slice::from_ref(&overturned),
+            &coordinator,
+            0,
+            &user,
+            true,
+        );
+        assert_eq!(
+            steps,
+            vec![VoteStep::SettleLosers {
+                target: overturned.target,
+                from_position: 0,
+                through_position: 1,
+            }]
+        );
+        overturned.settled_count = 1;
+        overturned.released_voters = 1;
+        let steps = plan(
+            std::slice::from_ref(&overturned),
+            &coordinator,
+            0,
+            &user,
+            true,
+        );
+        assert_eq!(
+            steps,
+            vec![VoteStep::SettleLosers {
+                target: overturned.target,
+                from_position: 1,
+                through_position: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tie_breaker_is_credited_once_every_loser_is_charged() {
+        let user = Pubkey::new_unique();
+        let losers = [Pubkey::new_unique(), Pubkey::new_unique()];
+        let mut overturned = verdict(VerdictStatus::Overturned, &losers, 0);
+        overturned.appeal_voters = vec![Pubkey::new_unique(), user];
+        let coordinator = coordinator_in_round(0);
+        let steps = plan(
+            std::slice::from_ref(&overturned),
+            &coordinator,
+            0,
+            &user,
+            false,
+        );
+        assert_eq!(
+            steps,
+            vec![VoteStep::SettleLosers {
+                target: overturned.target,
+                from_position: 0,
+                through_position: 1,
+            }]
+        );
+        overturned.settled_count = 2;
+        overturned.released_voters = 0b11;
+        overturned.bench_bounty_owed = 100;
+        let steps = plan(
+            std::slice::from_ref(&overturned),
+            &coordinator,
+            0,
+            &user,
+            false,
+        );
+        assert_eq!(
+            steps,
+            vec![VoteStep::CreditBenchSeat {
+                target: overturned.target,
+                seat: 1,
+            }]
+        );
+        // Credited already, or owed nothing: no step.
+        overturned.bench_paid = 0b10;
+        assert!(plan(
+            std::slice::from_ref(&overturned),
+            &coordinator,
+            0,
+            &user,
+            false
+        )
+        .is_empty());
+        overturned.bench_paid = 0;
+        overturned.bench_bounty_owed = 1;
+        assert!(plan(
+            std::slice::from_ref(&overturned),
+            &coordinator,
+            0,
+            &user,
+            false
+        )
+        .is_empty());
+    }
+}

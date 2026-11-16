@@ -46,7 +46,11 @@ pub struct RunSubmitAuditVerdictAccounts<'info> {
     #[account()]
     pub verifier: Signer<'info>,
 
+    /// Writable because the vote is counted on it: an overturn would charge
+    /// this bond, so it cannot leave while the vote is at stake
+    /// (wienerlabs/leviathan-net#39).
     #[account(
+        mut,
         seeds = [
             Participant::SEEDS_PREFIX,
             run.key().as_ref(),
@@ -287,6 +291,7 @@ pub fn run_submit_audit_verdict_processor(
 
         verdict.voters.push(verifier_key);
         verdict.verdict_count += 1;
+        context.accounts.verifier_participant.open_verdict_vote()?;
 
         msg!(
             "audit_verdict: target_index={} epoch={} round={} count={} quorum={}",

@@ -1,3 +1,4 @@
+mod appeals_harness;
 mod bonded_run;
 mod chain_state;
 mod memnet_authorizer_full_cycle;
@@ -29,6 +30,7 @@ mod memnet_treasurer_full_epoch;
 mod memnet_treasurer_join_gate;
 mod memnet_treasurer_slash_accounting_order;
 mod memnet_treasurer_slash_settle;
+mod memnet_treasurer_verifier_liability;
 mod memnet_treasurer_withdraw_hold;
 mod refusal;
 mod signed_payload;

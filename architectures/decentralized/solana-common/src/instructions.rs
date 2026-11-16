@@ -515,11 +515,132 @@ pub fn treasurer_participant_bond_finalize_withdraw(
             coordinator_account: *coordinator_account,
             participant,
             audit_verdict,
-            appeal_verdict: None,
             token_program: token::ID,
         },
         psyche_solana_treasurer::instruction::ParticipantBondFinalizeWithdraw {
             params: psyche_solana_treasurer::logic::ParticipantBondFinalizeWithdrawParams {},
+        },
+    )
+}
+
+/// `authority` releases `voter`'s vote on `target`'s verdict in run
+/// `treasurer_index`, once the verdict says the vote can no longer cost it.
+/// Anyone may send it; when `authority` is the voter itself, a vote whose
+/// round is still under way is withdrawn as well
+/// (wienerlabs/leviathan-net#39).
+pub fn treasurer_participant_release_verdict_vote(
+    treasurer_index: u64,
+    coordinator_account: &Pubkey,
+    authority: &Pubkey,
+    target: &Pubkey,
+    voter: &Pubkey,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::ParticipantReleaseVerdictVoteAccounts {
+            authority: *authority,
+            run,
+            coordinator_account: *coordinator_account,
+            audit_verdict: psyche_solana_treasurer::find_audit_verdict(&run, target),
+            participant: psyche_solana_treasurer::find_participant(&run, voter),
+        },
+        psyche_solana_treasurer::instruction::ParticipantReleaseVerdictVote {
+            params: psyche_solana_treasurer::logic::ParticipantReleaseVerdictVoteParams {
+                target: *target,
+                voter: *voter,
+            },
+        },
+    )
+}
+
+/// Charges the losing verifier `loser`, at `voter_position` of `target`'s
+/// overturned verdict in run `treasurer_index`, and records what its forfeit
+/// owes the bench. Anyone may send it (wienerlabs/leviathan-net#39).
+pub fn treasurer_run_slash_losing_verifier(
+    treasurer_index: u64,
+    coordinator_account: &Pubkey,
+    payer: &Pubkey,
+    target: &Pubkey,
+    voter_position: u16,
+    loser: &Pubkey,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunSlashLosingVerifierAccounts {
+            payer: *payer,
+            run,
+            coordinator_account: *coordinator_account,
+            audit_verdict: psyche_solana_treasurer::find_audit_verdict(&run, target),
+            loser_participant: psyche_solana_treasurer::find_participant(&run, loser),
+        },
+        psyche_solana_treasurer::instruction::RunSlashLosingVerifier {
+            params: psyche_solana_treasurer::logic::RunSlashLosingVerifierParams {
+                target: *target,
+                voter_position,
+                loser: *loser,
+            },
+        },
+    )
+}
+
+/// Credits `tie_breaker`, at `seat` of `target`'s overturned verdict in run
+/// `treasurer_index`, its share of the losers' forfeits, to its bond. Anyone
+/// may send it once every loser is charged (wienerlabs/leviathan-net#39).
+pub fn treasurer_run_pay_bench_bounty(
+    treasurer_index: u64,
+    payer: &Pubkey,
+    target: &Pubkey,
+    seat: u16,
+    tie_breaker: &Pubkey,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunPayBenchBountyAccounts {
+            payer: *payer,
+            run,
+            audit_verdict: psyche_solana_treasurer::find_audit_verdict(&run, target),
+            tie_breaker_participant: psyche_solana_treasurer::find_participant(&run, tie_breaker),
+        },
+        psyche_solana_treasurer::instruction::RunPayBenchBounty {
+            params: psyche_solana_treasurer::logic::RunPayBenchBountyParams {
+                target: *target,
+                seat,
+                tie_breaker: *tie_breaker,
+            },
+        },
+    )
+}
+
+/// Finalises `target`'s conviction in run `treasurer_index` once its windows
+/// have closed, or once it is due and can land, with the target at
+/// `target_index` on the roster now. Anyone may send it.
+pub fn treasurer_run_finalize_slash(
+    treasurer_index: u64,
+    coordinator_instance: &Pubkey,
+    coordinator_account: &Pubkey,
+    payer: &Pubkey,
+    target: &Pubkey,
+    target_index: u64,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunFinalizeSlashAccounts {
+            payer: *payer,
+            run,
+            coordinator_instance: *coordinator_instance,
+            coordinator_account: *coordinator_account,
+            audit_verdict: psyche_solana_treasurer::find_audit_verdict(&run, target),
+            coordinator_program: psyche_solana_coordinator::ID,
+        },
+        psyche_solana_treasurer::instruction::RunFinalizeSlash {
+            params: psyche_solana_treasurer::logic::RunFinalizeSlashParams {
+                target: *target,
+                target_index,
+            },
         },
     )
 }
