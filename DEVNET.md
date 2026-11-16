@@ -90,6 +90,14 @@ programs in place would leave their version 1 runs unable to pay out or release
 a bond. The dashboard decoder checks the version too, and has to accept 3 when
 it ships.
 
+The treasurer's accounts changed in the same deployment
+(wienerlabs/leviathan-net#39). `Participant` gained the count of verdict votes
+that still hold the bond (69 bytes). `AuditVerdict` gained which votes are
+released and what an overturn owes the bench (4392 bytes). Older, shorter
+accounts do not decode with the new layout and carry votes nobody counted, so
+these are for the new deployment's runs only, never a migration of the current
+ones. The dashboard decoder has to learn both lengths.
+
 ## Run a node
 
 If you have nothing set up yet, one line fetches everything, checks your
@@ -132,6 +140,31 @@ without ever reaching the ledger is charged against the bond as part of the
 withdrawal. `bond-status` says whether the withdrawal is held, why, or that it
 will settle a conviction, and `bond-withdraw-finalize` checks the same thing,
 against the cluster clock, before it sends anything.
+
+A verifier's votes hold its bond too, until each can no longer cost it
+(wienerlabs/leviathan-net#39). A vote counts from the moment it is cast, and it
+stops counting in one of three ways:
+
+- The conviction stands. The vote is then released.
+- The verdict never reached quorum. Once its round is over the vote is
+  withdrawn, or the voter can withdraw it sooner.
+- An appeal overturned the verdict, and the losing-verifier crank charged the
+  bond.
+
+`bond-withdraw-finalize` frees what it can before it withdraws:
+
+- it releases and withdraws votes;
+- it finalises a conviction whose windows have closed;
+- it cranks an overturned verdict's losers up to and including this wallet;
+- on a tie-breaker's wallet, it credits the bond with its share of an
+  overturn's forfeits.
+
+Each step goes in its own transaction, and a step that fails does not stop the
+others. The command names any vote that still holds the bond, and says why.
+Pass `--withdraw-live-votes` to also withdraw votes whose round is still under
+way; they stop counting toward a conviction. `bond-status` shows how many votes
+still hold the bond. Listing the run's verdicts needs an RPC endpoint that
+serves `getProgramAccounts`.
 
 The wallet needs a little devnet SOL for transaction fees. Override `RUN_ID`,
 `RPC`, `WS_RPC`, `TORCH_VENV` or `AUTHORIZER` via env if needed.

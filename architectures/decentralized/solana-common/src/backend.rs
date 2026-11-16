@@ -9,7 +9,8 @@ use anchor_client::{
     anchor_lang::system_program,
     solana_client::{
         nonblocking::pubsub_client::PubsubClient,
-        rpc_config::{RpcAccountInfoConfig, RpcTransactionConfig},
+        rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig},
+        rpc_filter::{Memcmp, RpcFilterType},
         rpc_response::Response as RpcResponse,
     },
     solana_sdk::{
@@ -494,6 +495,56 @@ impl SolanaBackend {
         let data = self.get_data(treasurer_participant).await?;
         psyche_solana_treasurer::state::Participant::try_deserialize(&mut data.as_slice())
             .map_err(|error| anyhow!("Unable to decode treasurer participant data: {error}"))
+    }
+
+    /// Every audit verdict the treasurer holds for `treasurer_run`, with its
+    /// address. A verdict account keeps the run at a fixed offset, right after
+    /// its discriminator and bump, so the cluster filters by it.
+    pub async fn get_treasurer_audit_verdicts(
+        &self,
+        treasurer_run: &Pubkey,
+    ) -> Result<Vec<(Pubkey, psyche_solana_treasurer::state::AuditVerdict)>> {
+        use anchor_client::anchor_lang::Discriminator;
+        use psyche_solana_treasurer::state::AuditVerdict;
+        const RUN_OFFSET: usize = 8 + 1;
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![
+                RpcFilterType::DataSize(AuditVerdict::space_with_discriminator() as u64),
+                RpcFilterType::Memcmp(Memcmp::new_base58_encoded(0, AuditVerdict::DISCRIMINATOR)),
+                RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
+                    RUN_OFFSET,
+                    treasurer_run.as_ref(),
+                )),
+            ]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let accounts = self
+            .rpc_with_fallback("get_treasurer_audit_verdicts", |coord| {
+                let config = config.clone();
+                async move {
+                    coord
+                        .rpc()
+                        .get_program_accounts_with_config(&psyche_solana_treasurer::ID, config)
+                        .await
+                        .map_err(Into::into)
+                }
+            })
+            .await
+            .context(
+                "Unable to list the run's audit verdicts: the RPC endpoint has to serve getProgramAccounts",
+            )?;
+        accounts
+            .into_iter()
+            .map(|(address, account)| {
+                AuditVerdict::try_deserialize(&mut account.data.as_slice())
+                    .map(|verdict| (address, verdict))
+                    .map_err(|error| anyhow!("Unable to decode audit verdict {address}: {error}"))
+            })
+            .collect()
     }
 
     pub async fn get_token_account(

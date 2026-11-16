@@ -419,6 +419,22 @@ wrongly, you pay" — is optional for anyone paying attention.
 outstanding and settle against the bond directly (the treasurer holds it; it
 does not need the coordinator's client list to know who owes what).
 
+**Status.** The crank first kept its place on a miss
+(`LoserNotSlashableYet`), so a loser was settled once it was back on a
+roster that would be charged. That left two gaps (wienerlabs/leviathan-net#39):
+
+- A loser that never came back, or a run that halted, was never settled.
+- Nothing held the loser's bond, so it could withdraw before the crank, or
+  even during the appeal.
+
+Both are closed:
+
+- The crank now settles against the bond directly, as this fix proposed. The
+  bench's share is credited to each tie-breaker's bond afterwards, seat by
+  seat, so no payout can stop a loser being charged.
+- Every verdict vote is counted on the voter's participant account, and a
+  withdrawal is refused until each vote is released or charged.
+
 ## 9. No evidence consensus; the last voter overwrites the record (Medium)
 
 **File:** `.../logic/run_submit_audit_verdict.rs:149-153`
@@ -1092,7 +1108,9 @@ Listed so the external audit does not spend hours re-deriving these.
   Sound, as the issue hoped. The problem is what happens on a miss (finding 8),
   not the walk.
 - The loser is resolved by public key against the live client list, not by a
-  stored index. Correct.
+  stored index. Correct. (Since wienerlabs/leviathan-net#39 the crank charges
+  the loser's participant account, named by the verdict at the position, and
+  no longer reads the client list.)
 
 **`participant_bond_finalize_withdraw.rs`**
 - The voter branch validates every recipient three ways: unpacks it as a

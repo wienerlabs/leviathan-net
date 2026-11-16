@@ -17,21 +17,32 @@ fn run_is_the_length_the_web_decoder_expects() {
     assert_eq!(Run::space_with_discriminator(), 237);
 }
 
-/// Mirrors the participant length check in the same file.
+/// Mirrors the participant length check in the same file, which knows 65.
+/// This generation is 4 bytes longer: `open_verdict_votes` (u32) follows
+/// `bond_withdraw_delay_snapshot` at the end, counting the votes that still
+/// hold the bond (wienerlabs/leviathan-net#39). The fields before it are where
+/// they were, so a 65-byte decoder reads a 69-byte account correctly except
+/// for the count; the length check has to learn 69.
 #[test]
 fn participant_is_the_length_the_web_decoder_expects() {
-    assert_eq!(Participant::space_with_discriminator(), 65);
+    assert_eq!(Participant::space_with_discriminator(), 69);
 }
 
 /// Mirrors `VERDICT_LAYOUT_BY_SIZE` in the same file, which stops at 4328
-/// (`appealsWithDeadline`). This is a fourth generation, 40 bytes longer.
-/// The verdict records the payload the target signed: `evidence` (step u32,
-/// trainer nonce u32, results digest 32 bytes) sits between `batch_end` and
-/// `pending_since_unix` (wienerlabs/leviathan-net#43). A decoder has to learn
-/// 4368 before it reads accounts from the deployment carrying it. Read with
-/// the 4328 layout, `evidence` lands in `pending_since_unix` and every field
-/// after it.
+/// (`appealsWithDeadline`). Two generations followed it:
+///
+/// - 4368 records the payload the target signed: `evidence` (step u32,
+///   trainer nonce u32, results digest 32 bytes) sits between `batch_end` and
+///   `pending_since_unix` (wienerlabs/leviathan-net#43).
+/// - 4392, this one, adds three u64 fields between `settled_count` and
+///   `voters` (wienerlabs/leviathan-net#39): `released_voters` (one bit per
+///   voter), `bench_bounty_owed` and `bench_paid` (one bit per appeal voter).
+///   Read with the 4368 layout, they land in the voter list's length and
+///   every voter after it is misread.
+///
+/// A decoder has to learn 4392 before it reads accounts from the deployment
+/// carrying it.
 #[test]
 fn audit_verdict_is_the_length_the_web_decoder_expects() {
-    assert_eq!(AuditVerdict::space_with_discriminator(), 4368);
+    assert_eq!(AuditVerdict::space_with_discriminator(), 4392);
 }

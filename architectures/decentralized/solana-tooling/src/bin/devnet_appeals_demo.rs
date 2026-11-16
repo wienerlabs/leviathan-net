@@ -25,7 +25,10 @@ use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::ensure_coordinator_version;
+use psyche_solana_tooling::get_accounts::get_participant;
 use psyche_solana_tooling::get_accounts::get_run;
+use psyche_solana_tooling::verdict_votes::process_treasurer_run_slash_losing_verifier;
+use psyche_solana_treasurer::find_participant;
 use psyche_solana_tooling::signed_commitment::payload_dump_digest;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
@@ -38,7 +41,6 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_open_challenge;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_challenge_config;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash_losing_verifier;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_appeal_verdict;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_update;
@@ -512,35 +514,41 @@ async fn run() -> Result<()> {
             &payer,
             &run,
             &coordinator_account,
-            &run_id,
             &target_key,
             position as u16,
         )
         .await?;
-        println!("    verifier at position {position} ejected for a wrongful conviction");
+        println!(
+            "    verifier at position {position} charged for a wrongful conviction"
+        );
     }
 
-    println!("[+] driving to epoch end to settle the bonds");
-    let mut verifier_slashed = vec![0u64; verifier_keys.len()];
-    let mut target_slashed = 0;
-    for _ in 0..24 {
-        sleep_seconds(COOLDOWN_TIME).await;
-        let _ = process_coordinator_tick_and_reveal(
-            &mut endpoint,
-            &payer,
-            &ticker,
-            &coordinator_instance,
-            &coordinator_account,
-        )
-        .await;
-        for (i, key) in verifier_keys.iter().enumerate() {
-            verifier_slashed[i] = slashed_of(&mut endpoint, &coordinator_account, key).await;
+    // The crank charges each loser's bond directly, wherever it is, so the
+    // forfeit shows on its participant account at once and never on the
+    // coordinator's ledger (wienerlabs/leviathan-net#39).
+    let mut verifier_bonds = vec![];
+    for key in &verifier_keys {
+        let participant =
+            get_participant(&mut endpoint, &find_participant(&run, key))
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("verifier {key} has no participant account")
+                })?;
+        if participant.open_verdict_votes != 0 {
+            return Err(anyhow!(
+                "verifier {key} still has {} open verdict votes after the crank",
+                participant.open_verdict_votes
+            ));
         }
-        target_slashed = slashed_of(&mut endpoint, &coordinator_account, &target_key).await;
-        if verifier_slashed.iter().all(|s| *s > 0) {
-            break;
-        }
+        verifier_bonds.push(participant.bond_amount);
     }
+    let target_bond =
+        get_participant(&mut endpoint, &find_participant(&run, &target_key))
+            .await?
+            .ok_or_else(|| anyhow!("the target has no participant account"))?
+            .bond_amount;
+    let target_slashed =
+        slashed_of(&mut endpoint, &coordinator_account, &target_key).await;
 
     println!();
     println!("Summary");
@@ -548,17 +556,38 @@ async fn run() -> Result<()> {
     println!("  verifier quorum      {}", verifier_quorum);
     println!("  tie-breaker quorum   {}", tie_breaker_quorum);
     println!("  target slashed       {} (expected 0, the wrongful accusation is reversed)", target_slashed);
-    for (i, s) in verifier_slashed.iter().enumerate() {
-        println!("  verifier {} slashed   {} (expected {}, the losing side forfeits)", i + 1, s, SLASHING_RATE);
+    println!(
+        "  target bond          {} (expected {}, the target keeps it)",
+        target_bond, BOND
+    );
+    for (i, bond) in verifier_bonds.iter().enumerate() {
+        println!(
+            "  verifier {} bond      {} (expected {}, the losing side forfeits {})",
+            i + 1,
+            bond,
+            BOND - SLASHING_RATE,
+            SLASHING_RATE
+        );
     }
     println!("  run                  {}", run);
     println!("  coordinator          {}", coordinator_account);
 
-    if target_slashed != 0 {
-        return Err(anyhow!("overturned target must not be slashed, got {}", target_slashed));
+    if target_slashed != 0 || target_bond != BOND {
+        return Err(anyhow!(
+            "overturned target must keep its bond, got slashed {} and bond {}",
+            target_slashed,
+            target_bond
+        ));
     }
-    if verifier_slashed.iter().any(|s| *s != SLASHING_RATE) {
-        return Err(anyhow!("each losing verifier must forfeit {}, got {:?}", SLASHING_RATE, verifier_slashed));
+    if verifier_bonds
+        .iter()
+        .any(|bond| *bond != BOND - SLASHING_RATE)
+    {
+        return Err(anyhow!(
+            "each losing verifier must forfeit {}, bonds now {:?}",
+            SLASHING_RATE,
+            verifier_bonds
+        ));
     }
     println!("[+] live devnet appeals court verified: the losing side lost its bond, the innocent target kept its own");
     Ok(())

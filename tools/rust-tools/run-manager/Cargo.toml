@@ -43,6 +43,7 @@ futures.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+bytemuck.workspace = true
 serial_test = "3.0"
 
 [build-dependencies]

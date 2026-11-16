@@ -166,6 +166,20 @@ pub mod psyche_solana_treasurer {
     ) -> Result<()> {
         run_slash_losing_verifier_processor(context, params)
     }
+
+    pub fn run_pay_bench_bounty(
+        context: Context<RunPayBenchBountyAccounts>,
+        params: RunPayBenchBountyParams,
+    ) -> Result<()> {
+        run_pay_bench_bounty_processor(context, params)
+    }
+
+    pub fn participant_release_verdict_vote(
+        context: Context<ParticipantReleaseVerdictVoteAccounts>,
+        params: ParticipantReleaseVerdictVoteParams,
+    ) -> Result<()> {
+        participant_release_verdict_vote_processor(context, params)
+    }
 }
 
 #[error_code]
@@ -263,9 +277,6 @@ pub enum ProgramError {
     #[msg("An audit verdict exists for this participant and must be provided")]
     AuditVerdictRequired,
 
-    #[msg("The losing verifier is not in a slashable state yet; retry while it is")]
-    LoserNotSlashableYet,
-
     #[msg("This run is not gated by its own bond; join it through its join authority")]
     RunNotBondGated,
 
@@ -291,4 +302,28 @@ pub enum ProgramError {
         "The commitment a conviction cites was not made in the current epoch"
     )]
     CommitmentOutsideEpoch,
+
+    #[msg("This participant voted on a verdict that can still cost it; release each vote once it can no longer, then withdraw")]
+    VerdictVotesOpen,
+
+    #[msg("This vote can still cost its voter: its verdict may yet be overturned, or was overturned and waits for run_slash_losing_verifier")]
+    VoteStillAtStake,
+
+    #[msg("This vote no longer holds its voter's bond")]
+    VoteAlreadyReleased,
+
+    #[msg("This key did not vote on this verdict")]
+    NotAVoter,
+
+    #[msg("The participant's count of open verdict votes disagrees with the verdicts")]
+    OpenVerdictVotesInconsistent,
+
+    #[msg("The bench is paid once every losing verifier has been charged")]
+    LosersNotAllSettled,
+
+    #[msg("This tie-breaker's share has already been paid")]
+    BenchSeatPaid,
+
+    #[msg("The losing verifiers' forfeits owe the bench nothing")]
+    NothingOwedToBench,
 }

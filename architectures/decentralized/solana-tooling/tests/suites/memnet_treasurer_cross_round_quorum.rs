@@ -65,7 +65,15 @@ use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
 use std::collections::HashSet;
 
+use psyche_solana_tooling::get_accounts::get_participant;
 use psyche_solana_tooling::get_accounts::get_run;
+use psyche_solana_tooling::verdict_votes::settle_previous_dispute;
+use psyche_solana_treasurer::find_participant;
+use psyche_solana_treasurer::state::Participant;
+use psyche_solana_treasurer::ProgramError;
+
+use super::refusal::refusal_code;
+use super::refusal::treasurer_refusal;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 
 use super::signed_payload::identity;
@@ -409,9 +417,62 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         "the target is still healthy going into the second vote"
     );
 
+    // The lapsed dispute still holds its voter's bond, so the account cannot
+    // be taken over for today's round while that vote stands. Anyone may
+    // withdraw a vote once its round is over, as the verifier daemon does
+    // before it votes (wienerlabs/leviathan-net#39).
+    let first_voter_participant = find_participant(&run, &first_voter);
+    let open_votes = |participant: Option<Participant>| {
+        participant.unwrap().open_verdict_votes
+    };
+    assert_eq!(
+        open_votes(
+            get_participant(&mut endpoint, &first_voter_participant)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        refusal_code(
+            cast(
+                &mut endpoint,
+                &payer,
+                keypair_for(&clients, &second_voter),
+                &run,
+                &coordinator_account,
+                &target_key,
+                &commitment,
+            )
+            .await
+        ),
+        treasurer_refusal(ProgramError::PreviousVerdictUnsettled),
+        "a lapsed dispute with a vote on it is not taken over",
+    );
+    let settled = settle_previous_dispute(
+        &mut endpoint,
+        &payer,
+        &run,
+        &coordinator_account,
+        &target_key,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.votes_freed, 1);
+    assert_eq!(
+        open_votes(
+            get_participant(&mut endpoint, &first_voter_participant)
+                .await
+                .unwrap()
+        ),
+        0
+    );
+
     // The vote is accepted - this verifier is properly seated today - but it
     // opens a fresh count for today's round instead of completing the one from
-    // the round that has since ended.
+    // the round that has since ended. The clock moves so it is not the
+    // transaction that was just refused.
+    endpoint.forward_clock_slot(1).await.unwrap();
     cast(
         &mut endpoint,
         &payer,

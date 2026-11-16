@@ -27,7 +27,7 @@ The protocol and its security layer are built and proven on devnet. What is left
 | 0, Proof | Done | 5 of 5 | Sim on real transformer gradients, decision log, whitepaper, the site |
 | 1, Devnet core | Done | 10 of 10 | Bond custody, audit lottery, slash, verifier core, live conviction |
 | 2, Genesis readiness | In progress | 15 of 34 | Jury, appeals, a live cheater slashed, rented GPUs. Next: model, data, rehearsals |
-| 3, Mainnet | Prepared | 5 of 21 | Runbooks and briefs are written. Waits on the audit, counsel and tokenomics |
+| 3, Mainnet | Prepared | 7 of 22 | Runbooks and briefs are written. Waits on the audit, counsel and tokenomics |
 | 4, The second loop | Not started | 0 of 5 | Inference revenue and futarchy close the loop |
 
 October so far:
@@ -115,7 +115,7 @@ Sourced from the issues in the three repositories, the task ladder and the launc
 | Open, milestone | **Telemetry retro: go or no-go for 1B.** The decision is no-go until the Phase 2 gates pass. | Training and data | [leviathan#3](https://github.com/wienerlabs/leviathan/issues/3) |
 | Open, milestone | **First public run: the 1B flagship, bondless stage one.** Public invitation, a finish line in tokens, a loss curve anyone can watch. | Training and data | [net#11](https://github.com/wienerlabs/leviathan-net/issues/11) |
 
-### Phase 3, Mainnet: 6 of 21 done
+### Phase 3, Mainnet: 7 of 22 done
 
 | Status | Item | Track | Ref |
 |---|---|---|---|
@@ -125,6 +125,7 @@ Sourced from the issues in the three repositories, the task ladder and the launc
 | Done | **Mainnet deploy runbook.** Prerequisites, program order, authority handover, emergency path. | Network | [MAINNET_DEPLOY](https://github.com/wienerlabs/leviathan/blob/main/docs/launch/MAINNET_DEPLOY.md) |
 | Done | **Genesis launch checklist and disclosures.** Launch-day sequence and the kill criteria. | Product | [GENESIS_LAUNCH](https://github.com/wienerlabs/leviathan/blob/main/docs/launch/GENESIS_LAUNCH.md) |
 | Done | **Round seeds no client or ticker can grind.** Committed to a slot before its hash exists and revealed from the `SlotHashes` sysvar, with no witness, health check or pause taken in between, in place of sha256 of the timestamp and slot. The committed slot's leader still chooses; see the risks below. | Protocol | [net#62](https://github.com/wienerlabs/leviathan-net/issues/62) |
+| Done | **A verifier cannot leave before an overturn reaches its bond.** Each vote holds the verifier's bond until the verdict can no longer cost it, and the losing-verifier crank charges the bond directly, wherever the verifier is; the bench's share is credited to each tie-breaker's bond. | Protocol | [net#39](https://github.com/wienerlabs/leviathan-net/issues/39) |
 | Open | **Outside security audit, critical and high closed.** The gate for bonds, mainnet and the TGE. | Audit and legal | [leviathan#4](https://github.com/wienerlabs/leviathan/issues/4) |
 | Open | **Legal opinion on the bond and the token.** Classification, collateral and payout structure. | Audit and legal | [leviathan#5](https://github.com/wienerlabs/leviathan/issues/5) |
 | Open | **Token numbers locked after counsel.** Allocation, vesting, emission and the real bond parameters. | Economics | [leviathan#6](https://github.com/wienerlabs/leviathan/issues/6) |

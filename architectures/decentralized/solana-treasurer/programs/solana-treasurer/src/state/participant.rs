@@ -1,6 +1,8 @@
 use anchor_lang::prelude::*;
 use psyche_solana_coordinator::CoordinatorAccount;
 
+use crate::ProgramError;
+
 /// The points the coordinator has charged against `user`, read from its
 /// permanent client ledger. A signer that never joined the run owes nothing.
 ///
@@ -43,6 +45,18 @@ pub struct Participant {
     /// window that can be closed retroactively is not that window
     /// (wienerlabs/leviathan#15, finding 17).
     pub bond_withdraw_delay_snapshot: i64,
+
+    /// Votes this participant cast on audit verdicts that can still cost it
+    /// its bond.
+    ///
+    /// A verdict that is overturned charges every verifier that voted for it,
+    /// and that liability is recorded only on the target's verdict. A count here
+    /// is what lets a withdrawal see it: a vote is counted when it is cast, and
+    /// stops counting once the verdict stands, the vote is withdrawn from a
+    /// verdict that never reached quorum, or the losing-verifier crank has
+    /// charged it. Until then the bond cannot leave
+    /// (wienerlabs/leviathan-net#39).
+    pub open_verdict_votes: u32,
 }
 
 impl Participant {
@@ -90,6 +104,50 @@ impl Participant {
             + 8 // bond_withdraw_requested_at
             + 8 // bond_settled_slashed_points
             + 8 // bond_withdraw_delay_snapshot
+            + 4 // open_verdict_votes
+    }
+
+    /// Counts a vote this participant just cast.
+    pub fn open_verdict_vote(&mut self) -> Result<()> {
+        self.open_verdict_votes =
+            self.open_verdict_votes.checked_add(1).ok_or_else(|| {
+                error!(ProgramError::OpenVerdictVotesInconsistent)
+            })?;
+        Ok(())
+    }
+
+    /// Stops counting a vote that can no longer cost this participant.
+    ///
+    /// Every vote is counted once when it is cast and closed at most once,
+    /// through the verdict's own record of it, so a count that would go below
+    /// zero means that record and this count disagree. It is refused rather
+    /// than clamped, so the disagreement shows.
+    pub fn close_verdict_vote(&mut self) -> Result<()> {
+        self.open_verdict_votes =
+            self.open_verdict_votes.checked_sub(1).ok_or_else(|| {
+                error!(ProgramError::OpenVerdictVotesInconsistent)
+            })?;
+        Ok(())
+    }
+
+    /// Forfeits up to `amount` of the bond, out of what convictions the ledger
+    /// already charged do not claim, and returns what it took.
+    ///
+    /// This is a charge the coordinator's ledger never sees, so it is not
+    /// counted as a settled point: counting it would hide a later conviction of
+    /// the same size. A pending withdrawal is cut down to what is left, so it
+    /// never asks for more than the bond holds.
+    pub fn forfeit_unclaimed_bond(
+        &mut self,
+        amount: u64,
+        coordinator_slashed_points: u64,
+    ) -> u64 {
+        let forfeit =
+            amount.min(self.unforfeited_bond(coordinator_slashed_points));
+        self.bond_amount -= forfeit;
+        self.bond_withdraw_pending_amount =
+            self.bond_withdraw_pending_amount.min(self.bond_amount);
+        forfeit
     }
 }
 
@@ -111,6 +169,7 @@ mod tests {
             bond_withdraw_requested_at: 0,
             bond_settled_slashed_points: settled_points,
             bond_withdraw_delay_snapshot: 0,
+            open_verdict_votes: 0,
         }
     }
 
@@ -153,5 +212,57 @@ mod tests {
         let p = participant(500, 0, 500);
         assert_eq!(p.unforfeited_bond(900), 0);
         assert_eq!(p.committed_bond(900), 0);
+    }
+
+    #[test]
+    fn votes_are_counted_open_and_closed_once_each() {
+        let mut p = participant(500, 0, 0);
+        p.open_verdict_vote().unwrap();
+        p.open_verdict_vote().unwrap();
+        assert_eq!(p.open_verdict_votes, 2);
+        p.close_verdict_vote().unwrap();
+        p.close_verdict_vote().unwrap();
+        assert_eq!(p.open_verdict_votes, 0);
+        assert!(p.close_verdict_vote().is_err());
+        assert_eq!(p.open_verdict_votes, 0);
+    }
+
+    #[test]
+    fn a_full_vote_count_refuses_another_vote() {
+        let mut p = participant(500, 0, 0);
+        p.open_verdict_votes = u32::MAX;
+        assert!(p.open_verdict_vote().is_err());
+        assert_eq!(p.open_verdict_votes, u32::MAX);
+    }
+
+    #[test]
+    fn a_forfeit_takes_the_amount_from_the_bond() {
+        let mut p = participant(500, 0, 0);
+        assert_eq!(p.forfeit_unclaimed_bond(200, 0), 200);
+        assert_eq!(p.bond_amount, 300);
+        // Not a ledger charge, so nothing is recorded as settled.
+        assert_eq!(p.bond_settled_slashed_points, 0);
+    }
+
+    #[test]
+    fn a_forfeit_leaves_what_the_ledger_already_claims() {
+        // 400 of the bond is already owed to an unsettled conviction.
+        let mut p = participant(500, 0, 0);
+        assert_eq!(p.forfeit_unclaimed_bond(200, 400), 100);
+        assert_eq!(p.bond_amount, 400);
+        assert_eq!(p.unforfeited_bond(400), 0);
+        assert_eq!(p.forfeit_unclaimed_bond(200, 400), 0);
+        assert_eq!(p.bond_amount, 400);
+    }
+
+    #[test]
+    fn a_forfeit_cuts_a_pending_withdrawal_down_to_the_bond() {
+        let mut p = participant(500, 0, 500);
+        p.forfeit_unclaimed_bond(200, 0);
+        assert_eq!(p.bond_withdraw_pending_amount, 300);
+        // A smaller request is left alone.
+        let mut q = participant(500, 0, 100);
+        q.forfeit_unclaimed_bond(200, 0);
+        assert_eq!(q.bond_withdraw_pending_amount, 100);
     }
 }

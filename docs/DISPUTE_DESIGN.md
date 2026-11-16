@@ -59,12 +59,65 @@ so a client is never both a verifier and its own appeals judge. The whole appeal
 court is five treasurer instructions (`run_set_challenge_config`,
 `run_open_challenge`, `run_submit_appeal_verdict`, `run_finalize_slash`,
 `run_slash_losing_verifier`) plus a lifecycle on the existing `AuditVerdict`
-account. Only the treasurer was rebuilt and redeployed. The losing side forfeits
-its bond through the same slash-then-settle path the target already used: an
-overturned verdict ejects the convicting verifiers, and their bonds settle at the
-epoch boundary exactly as a cheater's would. Verified live on devnet: two
-verifiers convict, the target appeals, two tie-breakers overturn, both verifiers
-forfeit 200 while the innocent target keeps its full bond.
+account. Only the treasurer was rebuilt and redeployed. Verified live on devnet:
+two verifiers convict, the target appeals, two tie-breakers overturn, both
+verifiers forfeit 200 while the innocent target keeps its full bond.
+
+The losing side first forfeited its bond through the slash-then-settle path the
+target used: the crank ejected each convicting verifier, the epoch's end charged
+the ejection, and the bond paid at the loser's own withdrawal. That reached a
+loser only while it sat on the roster of an epoch that would charge it, and
+nothing held a verifier's bond while its verdict could still be overturned. A
+verifier could vote, request its bond, and leave during the appeal, or between
+the overturn and the crank. A loser that left the run, or a run that halted, was
+out of reach for good (wienerlabs/leviathan-net#39). Two rules now close that:
+
+- **A vote holds the bond until it can no longer cost the voter.** Each vote is
+  counted on the voter's `Participant` (`open_verdict_votes`), and a withdrawal
+  is refused while any is counted (`VerdictVotesOpen`).
+  `participant_release_verdict_vote` stops a vote counting once the verdict says
+  it can no longer cost the voter:
+  - the conviction stands (`Upheld`, `Due`);
+  - or the verdict never reached quorum, and either its round is over or the
+    voter withdraws its own vote.
+
+  Anyone may send it. A withdrawn vote comes off the verdict's count, so it can
+  never be part of a later quorum. The verdict marks each released vote in a
+  bitmap (`released_voters`), so no vote is released twice. Its account is taken
+  over for a new dispute only once every vote on the old one is released or
+  charged, so a reset never strands a count. Before it votes, the verifier
+  daemon settles the last dispute against the target in everything that needs
+  nobody's consent: it finalises a conviction whose windows have closed,
+  releases and withdraws votes, charges an overturn's losers and credits the
+  bench. `run-manager bond-withdraw-finalize` does the same for a wallet's own
+  votes and bench seats before it withdraws.
+- **The crank charges a loser's bond directly; the bench is credited seat by
+  seat.** `run_slash_losing_verifier` no longer ejects. It forfeits the epoch's
+  slashing rate from the loser's bond, out of what convictions on the ledger do
+  not already claim, the way an unlanded conviction is settled at a target's
+  withdrawal. It closes the loser's vote and adds what the forfeit owes the
+  bench to the verdict (`bench_bounty_owed`). It settles every loser wherever it
+  is, so nothing waits for an epoch, and it depends on no other account, so no
+  payout and no size of bench can stop it. The loser keeps its seat. If the
+  forfeit leaves its bond below the run minimum, it cannot vote, join or claim
+  again, starting at once rather than at the next epoch's charge. Once every
+  loser is charged, `run_pay_bench_bounty` credits each tie-breaker's bond with
+  its even share, one seat per transaction, marked in `bench_paid`. Anyone may
+  send it. The share never leaves the vault and no token account is involved,
+  so nothing a tie-breaker or a mint does can stop it. An overturn is settled,
+  and its account free for a new dispute, once every loser is charged and every
+  seat credited.
+- **Switching appeals off ends the appeals in flight.** A run with appeals on
+  always has an appeal deadline, so a zero window means the run turned appeals
+  off. A challenge still open then has no deadline left to wait for, and
+  `run_finalize_slash` finalises it at once. It used to mean the challenge never
+  timed out, which held the conviction, and now every vote on it, for good. A
+  run authority could switch appeals off to end an appeal before the bench
+  reaches quorum, and so spare its verifiers an overturn. That sits within
+  the authority's existing trust: it can already shorten the appeal window to
+  a second, or convict directly through `run_slash`. A bonded run's authority
+  is a key its operator holds, and the overturn is final once the bench
+  reaches quorum.
 
 ### B. Symmetric verifier audit by hash comparison (does not work, recorded so it is not retried)
 
@@ -133,10 +186,12 @@ pays them out of the convicting verifiers' forfeited bonds, an upheld appeal pay
 them out of the target's forfeited bond. Because a tie-breaker earns either way,
 the bounty does not push its vote in either direction, so it votes its honest read
 and the Schelling point stays put. It reuses the existing `slash_bounty_bps` knob
-and the same split-and-verify settlement the target-cheater path already used: at
-settlement the forfeited bond's bounty share is split among the recorded appeal
-voters, each recipient's token account owner checked against a recorded voter, and
-the tokens come from the vault where the forfeited bond already sits. memnet
+and the same split-and-verify settlement the target-cheater path already used: the
+forfeited bond's bounty share is split among the recorded appeal voters, each
+recipient's token account owner checked against a recorded voter, and the tokens
+come from the vault where the forfeited bond already sits. An overturn's share is
+credited to each tie-breaker's bond once the crank has charged every loser; an
+upheld appeal pays it at the target's settlement. memnet
 confirms both directions: a tie-breaker earns its share whether the verdict is
 overturned or upheld, while a cleared target still recovers its full bond and a
 convicted one still forfeits.

@@ -152,6 +152,9 @@ fn verdict(target: u8, epoch: u16, round_height: u32, status: VerdictStatus) -> 
         overturn_count: 0,
         uphold_count: 0,
         settled_count: 0,
+        released_voters: 0,
+        bench_bounty_owed: 0,
+        bench_paid: 0,
         voters: vec![],
         appeal_voters: vec![],
     }

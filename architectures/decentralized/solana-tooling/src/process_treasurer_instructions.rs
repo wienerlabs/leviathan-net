@@ -48,21 +48,18 @@ use psyche_solana_treasurer::accounts::RunSetChallengeConfigAccounts;
 use psyche_solana_treasurer::accounts::RunOpenChallengeAccounts;
 use psyche_solana_treasurer::accounts::RunSubmitAppealVerdictAccounts;
 use psyche_solana_treasurer::accounts::RunFinalizeSlashAccounts;
-use psyche_solana_treasurer::accounts::RunSlashLosingVerifierAccounts;
 use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::instruction::RunSubmitAuditVerdict;
 use psyche_solana_treasurer::instruction::RunSetChallengeConfig;
 use psyche_solana_treasurer::instruction::RunOpenChallenge;
 use psyche_solana_treasurer::instruction::RunSubmitAppealVerdict;
 use psyche_solana_treasurer::instruction::RunFinalizeSlash;
-use psyche_solana_treasurer::instruction::RunSlashLosingVerifier;
 use psyche_solana_treasurer::logic::RunSlashParams;
 use psyche_solana_treasurer::logic::RunSubmitAuditVerdictParams;
 use psyche_solana_treasurer::logic::RunSetChallengeConfigParams;
 use psyche_solana_treasurer::logic::RunOpenChallengeParams;
 use psyche_solana_treasurer::logic::RunSubmitAppealVerdictParams;
 use psyche_solana_treasurer::logic::RunFinalizeSlashParams;
-use psyche_solana_treasurer::logic::RunSlashLosingVerifierParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use psyche_solana_treasurer::state::CommitmentEvidence;
 use solana_sdk::instruction::Instruction;
@@ -396,7 +393,6 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw_with_reporter(
         coordinator_account: *coordinator_account,
         participant,
         audit_verdict: find_audit_verdict(run, &user.pubkey()),
-        appeal_verdict: None,
         token_program: token::ID,
     };
     let mut metas = accounts.to_account_metas(None);
@@ -504,7 +500,6 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw(
         coordinator_account: *coordinator_account,
         participant,
         audit_verdict: find_audit_verdict(run, &user.pubkey()),
-        appeal_verdict: None,
         token_program: token::ID,
     };
     let instruction = Instruction {
@@ -546,65 +541,12 @@ pub async fn process_treasurer_participant_bond_finalize_withdraw_with_voters(
         coordinator_account: *coordinator_account,
         participant,
         audit_verdict,
-        appeal_verdict: None,
         token_program: token::ID,
     };
     let mut metas = accounts.to_account_metas(None);
     for voter_collateral in voter_collaterals {
         metas.push(solana_sdk::instruction::AccountMeta::new(
             *voter_collateral,
-            false,
-        ));
-    }
-    let instruction = Instruction {
-        accounts: metas,
-        data: ParticipantBondFinalizeWithdraw {
-            params: ParticipantBondFinalizeWithdrawParams {},
-        }
-        .data(),
-        program_id: psyche_solana_treasurer::ID,
-    };
-    endpoint
-        .process_instruction_with_signers(payer, instruction, &[user])
-        .await?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn process_treasurer_participant_bond_finalize_withdraw_with_appeal(
-    endpoint: &mut ToolboxEndpoint,
-    payer: &Keypair,
-    user: &Keypair,
-    user_collateral: &Pubkey,
-    collateral_mint: &Pubkey,
-    run: &Pubkey,
-    coordinator_account: &Pubkey,
-    target: &Pubkey,
-    tie_breaker_collaterals: &[Pubkey],
-) -> Result<()> {
-    let run_collateral = ToolboxEndpoint::find_spl_associated_token_account(
-        run,
-        collateral_mint,
-    );
-    let participant = find_participant(run, &user.pubkey());
-    let appeal_verdict = find_audit_verdict(run, target);
-    let accounts = ParticipantBondFinalizeWithdrawAccounts {
-        user: user.pubkey(),
-        user_collateral: *user_collateral,
-        run: *run,
-        run_collateral,
-        coordinator_account: *coordinator_account,
-        participant,
-        // Always the withdrawer's own verdict PDA; the appeal being settled
-        // belongs to somebody else and goes in the slot below.
-        audit_verdict: find_audit_verdict(run, &user.pubkey()),
-        appeal_verdict: Some(appeal_verdict),
-        token_program: token::ID,
-    };
-    let mut metas = accounts.to_account_metas(None);
-    for tie_breaker_collateral in tie_breaker_collaterals {
-        metas.push(solana_sdk::instruction::AccountMeta::new(
-            *tie_breaker_collateral,
             false,
         ));
     }
@@ -837,40 +779,6 @@ pub async fn process_treasurer_run_finalize_slash(
             params: RunFinalizeSlashParams {
                 target: *target,
                 target_index,
-            },
-        }
-        .data(),
-        program_id: psyche_solana_treasurer::ID,
-    };
-    endpoint.process_instruction(payer, instruction).await?;
-    Ok(())
-}
-
-pub async fn process_treasurer_run_slash_losing_verifier(
-    endpoint: &mut ToolboxEndpoint,
-    payer: &Keypair,
-    run: &Pubkey,
-    coordinator_account: &Pubkey,
-    run_id: &str,
-    target: &Pubkey,
-    voter_position: u16,
-) -> Result<()> {
-    let coordinator_instance = find_coordinator_instance(run_id);
-    let audit_verdict = find_audit_verdict(run, target);
-    let accounts = RunSlashLosingVerifierAccounts {
-        payer: payer.pubkey(),
-        run: *run,
-        coordinator_instance,
-        coordinator_account: *coordinator_account,
-        audit_verdict,
-        coordinator_program: psyche_solana_coordinator::ID,
-    };
-    let instruction = Instruction {
-        accounts: accounts.to_account_metas(None),
-        data: RunSlashLosingVerifier {
-            params: RunSlashLosingVerifierParams {
-                target: *target,
-                voter_position,
             },
         }
         .data(),

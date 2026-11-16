@@ -6,6 +6,9 @@ use anchor_spl::token::transfer;
 use psyche_solana_coordinator::CoordinatorAccount;
 
 use crate::ProgramError;
+use crate::logic::BountyVault;
+use crate::logic::bounty_amount;
+use crate::logic::pay_bounty_shares;
 use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
@@ -83,9 +86,6 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
     pub audit_verdict: UncheckedAccount<'info>,
 
     #[account()]
-    pub appeal_verdict: Option<Box<Account<'info, AuditVerdict>>>,
-
-    #[account()]
     pub token_program: Program<'info, Token>,
 }
 
@@ -97,7 +97,6 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     _params: ParticipantBondFinalizeWithdrawParams,
 ) -> Result<()> {
     let user_key = context.accounts.user.key();
-    let run_key = context.accounts.run.key();
 
     // The verdict is read from the account at its own PDA, which the caller
     // cannot substitute or leave out. An account with no data there is the
@@ -121,6 +120,7 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
             withdrawal_standing(
                 &context.accounts.run,
                 &coordinator_account,
+                &context.accounts.participant,
                 own_verdict.as_ref(),
                 &user_key,
                 now,
@@ -140,6 +140,9 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
         },
         WithdrawalStanding::Held(WithdrawalHold::EpochNotSettled) => {
             return err!(ProgramError::EpochNotSettled)
+        },
+        WithdrawalStanding::Held(WithdrawalHold::VotesAtStake) => {
+            return err!(ProgramError::VerdictVotesOpen)
         },
         WithdrawalStanding::Free { settle_conviction } => settle_conviction,
     };
@@ -201,32 +204,19 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
     let run_index = run.index;
     let run_bump = run.bump;
     let collateral_mint = run.collateral_mint;
-    let bounty_amount = if run.slash_bounty_bps > 0 {
-        (forfeited_amount as u128 * run.slash_bounty_bps as u128 / 10_000) as u64
-    } else {
-        0
-    };
+    let bounty_amount = bounty_amount(run, forfeited_amount);
 
     let index_bytes = run_index.to_le_bytes();
     let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
 
     if bounty_amount > 0 {
-        let voters: Vec<Pubkey> = if let Some(verdict) = own_verdict.as_ref() {
-            verdict.bounty_recipients().to_vec()
-        } else if let Some(appeal) = context.accounts.appeal_verdict.as_ref() {
-            if appeal.run != run_key {
-                return err!(ProgramError::InvalidParameter);
-            }
-            if appeal.status != VerdictStatus::Overturned {
-                return err!(ProgramError::VerdictNotOverturned);
-            }
-            if !appeal.voters.iter().any(|voter| voter == &user_key) {
-                return err!(ProgramError::InvalidParameter);
-            }
-            appeal.appeal_voters.clone()
-        } else {
-            Vec::new()
-        };
+        // A verdict against this participant names who earned the bounty. A
+        // losing verifier's forfeit no longer comes through here: the crank
+        // charges it and pays the bench itself (wienerlabs/leviathan-net#39).
+        let voters: Vec<Pubkey> = own_verdict
+            .as_ref()
+            .map(|verdict| verdict.bounty_recipients().to_vec())
+            .unwrap_or_default();
 
         if voters.is_empty() {
             // No verdict names anyone, so the bounty goes to whoever reported
@@ -260,36 +250,22 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
                 bounty_amount,
             )?;
         } else {
-            if context.remaining_accounts.len() < voters.len() {
-                return err!(ProgramError::MissingReporter);
-            }
-            let share = bounty_amount / voters.len() as u64;
-            for (position, voter) in voters.iter().enumerate() {
-                if share == 0 {
-                    break;
-                }
-                let recipient = &context.remaining_accounts[position];
-                let recipient_token_account =
-                    Account::<TokenAccount>::try_from(recipient)
-                        .map_err(|_| error!(ProgramError::BountyRecipientMismatch))?;
-                if recipient_token_account.owner != *voter
-                    || recipient_token_account.mint != collateral_mint
-                {
-                    return err!(ProgramError::BountyRecipientMismatch);
-                }
-                transfer(
-                    CpiContext::new(
-                        context.accounts.token_program.to_account_info(),
-                        Transfer {
-                            from: context.accounts.run_collateral.to_account_info(),
-                            to: recipient.to_account_info(),
-                            authority: context.accounts.run.to_account_info(),
-                        },
-                    )
-                    .with_signer(run_signer_seeds),
-                    share,
-                )?;
-            }
+            pay_bounty_shares(
+                &BountyVault {
+                    token_program: &context
+                        .accounts
+                        .token_program
+                        .to_account_info(),
+                    run_collateral: &context
+                        .accounts
+                        .run_collateral
+                        .to_account_info(),
+                    run: &context.accounts.run,
+                },
+                &voters,
+                context.remaining_accounts,
+                bounty_amount,
+            )?;
         }
     }
 
