@@ -151,6 +151,16 @@ pub fn run_submit_appeal_verdict_processor(
         if verdict.status != VerdictStatus::Challenged {
             return err!(ProgramError::VerdictNotChallenged);
         }
+        // The bench is drawn again every round, over the whole roster, and the
+        // target stays on the roster while it appeals, so a later round can
+        // seat it on the bench of its own appeal. No draw makes it neutral
+        // there: it would vote to clear itself, and an overturn charges the
+        // verifiers who convicted it and credits the bench, itself included,
+        // with their forfeits. With a one-seat bench its vote alone would be
+        // the quorum.
+        if appellate_key == verdict.target {
+            return err!(ProgramError::AppellateIsTarget);
+        }
         if verdict.appeal_voters.iter().any(|voter| voter == &appellate_key) {
             return err!(ProgramError::DuplicateAppealVerdict);
         }

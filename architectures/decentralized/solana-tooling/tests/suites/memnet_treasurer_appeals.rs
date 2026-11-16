@@ -996,3 +996,117 @@ pub async fn the_indexer_counts_a_conviction_and_its_overturn_once() {
         assert!(scrape.contains(line), "missing {line} in\n{scrape}");
     }
 }
+
+/// Runs the swarm on, round by round and into later epochs, until `seated`
+/// finds what it looks for in the committee drawn for the round in force.
+async fn advance_until_drawn<T>(
+    h: &mut AppealsHarness,
+    seated: impl Fn(&CommitteeNow) -> Option<T>,
+) -> T {
+    for _ in 0..120 {
+        h.advance_to_next_round_across_epochs().await;
+        if let Some(found) = seated(&h.committee_now().await) {
+            return found;
+        }
+    }
+    panic!("no round in 120 drew the committee looked for");
+}
+
+/// The bench is drawn afresh every round and an appeal stays open over many of
+/// them, so the target of an appeal can be drawn onto its own bench. Seated,
+/// it would vote to clear itself: with a one-seat bench its overturn alone is
+/// the quorum, the verifiers who convicted it would forfeit their bonds to the
+/// crank, and the bench's share of those forfeits would be credited to the
+/// target's own bond. A target never judges its own appeal, and the bench
+/// drawn after it still rules.
+#[tokio::test]
+pub async fn a_target_drawn_onto_its_own_bench_cannot_judge_its_appeal() {
+    let mut h = setup("Leviathan appeals self judge", 167).await;
+    // A one-seat bench, so one overturn is the whole quorum.
+    let main_authority = h.main_authority.insecure_clone();
+    process_treasurer_run_set_challenge_config(
+        &mut h.endpoint,
+        &h.payer,
+        &main_authority,
+        &h.run,
+        CHALLENGE_WINDOW,
+        1,
+        APPEAL_WINDOW,
+    )
+    .await
+    .unwrap();
+
+    let committee = h.committee_now().await;
+    assert_eq!(committee.tie_breaker_quorum, 1);
+    let (target, target_index) = committee.trainers[0];
+    let target_key = h.clients[target].pubkey();
+    let voters: Vec<usize> = committee
+        .verifiers
+        .iter()
+        .take(committee.verifier_quorum)
+        .map(|(i, _)| *i)
+        .collect();
+    for voter in &voters {
+        h.convict_by(*voter, target, target_index).await.unwrap();
+    }
+    assert_eq!(
+        h.verdict_status_of(target).await,
+        VerdictStatus::SlashPending
+    );
+    let target_wallet = h.clients[target].insecure_clone();
+    process_treasurer_run_open_challenge(
+        &mut h.endpoint,
+        &h.payer,
+        &target_wallet,
+        &h.run,
+    )
+    .await
+    .unwrap();
+
+    // A later round seats the target on the bench of its own appeal.
+    let target_index = advance_until_drawn(&mut h, |committee| {
+        committee
+            .tie_breakers
+            .iter()
+            .any(|(client_idx, _)| *client_idx == target)
+            .then(|| {
+                committee
+                    .tie_breakers
+                    .iter()
+                    .chain(&committee.verifiers)
+                    .chain(&committee.trainers)
+                    .find(|(client_idx, _)| *client_idx == target)
+                    .map(|(_, index)| *index)
+                    .unwrap()
+            })
+    })
+    .await;
+    assert_eq!(target_index, h.roster_index_of(&target_key).await);
+    assert_eq!(
+        refusal_code(h.rule_by(target, target, target_index, true).await),
+        treasurer_refusal(ProgramError::AppellateIsTarget),
+    );
+    let verdict = h.verdict_of(&target_key).await;
+    assert_eq!(verdict.status, VerdictStatus::Challenged);
+    assert!(verdict.appeal_voters.is_empty());
+    assert_eq!((verdict.overturn_count, verdict.uphold_count), (0, 0));
+
+    // The appeal is not stuck on it: the next neutral bench rules.
+    let appellate = advance_until_drawn(&mut h, |committee| {
+        committee
+            .tie_breakers
+            .iter()
+            .map(|(client_idx, _)| *client_idx)
+            .find(|client_idx| {
+                *client_idx != target && !voters.contains(client_idx)
+            })
+    })
+    .await;
+    let target_index = h.roster_index_of(&target_key).await;
+    h.rule_by(appellate, target, target_index, false)
+        .await
+        .unwrap();
+    let verdict = h.verdict_of(&target_key).await;
+    assert_eq!(verdict.status, VerdictStatus::Upheld);
+    assert_eq!(verdict.appeal_voters, vec![h.clients[appellate].pubkey()]);
+}

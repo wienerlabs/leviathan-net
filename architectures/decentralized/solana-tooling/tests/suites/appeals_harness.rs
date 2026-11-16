@@ -773,6 +773,34 @@ impl AppealsHarness {
         .await;
     }
 
+    /// As `advance_to_next_round`, and when the epoch ends first, on into the
+    /// next one: every client rejoins it and its first round is the next.
+    pub(super) async fn advance_to_next_round_across_epochs(&mut self) {
+        let state = get_coordinator_account_state(
+            &mut self.endpoint,
+            &self.coordinator_account,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let start = (
+            state.coordinator.progress.epoch,
+            state.coordinator.current_round().map(|round| round.height),
+        );
+        self.advance_with_witnesses(|coordinator| {
+            coordinator.run_state == RunState::WaitingForMembers
+                || (coordinator.run_state == RunState::RoundTrain
+                    && (
+                        coordinator.progress.epoch,
+                        coordinator.current_round().map(|round| round.height),
+                    ) != start)
+        })
+        .await;
+        if self.run_state().await == RunState::WaitingForMembers {
+            self.rejoin_all_and_start_epoch().await;
+        }
+    }
+
     pub(super) async fn epoch(&mut self) -> u16 {
         get_coordinator_account_state(
             &mut self.endpoint,

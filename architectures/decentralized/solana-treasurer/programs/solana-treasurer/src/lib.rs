@@ -361,4 +361,7 @@ pub enum ProgramError {
 
     #[msg("The dispute is still open, so it owes nobody a bounty yet")]
     VerdictOwesNoBounty,
+
+    #[msg("The participant a verdict convicts cannot judge its own appeal")]
+    AppellateIsTarget,
 }
