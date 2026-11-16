@@ -274,6 +274,8 @@ fn distance_to(delta: &[f32], center: &[f32]) -> f32 {
 pub enum ReplayError {
     #[error("target {0} is not assigned to this verifier")]
     NotAssigned(u64),
+    #[error("no replay of {0} is assigned to this verifier")]
+    WorkNotAssigned(String),
     #[error("checkpoint {0} unavailable for replay")]
     CheckpointUnavailable(u64),
     #[error("replay backend failed: {0}")]

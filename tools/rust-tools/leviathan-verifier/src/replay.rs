@@ -30,15 +30,24 @@ use psyche_modeling::Batch;
 use psyche_modeling::BatchData;
 use psyche_modeling::BatchDataCPU;
 use psyche_modeling::Trainer;
-use psyche_verifier::ReplayEngine;
 use psyche_verifier::ReplayError;
 use tokio_util::sync::CancellationToken;
 
 use crate::decompress_results;
 
+/// A piece of work a verifier can replay: the batch trained at a step of an
+/// epoch, and what training it takes.
+///
+/// It names the work, not whoever did it. A replay of a batch is the same
+/// whichever node trained it, and a node's place in the roster moves under a
+/// verifier whenever someone ahead of it leaves the epoch, so an assignment
+/// keyed by roster position could be judged against another node's batch and
+/// convict an honest one.
 #[derive(Debug, Clone)]
 pub struct ReplayAssignment {
-    pub target_index: u64,
+    /// When the epoch the work was trained in started (the coordinator's
+    /// `epoch_state.start_timestamp`).
+    pub epoch_start: u64,
     pub step: u32,
     /// The run's cold-start warmup bounds at `step`, which the client trains
     /// with (`Coordinator::get_cold_start_warmup_bounds`).
@@ -47,9 +56,20 @@ pub struct ReplayAssignment {
     pub data: Vec<BatchDataCPU>,
 }
 
+impl ReplayAssignment {
+    /// The work this assignment replays, as a payload dump names it.
+    pub fn work(&self) -> DumpKey {
+        DumpKey {
+            epoch_start: self.epoch_start,
+            step: self.step,
+            batch_id: self.batch_id,
+        }
+    }
+}
+
 /// The work a payload dump is for: the round, named by its epoch and step,
 /// and the batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DumpKey {
     /// When the epoch the payload was trained in started (the coordinator's
     /// `epoch_state.start_timestamp`). A run restarted from an earlier step
@@ -57,6 +77,18 @@ pub struct DumpKey {
     pub epoch_start: u64,
     pub step: u32,
     pub batch_id: BatchId,
+}
+
+/// Written as a payload dump's contribution key names the work, so
+/// `parse_assignment_key` reads it back.
+impl std::fmt::Display for DumpKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "epoch{}-step{}-batch{}",
+            self.epoch_start, self.step, self.batch_id
+        )
+    }
 }
 
 /// The epoch whose dumps of `step` a replay reproduces, out of the dumps
@@ -266,9 +298,19 @@ pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
     .into())
 }
 
+/// Recomputes the honest result of a piece of work.
+///
+/// Asked for by the work a payload names (its epoch, step and batch), never by
+/// who sent it or where that node sits in the roster: the payload being judged
+/// names the work it claims, so the reference it is judged against is a replay
+/// of exactly that work, whatever has happened to the roster since.
+pub trait ReplayWork {
+    fn replay_work(&self, work: &DumpKey) -> Result<Vec<f32>, ReplayError>;
+}
+
 pub struct TrainerReplayEngine {
     trainer: Mutex<Option<Trainer>>,
-    assignments: HashMap<u64, ReplayAssignment>,
+    assignments: HashMap<DumpKey, ReplayAssignment>,
     device: tch::Device,
     quantize_1bit: bool,
 }
@@ -286,10 +328,7 @@ impl TrainerReplayEngine {
     ) -> Self {
         Self {
             trainer: Mutex::new(Some(trainer)),
-            assignments: assignments
-                .into_iter()
-                .map(|a| (a.target_index, a))
-                .collect(),
+            assignments: assignments.into_iter().map(|a| (a.work(), a)).collect(),
             device,
             quantize_1bit,
         }
@@ -349,12 +388,12 @@ impl TrainerReplayEngine {
     }
 }
 
-impl ReplayEngine for TrainerReplayEngine {
-    fn replay(&self, target_index: u64) -> Result<Vec<f32>, ReplayError> {
+impl ReplayWork for TrainerReplayEngine {
+    fn replay_work(&self, work: &DumpKey) -> Result<Vec<f32>, ReplayError> {
         let assignment = self
             .assignments
-            .get(&target_index)
-            .ok_or(ReplayError::NotAssigned(target_index))?
+            .get(work)
+            .ok_or_else(|| ReplayError::WorkNotAssigned(work.to_string()))?
             .clone();
         self.recompute(&assignment)
     }
