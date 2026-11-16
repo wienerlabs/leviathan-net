@@ -21,6 +21,9 @@ pub const COMMITMENT_RECORD_EXTENSION: &str = "commitment";
 /// (wienerlabs/leviathan-net#43).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitmentRecord {
+    /// When the epoch the payload was trained in started
+    /// (wienerlabs/leviathan-net#67).
+    pub epoch_start: u64,
     pub step: u32,
     pub trainer_nonce: u32,
     pub batch_id: BatchId,
@@ -43,9 +46,9 @@ pub enum CommitmentRecordError {
 }
 
 impl CommitmentRecord {
-    /// Step and nonce, the batch bounds, the hash and the signature, in that
-    /// order and big-endian.
-    pub const SERIALIZED_SIZE: usize = 4 + 4 + 8 + 8 + 32 + 64;
+    /// The epoch's start, the step and nonce, the batch bounds, the hash and
+    /// the signature, in that order and big-endian.
+    pub const SERIALIZED_SIZE: usize = 8 + 4 + 4 + 8 + 8 + 32 + 64;
 
     /// The record of `payload`, committed to as `data_hash` and signed with
     /// `signature`.
@@ -55,6 +58,7 @@ impl CommitmentRecord {
         signature: [u8; 64],
     ) -> Self {
         Self {
+            epoch_start: payload.epoch_start,
             step: payload.step,
             trainer_nonce: payload.trainer_nonce,
             batch_id: payload.batch_id,
@@ -65,12 +69,13 @@ impl CommitmentRecord {
 
     pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
         let mut bytes = [0u8; Self::SERIALIZED_SIZE];
-        bytes[0..4].copy_from_slice(&self.step.to_be_bytes());
-        bytes[4..8].copy_from_slice(&self.trainer_nonce.to_be_bytes());
-        bytes[8..16].copy_from_slice(&self.batch_id.0.start.to_be_bytes());
-        bytes[16..24].copy_from_slice(&self.batch_id.0.end.to_be_bytes());
-        bytes[24..56].copy_from_slice(&self.data_hash);
-        bytes[56..120].copy_from_slice(&self.signature);
+        bytes[0..8].copy_from_slice(&self.epoch_start.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.step.to_be_bytes());
+        bytes[12..16].copy_from_slice(&self.trainer_nonce.to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.batch_id.0.start.to_be_bytes());
+        bytes[24..32].copy_from_slice(&self.batch_id.0.end.to_be_bytes());
+        bytes[32..64].copy_from_slice(&self.data_hash);
+        bytes[64..128].copy_from_slice(&self.signature);
         bytes
     }
 
@@ -84,16 +89,17 @@ impl CommitmentRecord {
                 })?;
         let u32_at = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
         let u64_at = |at: usize| u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
-        let (start, end) = (u64_at(8), u64_at(16));
+        let (start, end) = (u64_at(16), u64_at(24));
         if end < start {
             return Err(CommitmentRecordError::Batch);
         }
         Ok(Self {
-            step: u32_at(0),
-            trainer_nonce: u32_at(4),
+            epoch_start: u64_at(0),
+            step: u32_at(8),
+            trainer_nonce: u32_at(12),
             batch_id: BatchId(ClosedInterval::new(start, end)),
-            data_hash: bytes[24..56].try_into().unwrap(),
-            signature: bytes[56..120].try_into().unwrap(),
+            data_hash: bytes[32..64].try_into().unwrap(),
+            signature: bytes[64..128].try_into().unwrap(),
         })
     }
 
@@ -107,6 +113,7 @@ impl CommitmentRecord {
         let digest = results_digest(results).map_err(CommitmentRecordError::Encoding)?;
         Ok(payload_commitment_hash(
             &payload_commitment_run(run_id),
+            self.epoch_start,
             self.step,
             self.trainer_nonce,
             self.batch_id.0.start,
@@ -139,6 +146,30 @@ pub fn commitment_record_path(payload_path: &Path) -> PathBuf {
     payload_path.with_extension(COMMITMENT_RECORD_EXTENSION)
 }
 
+/// The extension a payload dump is kept under.
+pub const PAYLOAD_DUMP_EXTENSION: &str = "vec-postcard";
+
+/// The name a node keeps the payload `committer` trained on `batch_id` at
+/// `step`, in the epoch that started at `epoch_start`, under.
+///
+/// The committer is its full signer, base58 and untruncated, which the
+/// verifier daemon matches against the roster (wienerlabs/leviathan#15,
+/// finding 20). The epoch is in the name because the step alone does not
+/// name the round: a run restarted from an earlier step trains that step
+/// again, and without the epoch its payload would be kept under the name of
+/// the one trained the first time, and never kept itself
+/// (wienerlabs/leviathan-net#67).
+pub fn payload_dump_name(
+    committer: &str,
+    epoch_start: u64,
+    step: u32,
+    batch_id: BatchId,
+) -> String {
+    format!(
+        "result-{committer}-epoch{epoch_start}-step{step}-batch{batch_id}.{PAYLOAD_DUMP_EXTENSION}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +194,7 @@ mod tests {
 
     fn payload(results: Vec<SerializedDistroResult>) -> TransmittableDistroResult {
         TransmittableDistroResult {
+            epoch_start: 1_700_000_000,
             step: 12,
             trainer_nonce: 2,
             batch_id: BatchId(ClosedInterval::new(40, 47)),
@@ -208,6 +240,10 @@ mod tests {
         let payload = payload(results(&[1.0, -2.0, 3.0]));
         let record = signed(&key, &payload);
         for moved in [
+            CommitmentRecord {
+                epoch_start: record.epoch_start + 1,
+                ..record
+            },
             CommitmentRecord {
                 step: record.step + 1,
                 ..record
@@ -281,7 +317,7 @@ mod tests {
             })
         );
         let mut inverted = bytes;
-        inverted[8..16].copy_from_slice(&48u64.to_be_bytes());
+        inverted[16..24].copy_from_slice(&48u64.to_be_bytes());
         assert_eq!(
             CommitmentRecord::from_bytes(&inverted),
             Err(CommitmentRecordError::Batch)
@@ -290,10 +326,25 @@ mod tests {
 
     #[test]
     fn the_record_sits_next_to_its_payload() {
-        let payload = Path::new("/dumps/result-Abc-step3-batchB[0, 1].vec-postcard");
+        let name = payload_dump_name("Abc", 1_700_000_000, 3, BatchId(ClosedInterval::new(0, 1)));
         assert_eq!(
-            commitment_record_path(payload),
-            PathBuf::from("/dumps/result-Abc-step3-batchB[0, 1].commitment")
+            name,
+            "result-Abc-epoch1700000000-step3-batchB[0, 1].vec-postcard"
+        );
+        assert_eq!(
+            commitment_record_path(&Path::new("/dumps").join(name)),
+            PathBuf::from("/dumps/result-Abc-epoch1700000000-step3-batchB[0, 1].commitment")
+        );
+    }
+
+    /// A step trained in two epochs, as after a restart from an earlier
+    /// step, is two payloads under two names (wienerlabs/leviathan-net#67).
+    #[test]
+    fn the_same_step_in_two_epochs_is_kept_under_two_names() {
+        let batch = BatchId(ClosedInterval::new(0, 1));
+        assert_ne!(
+            payload_dump_name("Abc", 1_700_000_000, 3, batch),
+            payload_dump_name("Abc", 1_700_000_090, 3, batch)
         );
     }
 }

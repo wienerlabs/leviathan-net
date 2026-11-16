@@ -600,6 +600,15 @@ impl StepStateMachine {
             return;
         };
 
+        if let Err(err) = round_state.check_payload_header(&distro_result, batch_id) {
+            warn!(
+                from = %from,
+                batch_id = %batch_id,
+                "Distro result does not name the work it was broadcast for, dropping it: {err}",
+            );
+            return;
+        }
+
         // The shape is verified, but not here: the commitment hash now covers
         // dims, dtype, encoding, xshape and totalk, so the check below rejects a
         // payload whose shape is not the one that was signed for. Deserialising

@@ -12,14 +12,14 @@ use std::path::PathBuf;
 
 use psyche_coordinator::Coordinator;
 use psyche_core::sha256;
-#[cfg(feature = "daemon")]
-use psyche_core::BatchId;
 use psyche_core::NodeIdentity;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
 #[cfg(feature = "daemon")]
 use psyche_solana_tooling::signed_commitment;
+#[cfg(feature = "daemon")]
+use psyche_solana_tooling::signed_commitment::PayloadHeader;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -80,7 +80,7 @@ pub fn payload_header(
     coordinator: &Coordinator,
     tie_breaker_committee_size: u16,
     node: &NodeIdentity,
-) -> (u32, u32, BatchId) {
+) -> PayloadHeader {
     signed_commitment::payload_header(
         coordinator,
         tie_breaker_committee_size,
@@ -89,13 +89,15 @@ pub fn payload_header(
     .expect("the node trains a batch this round")
 }
 
-/// The name a client gives the dump of `wallet`'s payload for `batch_id` at
-/// `step`.
+/// The name a client gives the dump of `wallet`'s payload for the work
+/// `header` names.
 #[cfg(feature = "daemon")]
-pub fn dump_name(wallet: &Keypair, step: u32, batch_id: BatchId) -> String {
-    format!(
-        "result-{}-step{step}-batch{batch_id}.vec-postcard",
-        wallet.pubkey()
+pub fn dump_name(wallet: &Keypair, header: PayloadHeader) -> String {
+    psyche_network::payload_dump_name(
+        &wallet.pubkey().to_string(),
+        header.epoch_start,
+        header.step,
+        header.batch_id,
     )
 }
 
@@ -111,13 +113,14 @@ pub fn keep_signed_payload(
     wallet: &Keypair,
     p2p: &Keypair,
     run_id: &str,
-    (step, trainer_nonce, batch_id): (u32, u32, BatchId),
+    header: PayloadHeader,
 ) -> PathBuf {
     let distro_results = leviathan_verifier::read_dump(source).unwrap();
     let payload = psyche_network::TransmittableDistroResult {
-        step,
-        trainer_nonce,
-        batch_id,
+        epoch_start: header.epoch_start,
+        step: header.step,
+        trainer_nonce: header.trainer_nonce,
+        batch_id: header.batch_id,
         distro_results,
     };
     let data_hash = payload.comptue_hash(run_id).unwrap();
@@ -126,7 +129,7 @@ pub fn keep_signed_payload(
     let signature = key.sign(&data_hash).to_bytes();
     let record =
         psyche_network::CommitmentRecord::new(&payload, data_hash, signature);
-    let path = dir.join(dump_name(wallet, step, batch_id));
+    let path = dir.join(dump_name(wallet, header));
     std::fs::write(
         psyche_network::commitment_record_path(&path),
         record.to_bytes(),
@@ -148,9 +151,9 @@ pub fn keep_reference(
     dir: &std::path::Path,
     source: &std::path::Path,
     wallet: &Keypair,
-    (step, _, batch_id): (u32, u32, BatchId),
+    header: PayloadHeader,
 ) -> PathBuf {
-    let path = dir.join(dump_name(wallet, step, batch_id));
+    let path = dir.join(dump_name(wallet, header));
     std::fs::copy(source, &path).unwrap();
     path
 }

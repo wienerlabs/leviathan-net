@@ -41,3 +41,5 @@ mod memnet_verifier_daemon;
 mod memnet_verifier_daemon_committee;
 #[cfg(feature = "daemon")]
 mod memnet_verifier_daemon_replay;
+#[cfg(feature = "daemon")]
+mod memnet_verifier_daemon_restart;

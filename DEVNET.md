@@ -93,10 +93,14 @@ it ships.
 The treasurer's accounts changed in the same deployment
 (wienerlabs/leviathan-net#39). `Participant` gained the count of verdict votes
 that still hold the bond (69 bytes). `AuditVerdict` gained which votes are
-released and what an overturn owes the bench (4392 bytes). Older, shorter
-accounts do not decode with the new layout and carry votes nobody counted, so
-these are for the new deployment's runs only, never a migration of the current
-ones. The dashboard decoder has to learn both lengths.
+released and what an overturn owes the bench (4392 bytes), then the epoch its
+evidence was trained in (4400 bytes, wienerlabs/leviathan-net#67). Older,
+shorter accounts do not decode with the new layout and carry votes nobody
+counted, so these are for the new deployment's runs only, never a migration of
+the current ones. The dashboard decoder has to learn both lengths, 69 and 4400.
+That deployment's nodes also sign the `v2` payload commitment, which names the
+epoch a payload was trained in (wienerlabs/leviathan-net#67). A node on an older
+build cannot train beside them.
 
 ## Run a node
 

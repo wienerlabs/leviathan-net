@@ -402,7 +402,7 @@ pub async fn run() {
     let unsigned_dir = scratch("unsigned");
     fs::copy(
         fixture(FRAUD_PAYLOAD),
-        unsigned_dir.join(dump_name(&clients[cheater], header.0, header.2)),
+        unsigned_dir.join(dump_name(&clients[cheater], header)),
     )
     .unwrap();
     let foreign_dir = scratch("foreign");

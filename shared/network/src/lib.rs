@@ -80,7 +80,8 @@ mod test;
 
 pub use authenticable_identity::raw_p2p_verify;
 pub use commitment_record::{
-    COMMITMENT_RECORD_EXTENSION, CommitmentRecord, CommitmentRecordError, commitment_record_path,
+    COMMITMENT_RECORD_EXTENSION, CommitmentRecord, CommitmentRecordError, PAYLOAD_DUMP_EXTENSION,
+    commitment_record_path, payload_dump_name,
 };
 pub use connection_monitor::{ConnectionData, ConnectionMonitor, PeerBandwidth};
 pub use download::{

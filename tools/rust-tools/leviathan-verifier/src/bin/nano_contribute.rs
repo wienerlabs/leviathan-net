@@ -20,6 +20,7 @@ use psyche_modeling::Batch;
 use psyche_modeling::BatchData;
 use psyche_modeling::BatchDataCPU;
 use psyche_modeling::Trainer;
+use psyche_network::payload_dump_name;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
@@ -39,6 +40,11 @@ struct Args {
     out_dir: PathBuf,
     #[arg(long, default_value = "node0")]
     committer: String,
+    /// When the epoch the contribution is trained in started, as the
+    /// coordinator's `epoch_state.start_timestamp` gives it. A node names its
+    /// dumps by it (wienerlabs/leviathan-net#67).
+    #[arg(long)]
+    epoch_start: u64,
     /// The step trained. Defaults to a run's first step.
     #[arg(long)]
     step: Option<u32>,
@@ -116,10 +122,7 @@ async fn main() -> Result<()> {
         false => results,
     };
 
-    let name = format!(
-        "result-{}-step{}-batch{}.vec-postcard",
-        args.committer, step, batch_id
-    );
+    let name = payload_dump_name(&args.committer, args.epoch_start, step, batch_id);
     let path = args.out_dir.join(&name);
     write_results_dump(&path, &results)?;
 

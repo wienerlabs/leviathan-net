@@ -14,6 +14,7 @@ use psyche_coordinator::select_audits_for_current_round;
 use psyche_coordinator::ClientState;
 use psyche_coordinator::Coordinator;
 use psyche_core::BatchId;
+use psyche_network::CommitmentRecord;
 use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::state::commitment_run;
 use psyche_solana_treasurer::state::committee_matches_roster;
@@ -52,10 +53,13 @@ pub fn hex8(bytes: &[u8; 32]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The committer a payload dump is named for
+/// (`psyche_network::payload_dump_name`). Base58 has no `-`, so the first
+/// `-epoch` after the prefix is where it ends.
 pub fn parse_committer(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     let rest = name.strip_prefix("result-")?;
-    let end = rest.find("-step")?;
+    let end = rest.find("-epoch")?;
     Some(rest[..end].to_string())
 }
 
@@ -91,6 +95,20 @@ fn audit_assignments(
             HashSet::new()
         },
     }
+}
+
+/// Whether the round `record` names ended before the epoch the coordinator
+/// is in: an earlier epoch, or a step before this epoch's first. A record the
+/// coordinator has not reached yet is not over, only ahead of this view of it
+/// (wienerlabs/leviathan-net#67).
+pub fn epoch_is_over(
+    coordinator: &Coordinator,
+    record: &CommitmentRecord,
+) -> bool {
+    let epoch_start = coordinator.epoch_state.start_timestamp;
+    record.epoch_start < epoch_start
+        || (record.epoch_start == epoch_start
+            && record.step < coordinator.epoch_state.start_step)
 }
 
 /// Whether the chain already holds what a refused submission would have put
@@ -211,10 +229,11 @@ pub async fn audit_pass(
         if judged.contains(key) {
             continue;
         }
-        let Some((step, batch_id)) = parse_assignment_key(key) else {
-            println!("[verifier-daemon] skip  {key}: not a step and batch this daemon can read");
+        let Some(dump) = parse_assignment_key(key) else {
+            println!("[verifier-daemon] skip  {key}: not an epoch, step and batch this daemon can read");
             continue;
         };
+        let batch_id = dump.batch_id;
 
         if let Some(assigned) = &assigned {
             if !assigned.contains(&(committer.clone(), batch_id)) {
@@ -278,12 +297,42 @@ pub async fn audit_pass(
             },
         };
         let record = commitment.record;
-        if (record.step, record.batch_id) != (step, batch_id) {
+        if (record.epoch_start, record.step, record.batch_id)
+            != (dump.epoch_start, dump.step, dump.batch_id)
+        {
             println!(
-                "[verifier-daemon] skip  {key} committer {committer}: its commitment is for step {} batch {}",
-                record.step, record.batch_id
+                "[verifier-daemon] skip  {key} committer {committer}: its commitment is for the epoch that started at {}, step {} batch {}",
+                record.epoch_start, record.step, record.batch_id
             );
             judged.insert(key.clone());
+            continue;
+        }
+        let evidence = CommitmentEvidence {
+            epoch_start: record.epoch_start,
+            step: record.step,
+            trainer_nonce: record.trainer_nonce,
+            results_digest: commitment.results_digest,
+        };
+        // A payload from an epoch that is over convicts nobody now: the
+        // treasurer refuses it, by the same rule. One kept from before a
+        // restart from an earlier step is such a payload, though its step is
+        // trained again. Judged and sent anyway, it would be refused every
+        // pass and reported as a fraud the chain never saw
+        // (wienerlabs/leviathan-net#67).
+        if !evidence.is_from_current_epoch(coordinator) {
+            if epoch_is_over(coordinator, &record) {
+                println!(
+                    "[verifier-daemon] skip  {key} committer {committer}: its epoch is over, nothing can convict on it now"
+                );
+                judged.insert(key.clone());
+            } else {
+                // Work this pass's view of the run has not reached: the run
+                // moved on after it was read, or the RPC lags the node that
+                // kept the payload. The next pass reads the run again.
+                println!(
+                    "[verifier-daemon] retry {key} committer {committer}: it is newer than this pass's view of the run"
+                );
+            }
             continue;
         }
 
@@ -309,8 +358,10 @@ pub async fn audit_pass(
                 // A replay reproduces only the first step of a cold-start
                 // epoch, trained from zeroed error feedback, and the run says
                 // which step that is. Judging any other step against it would
-                // convict honest nodes (wienerlabs/leviathan-net#47, #48).
-                if coordinator.replayable_step() != Some(record.step) {
+                // convict honest nodes (wienerlabs/leviathan-net#47, #48), and
+                // so would the same step trained again after a restart, from
+                // other weights (wienerlabs/leviathan-net#67).
+                if !coordinator.is_replayable(record.epoch_start, record.step) {
                     continue;
                 }
                 match engine.replay(index as u64) {
@@ -365,11 +416,7 @@ pub async fn audit_pass(
             run: commitment_run(coordinator),
             batch_start: record.batch_id.0.start,
             batch_end: record.batch_id.0.end,
-            evidence: CommitmentEvidence {
-                step: record.step,
-                trainer_nonce: record.trainer_nonce,
-                results_digest: commitment.results_digest,
-            },
+            evidence,
             signer: *target.p2p_identity(),
             signature: record.signature,
         };

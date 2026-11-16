@@ -11,6 +11,8 @@ use leviathan_verifier::cold_start_warmup_bounds;
 use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::replay_epoch;
+use leviathan_verifier::DumpKey;
 use leviathan_verifier::read_run_model;
 use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ContributionOutcome;
@@ -53,6 +55,12 @@ struct Args {
     /// other step are left alone.
     #[arg(long)]
     first_step: Option<u32>,
+    /// The epoch whose first step is replayed, by when it started (the
+    /// coordinator's `epoch_state.start_timestamp`). Needed only when the dumps
+    /// of the first step come from more than one epoch, as they do once a run
+    /// restarts from its first step (wienerlabs/leviathan-net#67).
+    #[arg(long)]
+    epoch_start: Option<u64>,
     /// Whether the run's first epoch was flagged a cold start, which is when
     /// it trains within the run's cold-start warmup bounds. A run that was
     /// paused before its first epoch is; one started directly is not.
@@ -109,16 +117,33 @@ async fn main() -> Result<()> {
                 shuffle,
             )?;
 
+            let submitted = index_dir(&args.submitted)?;
+            let dumps: Vec<DumpKey> = submitted
+                .keys()
+                .filter_map(|key| parse_assignment_key(key))
+                .collect();
+            let epoch = replay_epoch(&dumps, first_step, args.epoch_start)?;
             let mut assignments = Vec::new();
-            for (target_index, (key, _)) in index_dir(&args.submitted)?.iter().enumerate() {
-                let Some((step, batch_id)) = parse_assignment_key(key) else {
-                    println!("skip  {key}: cannot read a step and batch out of this dump name");
+            for (target_index, key) in submitted.keys().enumerate() {
+                let Some(DumpKey {
+                    epoch_start,
+                    step,
+                    batch_id,
+                }) = parse_assignment_key(key)
+                else {
+                    println!(
+                        "skip  {key}: cannot read an epoch, step and batch out of this dump name"
+                    );
                     continue;
                 };
                 if step != first_step {
                     println!(
                         "skip  {key}: only the run's first step, {first_step}, can be replayed"
                     );
+                    continue;
+                }
+                if Some(epoch_start) != epoch {
+                    println!("skip  {key}: not of the epoch being replayed");
                     continue;
                 }
                 let data: Vec<BatchDataCPU> = provider

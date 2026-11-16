@@ -13,6 +13,7 @@ use psyche_network::commitment_record_path;
 use psyche_network::distro_results_from_reader;
 use psyche_network::results_digest;
 use psyche_network::CommitmentRecord;
+use psyche_network::PAYLOAD_DUMP_EXTENSION;
 use psyche_network::SerializedDistroResult;
 use psyche_verifier::audit_contribution;
 use psyche_verifier::FraudProof;
@@ -26,21 +27,25 @@ pub use replay::published_checkpoint;
 pub use replay::read_run_model;
 pub use replay::replay_data_layout;
 pub use replay::parse_assignment_key;
+pub use replay::replay_epoch;
+pub use replay::DumpKey;
 pub use replay::ReplayAssignment;
 pub use replay::ReplayTrainerConfig;
 pub use replay::TrainerReplayEngine;
 
-/// The step and batch part of a dump named `result-<committer>-step<N>-batch<B>.vec-postcard`.
+/// The epoch, step and batch part of a dump named
+/// `result-<committer>-epoch<T>-step<N>-batch<B>.vec-postcard`
+/// (`psyche_network::payload_dump_name`).
 ///
-/// The committer is base58, which has no `-`, so the first `-step` after the
-/// prefix is where it ends. Searching for `step` alone matched inside a
+/// The committer is base58, which has no `-`, so the first `-epoch` after the
+/// prefix is where it ends. Searching for `epoch` alone matched inside a
 /// committer that happened to spell it.
 pub fn contribution_key(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     let rest = name
         .strip_prefix("result-")?
-        .strip_suffix(".vec-postcard")?;
-    let start = rest.find("-step")?;
+        .strip_suffix(&format!(".{PAYLOAD_DUMP_EXTENSION}"))?;
+    let start = rest.find("-epoch")?;
     Some(rest[start + 1..].to_string())
 }
 

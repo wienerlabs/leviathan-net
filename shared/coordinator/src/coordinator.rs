@@ -988,6 +988,15 @@ impl Coordinator {
         (self.progress.epoch == 0).then_some(self.epoch_state.start_step)
     }
 
+    /// Whether a payload of `step`, trained in the epoch that started at
+    /// `epoch_start`, is one a replay can reproduce now: the replayable step
+    /// of the epoch the coordinator is in. The step alone does not say so. A
+    /// run set back to an earlier progress trains a step again in a later
+    /// epoch, from other weights (wienerlabs/leviathan-net#67).
+    pub fn is_replayable(&self, epoch_start: u64, step: u32) -> bool {
+        self.replayable_step() == Some(step) && epoch_start == self.epoch_state.start_timestamp
+    }
+
     pub fn get_cold_start_warmup_bounds(&self) -> Option<(u32, u32)> {
         let Model::LLM(llm) = &self.model;
         let cold_start_warmup_steps = llm.cold_start_warmup_steps;

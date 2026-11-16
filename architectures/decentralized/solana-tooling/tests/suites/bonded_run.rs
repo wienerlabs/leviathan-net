@@ -4,8 +4,10 @@
 //! (wienerlabs/leviathan-net#36).
 
 use psyche_coordinator::model::Model;
+use psyche_coordinator::get_data_index_for_step;
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
+use psyche_coordinator::CoordinatorProgress;
 use psyche_coordinator::RunState;
 use psyche_coordinator::WitnessBloom;
 use psyche_coordinator::BLOOM_FALSE_RATE;
@@ -704,6 +706,31 @@ impl Harness {
 
     /// The run authority pauses the run.
     pub async fn pause(&mut self) {
+        self.update_run(None, Some(true)).await;
+    }
+
+    /// The run authority restarts the run from `step`, the way
+    /// `run-manager update-config --restart-from-step` does: it pauses the
+    /// run, sets its progress back to `step` and resumes it. The nodes then
+    /// join and train from `step` again, in a new epoch.
+    pub async fn restart_from_step(&mut self, step: u32) {
+        self.pause().await;
+        let coordinator = self.state().await.coordinator;
+        assert_eq!(coordinator.run_state, RunState::Paused);
+        let progress = CoordinatorProgress {
+            epoch: coordinator.progress.epoch,
+            step,
+            epoch_start_data_index: get_data_index_for_step(&coordinator, step),
+        };
+        self.update_run(Some(progress), None).await;
+        self.update_run(None, Some(false)).await;
+    }
+
+    async fn update_run(
+        &mut self,
+        progress: Option<CoordinatorProgress>,
+        paused: Option<bool>,
+    ) {
         process_treasurer_run_update(
             &mut self.endpoint,
             &self.payer,
@@ -715,10 +742,10 @@ impl Harness {
                 metadata: None,
                 config: None,
                 model: None,
-                progress: None,
+                progress,
                 epoch_earning_rate_total_shared: None,
                 epoch_slashing_rate_per_client: None,
-                paused: Some(true),
+                paused,
                 client_version: None,
             },
         )

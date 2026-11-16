@@ -20,6 +20,7 @@ use psyche_solana_tooling::process_treasurer_instructions::run_slash_instruction
 use psyche_solana_tooling::process_treasurer_instructions::run_submit_audit_verdict_instruction;
 use psyche_solana_tooling::signed_commitment;
 use psyche_solana_tooling::signed_commitment::ed25519_signature_instruction;
+use psyche_solana_tooling::signed_commitment::PayloadHeader;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::state::commitment_run;
@@ -116,10 +117,7 @@ pub async fn a_commitment_signed_by_another_key_is_refused() {
     let foreign = SignedCommitment::sign(
         &harness.nodes[OTHER].p2p,
         genuine.run,
-        genuine.evidence.step,
-        genuine.evidence.trainer_nonce,
-        genuine.batch_start,
-        genuine.batch_end,
+        genuine.header(),
         genuine.evidence.results_digest,
     );
     assert_eq!(
@@ -231,10 +229,7 @@ pub async fn a_commitment_made_in_another_run_is_refused() {
     let elsewhere = SignedCommitment::sign(
         &harness.nodes[SUBJECT].p2p,
         payload_commitment_run("Leviathan another run"),
-        genuine.evidence.step,
-        genuine.evidence.trainer_nonce,
-        genuine.batch_start,
-        genuine.batch_end,
+        genuine.header(),
         genuine.evidence.results_digest,
     );
     assert_ne!(elsewhere.run, genuine.run);
@@ -329,10 +324,11 @@ pub async fn a_commitment_outside_the_current_epoch_is_refused() {
     let ahead = SignedCommitment::sign(
         &harness.nodes[SUBJECT].p2p,
         current.run,
-        current.evidence.step + 1,
-        current.evidence.trainer_nonce + 1,
-        current.batch_start,
-        current.batch_end,
+        PayloadHeader {
+            step: current.evidence.step + 1,
+            trainer_nonce: current.evidence.trainer_nonce + 1,
+            ..current.header()
+        },
         current.evidence.results_digest,
     );
     assert_eq!(
@@ -341,6 +337,37 @@ pub async fn a_commitment_outside_the_current_epoch_is_refused() {
     );
 
     harness.try_convict_on(SUBJECT, &current).await.unwrap();
+}
+
+/// A run restarted from an earlier step trains that step again, in a new
+/// epoch, and its nodes sign it again. A commitment signed the first time
+/// names a round that is over, though its step is back inside the epoch, and
+/// convicts nobody now. The same work signed in this epoch does
+/// (wienerlabs/leviathan-net#67).
+#[tokio::test]
+pub async fn a_commitment_from_before_a_restart_is_refused() {
+    let mut harness = training_run(443, "Leviathan restarted evidence").await;
+    let before = harness.signed_payload(SUBJECT).await;
+    let step = before.evidence.step;
+    harness.finish_epoch().await;
+    assert!(harness.state().await.coordinator.progress.step > step);
+
+    harness.restart_from_step(step).await;
+    for node in 0..NODES {
+        harness.join(node).await.unwrap();
+    }
+    harness.advance_to(RunState::RoundTrain).await;
+    let coordinator = harness.state().await.coordinator;
+    assert_eq!(coordinator.progress.step, step);
+    assert_eq!(coordinator.epoch_state.start_step, step);
+
+    assert_eq!(
+        refusal_code(harness.try_convict_on(SUBJECT, &before).await),
+        treasurer_refusal(ProgramError::CommitmentOutsideEpoch),
+    );
+    let again = harness.signed_payload(SUBJECT).await;
+    assert_eq!(again.evidence.step, step);
+    harness.try_convict_on(SUBJECT, &again).await.unwrap();
 }
 
 /// Batches are assigned by the round's committee, and in a warmup no round
@@ -528,10 +555,7 @@ pub async fn a_vote_on_a_commitment_signed_by_another_key_is_refused() {
     let foreign = SignedCommitment::sign(
         &harness.nodes[bystander].p2p,
         genuine.run,
-        genuine.evidence.step,
-        genuine.evidence.trainer_nonce,
-        genuine.batch_start,
-        genuine.batch_end,
+        genuine.header(),
         genuine.evidence.results_digest,
     );
     assert_eq!(
@@ -551,10 +575,7 @@ pub async fn a_later_vote_on_other_signed_evidence_is_refused() {
     let other = SignedCommitment::sign(
         &harness.nodes[target].p2p,
         first.run,
-        first.evidence.step,
-        first.evidence.trainer_nonce,
-        first.batch_start,
-        first.batch_end,
+        first.header(),
         payload_digest(HONEST_PAYLOAD),
     );
     vote(&mut harness, verifiers[0], target, &first)
