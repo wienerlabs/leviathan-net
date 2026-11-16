@@ -316,6 +316,20 @@ impl CoordinatorInstanceState {
             if !model.check() {
                 return err!(ProgramError::ModelSanityCheckFailed);
             }
+            // Every node builds its optimizer from the run's definition when it
+            // joins, and keeps it. A definition changed once the run has
+            // started would reach only the nodes that join after the change,
+            // and two nodes holding different optimizers, a different
+            // aggregation rule above all, apply different updates to the same
+            // results (wienerlabs/leviathan-net#60). Before the first start no
+            // node has built one, and the run can be set up freely.
+            let Model::LLM(current) = self.coordinator.model;
+            let Model::LLM(proposed) = model;
+            if self.coordinator.run_state != RunState::Uninitialized
+                && proposed.optimizer != current.optimizer
+            {
+                return err!(ProgramError::ModelOptimizerFrozen);
+            }
 
             let _ = std::mem::replace(&mut self.coordinator.model, model);
         }

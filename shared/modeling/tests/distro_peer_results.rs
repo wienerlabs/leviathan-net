@@ -235,3 +235,23 @@ fn values_beyond_the_safe_range_are_skipped_and_values_within_it_stay_finite() {
         );
     }
 }
+
+/// A run's aggregation rule decides with nothing set in the process's
+/// environment: a node of a run that aggregates robustly does so, and one of a
+/// run that takes the mean does that. The robust suite shows the reverse, that
+/// the environment cannot turn a mean run robust (wienerlabs/leviathan-net#60).
+#[test]
+fn a_runs_aggregation_rule_decides_on_its_own() {
+    let recipe = genesis_recipe();
+    let peers = [
+        peer_results(&recipe, &batch(&recipe, 3)),
+        peer_results(&recipe, &batch(&recipe, 11)),
+        peer_results(&recipe, &batch(&recipe, 17)),
+    ];
+    let robust = applied(&recipe.aggregating(true), &peers).unwrap();
+    let mean = applied(&recipe.aggregating(false), &peers).unwrap();
+    assert!(
+        !same(&robust, &mean),
+        "a robust run and a mean run applied the same update"
+    );
+}

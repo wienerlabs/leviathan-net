@@ -96,19 +96,23 @@ fn validate_coordinator_account_bytes(
 }
 
 /// The version a coordinator account's bytes declare, read before the bytes
-/// are taken for a `CoordinatorAccount`: an account of another version can
-/// hold bytes that are no valid value of this one's fields (a `bool` in what
-/// was padding, for one), and casting them is not sound.
+/// are taken for a `CoordinatorAccount`. An account of another version can
+/// hold bytes that mean something else in this one (a `bool` where version 1
+/// had padding, holding whatever the program's stack held), so it is refused
+/// with the version it declares rather than read as this one.
 fn validate_coordinator_account_version(
     bytes: &[u8],
 ) -> std::result::Result<(), DeserializeCoordinatorFromBytes> {
     let start = CoordinatorAccount::DISCRIMINATOR.len()
         + std::mem::offset_of!(CoordinatorAccount, version);
-    let version = u64::from_le_bytes(
-        bytes[start..start + std::mem::size_of::<u64>()]
-            .try_into()
-            .expect("the account was checked to be the full size"),
-    );
+    let version = bytes
+        .get(start..start + std::mem::size_of::<u64>())
+        .and_then(|field| field.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or(DeserializeCoordinatorFromBytes::IncorrectSize {
+            expected: CoordinatorAccount::space_with_discriminator(),
+            actual: bytes.len(),
+        })?;
     if version != CoordinatorAccount::VERSION {
         return Err(DeserializeCoordinatorFromBytes::InvalidVersion {
             expected: CoordinatorAccount::VERSION,

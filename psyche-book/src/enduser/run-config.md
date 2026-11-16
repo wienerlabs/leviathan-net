@@ -99,4 +99,9 @@ compression_decay = 0.999
 compression_chunk = 64
 compression_topk = 8
 quantize_1bit = true
+# how every node combines its peers' results: robustly (excising outliers and
+# clipping each peer's deviation) or, when false or left out, by their mean.
+# It is part of the run on chain, so every node aggregates the same way, and it
+# cannot change once the run has started.
+robust_aggregation = true
 ```

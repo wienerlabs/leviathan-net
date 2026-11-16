@@ -24,6 +24,7 @@ use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
+use psyche_solana_tooling::get_accounts::ensure_coordinator_version;
 use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::payload_dump_digest;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
@@ -243,6 +244,8 @@ async fn run() -> Result<()> {
     }
 
     println!("[+] configuring the run (verification_percent=50, slashing_rate={SLASHING_RATE})");
+    // The run's model goes on chain next, in the layout this build speaks.
+    ensure_coordinator_version(&mut endpoint, &coordinator_account).await?;
     process_treasurer_run_update(
         &mut endpoint,
         &payer,

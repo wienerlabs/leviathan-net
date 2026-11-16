@@ -350,6 +350,7 @@ impl From<ConstantLR> for LearningRateSchedule {
     Debug,
     Zeroable,
     Copy,
+    PartialEq,
     TS,
 )]
 #[repr(C)]

@@ -44,6 +44,27 @@ pub async fn get_coordinator_account_state(
         .transpose()
 }
 
+/// Refuses to go on against a coordinator program that writes accounts of
+/// another version than this build reads. Its instructions take a `Model`
+/// laid out differently, so an update sent across the two is misread rather
+/// than refused (wienerlabs/leviathan-net#60).
+pub async fn ensure_coordinator_version(
+    endpoint: &mut ToolboxEndpoint,
+    coordinator_account: &Pubkey,
+) -> Result<()> {
+    let data = endpoint
+        .get_account_data(coordinator_account)
+        .await?
+        .ok_or_else(|| {
+            anyhow!("coordinator account {coordinator_account} does not exist")
+        })?;
+    coordinator_account_from_bytes(&data).map(|_| ()).map_err(|err| {
+        anyhow!(
+            "the coordinator program here does not write the accounts this build reads ({err}); deploy the programs from this repository first"
+        )
+    })
+}
+
 pub async fn get_run(
     endpoint: &mut ToolboxEndpoint,
     run: &Pubkey,
