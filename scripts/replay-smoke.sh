@@ -13,7 +13,9 @@ set -euo pipefail
 # optimizer (1-bit DisTrO), sequence length and data layout.
 RUN_CONFIG="${RUN_CONFIG:-config/leviathan/genesis-rehearsal.toml}"
 VOCAB="${VOCAB:-30}"
-WORK="${WORK:-$(mktemp -d -t leviathan-replay-smoke)}"
+# A template with its X's spelled out, because the two mktemps disagree on
+# `-t`: BSD's takes a bare prefix, GNU's refuses one without them.
+WORK="${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/leviathan-replay-smoke.XXXXXX")}"
 BIN="${BIN:-./target/debug}"
 
 # macOS strips DYLD_* when it execs a protected shell, so a caller's exported

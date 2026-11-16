@@ -24,7 +24,6 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::daemon::audit_pass;
 use psyche_solana_tooling::daemon::AuditConfig;
-use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
@@ -50,6 +49,7 @@ use super::signed_payload::keep_signed_payload;
 use super::signed_payload::payload_header;
 use super::signed_payload::FRAUD_PAYLOAD;
 use super::signed_payload::HONEST_PAYLOAD;
+use super::chain_state::coordinator_state;
 
 const RUN_ID: &str = "Leviathan verifier daemon slash";
 const BOND: u64 = 500;
@@ -271,10 +271,7 @@ pub async fn run() {
     // assigned. It used to draw a committee over the warmup's roster anyway
     // and panic indexing past the round.
     let warmup =
-        get_coordinator_account_state(&mut endpoint, &coordinator_account)
-            .await
-            .unwrap()
-            .unwrap();
+        coordinator_state(&mut endpoint, &coordinator_account).await;
     assert_eq!(warmup.coordinator.run_state, RunState::Warmup);
     let mut judged = HashSet::new();
     let warmup_config = AuditConfig {
@@ -315,10 +312,7 @@ pub async fn run() {
     .unwrap();
 
     for _ in 0..4 {
-        let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-            .await
-            .unwrap()
-            .unwrap();
+        let state = coordinator_state(&mut endpoint, &coordinator_account).await;
         for client in &clients {
             let position = state
                 .coordinator
@@ -369,10 +363,7 @@ pub async fn run() {
 
     let cheater_committer = clients[cheater].pubkey().to_string();
     let state =
-        get_coordinator_account_state(&mut endpoint, &coordinator_account)
-            .await
-            .unwrap()
-            .unwrap();
+        coordinator_state(&mut endpoint, &coordinator_account).await;
     let tie_breakers = get_run(&mut endpoint, &run)
         .await
         .unwrap()
@@ -482,10 +473,7 @@ pub async fn run() {
     .await
     .unwrap();
 
-    let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
-        .await
-        .unwrap()
-        .unwrap();
+    let state = coordinator_state(&mut endpoint, &coordinator_account).await;
     let cheater_state = state
         .clients_state
         .clients
