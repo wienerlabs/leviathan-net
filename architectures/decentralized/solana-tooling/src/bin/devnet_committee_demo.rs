@@ -24,6 +24,7 @@ use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::ensure_coordinator_version;
+use psyche_solana_tooling::get_accounts::get_participant;
 use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::payload_dump_digest;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
@@ -32,7 +33,7 @@ use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_a
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_voters;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
@@ -43,6 +44,9 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run
 use psyche_solana_tooling::redact::guard_rpc_url;
 use psyche_solana_tooling::redact::redact_rpc_url;
 use psyche_solana_tooling::redact::scrub_rpc_url;
+use psyche_solana_tooling::verdict_votes::get_audit_verdict;
+use psyche_solana_tooling::verdict_votes::process_treasurer_run_pay_verdict_bounty;
+use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
@@ -76,6 +80,17 @@ const SLEEP_BUFFER: u64 = 3;
 
 async fn sleep_seconds(seconds: u64) {
     tokio::time::sleep(Duration::from_secs(seconds + SLEEP_BUFFER)).await;
+}
+
+async fn bond_of(
+    endpoint: &mut ToolboxEndpoint,
+    run: &Pubkey,
+    user: &Pubkey,
+) -> Result<u64> {
+    Ok(get_participant(endpoint, &find_participant(run, user))
+        .await?
+        .ok_or_else(|| anyhow!("{user} has no participant account"))?
+        .bond_amount)
 }
 
 async fn balance(endpoint: &mut ToolboxEndpoint, account: &Pubkey) -> u64 {
@@ -471,27 +486,26 @@ async fn run() -> Result<()> {
 
     // The conviction has moved the forfeit into the vault. The half that has
     // only ever run in memnet is the settlement: the target reclaims what the
-    // slash left of its bond, and the recorded voters split the bounty. The
-    // voter set passed here is exactly the committee that reached quorum above.
+    // slash left of its bond, which charges the conviction and records the
+    // bounty on its verdict, and each recorded voter's bond is then credited
+    // its share, seat by seat (wienerlabs/leviathan-net#64).
     let target_position = clients
         .iter()
         .position(|k| k.pubkey() == target_key)
         .ok_or_else(|| anyhow!("target key not among the demo clients"))?;
-    let voters: Vec<&Keypair> = verifiers.iter().take(quorum as usize).copied().collect();
-    let voter_collaterals: Vec<Pubkey> = voters
+    let voters: Vec<Pubkey> = verifiers
         .iter()
-        .map(|voter| {
-            let position = clients
-                .iter()
-                .position(|k| k.pubkey() == voter.pubkey())
-                .expect("a voter is always one of the demo clients");
-            clients_collateral[position]
-        })
+        .take(quorum as usize)
+        .map(|voter| voter.pubkey())
         .collect();
+    let mut voter_bonds_before = vec![];
+    for voter in &voters {
+        voter_bonds_before.push(bond_of(&mut endpoint, &run, voter).await?);
+    }
 
     println!(
-        "[+] target reclaims its bond; the {} recorded voters split the bounty",
-        voter_collaterals.len()
+        "[+] target reclaims its bond; the {} recorded voters are owed the bounty",
+        voters.len()
     );
     process_treasurer_participant_bond_request_withdraw(
         &mut endpoint,
@@ -503,7 +517,7 @@ async fn run() -> Result<()> {
     .await
     .unwrap();
     sleep_seconds(WITHDRAW_DELAY as u64).await;
-    process_treasurer_participant_bond_finalize_withdraw_with_voters(
+    process_treasurer_participant_bond_finalize_withdraw(
         &mut endpoint,
         &payer,
         &clients[target_position],
@@ -511,25 +525,45 @@ async fn run() -> Result<()> {
         &collateral_mint,
         &run,
         &coordinator_account,
-        &voter_collaterals,
     )
     .await
     .unwrap();
 
-    // Each voter deposited its whole bond, so its wallet sat at zero; whatever
-    // it holds now is its share of the bounty and nothing else.
+    let verdict = get_audit_verdict(&mut endpoint, &run, &target_key)
+        .await?
+        .ok_or_else(|| anyhow!("the verdict against the target is gone"))?;
+    if verdict.bounty_recipients() != voters.as_slice() {
+        return Err(anyhow!(
+            "the verdict owes {:?}, not the voters that convicted",
+            verdict.bounty_recipients()
+        ));
+    }
+    for seat in 0..voters.len() {
+        println!("[+] crediting voter {} its share", seat + 1);
+        process_treasurer_run_pay_verdict_bounty(
+            &mut endpoint,
+            &payer,
+            &run,
+            &target_key,
+            seat as u16,
+        )
+        .await?;
+    }
+
+    // Each voter's share went to its bond; what its bond gained is its share
+    // of the bounty and nothing else.
     let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
-    let share = bounty / voter_collaterals.len() as u64;
+    let share = bounty / voters.len() as u64;
     let target_recovered = balance(&mut endpoint, &clients_collateral[target_position]).await;
     let mut voter_amounts = vec![];
-    for voter_collateral in &voter_collaterals {
-        voter_amounts.push(balance(&mut endpoint, voter_collateral).await);
+    for (voter, before) in voters.iter().zip(&voter_bonds_before) {
+        voter_amounts.push(bond_of(&mut endpoint, &run, voter).await? - before);
     }
 
     println!();
     println!("Summary");
     println!("  verifiers          {}", verifiers.len());
-    println!("  quorum / voters    {} / {}", quorum, voter_collaterals.len());
+    println!("  quorum / voters    {} / {}", quorum, voters.len());
     println!("  target slashed     {}", target_slashed);
     println!("  bounty total       {}", bounty);
     println!("  bounty per voter   {}", share);

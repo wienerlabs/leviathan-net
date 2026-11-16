@@ -9,7 +9,6 @@ use prometheus_client::registry::Registry;
 use psyche_coordinator::ClientState;
 use psyche_coordinator::RunState;
 use psyche_solana_coordinator::CoordinatorAccount;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_voters;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_finalize_slash;
@@ -22,7 +21,6 @@ use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
-use solana_toolbox_endpoint::ToolboxEndpoint;
 use anchor_lang::error::ErrorCode as AnchorErrorCode;
 use anchor_lang::InstructionData;
 use anchor_lang::ToAccountMetas;
@@ -31,6 +29,7 @@ use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::instruction::RunOpenChallenge;
 use psyche_solana_treasurer::logic::RunOpenChallengeParams;
+use psyche_solana_treasurer::state::ConvictionCharge;
 use psyche_solana_treasurer::state::VerdictStatus;
 use psyche_solana_treasurer::state::WithdrawalHold;
 use psyche_solana_treasurer::state::WithdrawalStanding;
@@ -84,12 +83,11 @@ pub async fn upheld_appeal_slashes_the_target() {
         );
     }
 
-    let target_ata = h.clients_collateral[h.target_client_idx];
-    let tie_breaker_collaterals: Vec<Pubkey> = h
+    let bench: Vec<usize> = h
         .tie_breakers
         .iter()
         .take(h.tie_breaker_quorum as usize)
-        .map(|(client_idx, _)| h.clients_collateral[*client_idx])
+        .map(|(client_idx, _)| *client_idx)
         .collect();
     process_treasurer_participant_bond_request_withdraw(
         &mut h.endpoint,
@@ -104,29 +102,23 @@ pub async fn upheld_appeal_slashes_the_target() {
         .forward_clock_unix_timestamp(100)
         .await
         .unwrap();
-    process_treasurer_participant_bond_finalize_withdraw_with_voters(
-        &mut h.endpoint,
-        &h.payer,
-        &target,
-        &target_ata,
-        &h.collateral_mint,
-        &h.run,
-        &h.coordinator_account,
-        &tie_breaker_collaterals,
-    )
-    .await
-    .unwrap();
+    h.finalize_target_withdrawal().await.unwrap();
+    // The withdrawal charged the conviction and recorded what it owes the
+    // bench that upheld it; each tie-breaker is credited by seat.
     let appeal_bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
-    let appeal_share = appeal_bounty / tie_breaker_collaterals.len() as u64;
-    for tie_breaker_collateral in &tie_breaker_collaterals {
+    let appeal_share = appeal_bounty / bench.len() as u64;
+    let verdict = h.verdict_of(&target_key).await;
+    assert_eq!(verdict.bounty_owed, appeal_bounty);
+    let bench_keys: Vec<Pubkey> = bench
+        .iter()
+        .map(|client_idx| h.clients[*client_idx].pubkey())
+        .collect();
+    assert_eq!(verdict.bounty_recipients(), bench_keys.as_slice());
+    h.pay_every_seat_of(&target_key).await;
+    for tie_breaker in &bench {
         assert_eq!(
-            h.endpoint
-                .get_spl_token_account(tie_breaker_collateral)
-                .await
-                .unwrap()
-                .unwrap()
-                .amount,
-            appeal_share,
+            h.holdings_of(*tie_breaker).await,
+            BOND + appeal_share,
             "an upheld appeal pays the tie-breakers out of the target's forfeited bond",
         );
     }
@@ -374,9 +366,10 @@ pub async fn a_target_cannot_leave_while_its_conviction_is_pending() {
 /// A target that walks away from its conviction (its epoch ends before anyone
 /// finalises it, and it never comes back) cannot be ejected into any epoch the
 /// ledger will charge. Its withdrawal settles the conviction against the bond
-/// itself, pays the convicting verifiers, and records the verdict as upheld,
-/// so it is neither lost nor allowed to hold the bond forever
-/// (wienerlabs/leviathan-net#36).
+/// itself, records the verdict as upheld, so it is neither lost nor allowed to
+/// hold the bond forever (wienerlabs/leviathan-net#36), and records what it
+/// owes the convicting verifiers, who are credited by seat
+/// (wienerlabs/leviathan-net#64).
 #[tokio::test]
 pub async fn a_conviction_the_target_walks_away_from_is_settled_at_withdrawal() {
     let mut h = setup("Leviathan appeals walked away", 102).await;
@@ -395,19 +388,23 @@ pub async fn a_conviction_the_target_walks_away_from_is_settled_at_withdrawal() 
         WithdrawalStanding::Free { settle_conviction: true }
     );
 
-    let voter_collaterals = h.convicting_verifier_collaterals();
+    let voters = h.quorum_voters();
     let mut voters_before = vec![];
-    for collateral in &voter_collaterals {
-        voters_before.push(token_amount(&mut h.endpoint, collateral).await);
+    for voter in &voters {
+        voters_before.push(h.holdings_of(*voter).await);
     }
     let before = h.collateral_of(target_idx).await;
     h.finalize_target_withdrawal().await.unwrap();
     assert_eq!(h.collateral_of(target_idx).await - before, BOND - SLASHING_RATE);
     assert_eq!(h.verdict_status().await, VerdictStatus::Upheld);
-    let share = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64
-        / voter_collaterals.len() as u64;
-    for (collateral, before) in voter_collaterals.iter().zip(voters_before) {
-        assert_eq!(token_amount(&mut h.endpoint, collateral).await - before, share);
+    let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
+    let verdict = h.verdict_of(&target_key).await;
+    assert_eq!(verdict.charge, ConvictionCharge::Charged);
+    assert_eq!(verdict.bounty_owed, bounty);
+    h.pay_every_seat_of(&target_key).await;
+    let share = bounty / voters.len() as u64;
+    for (voter, before) in voters.iter().zip(voters_before) {
+        assert_eq!(h.holdings_of(*voter).await - before, share);
     }
 
     // Settled once: the verdict cannot be finalised against the target again.
@@ -619,8 +616,9 @@ pub async fn the_bench_can_overturn_between_epochs() {
 
 /// A bench that upholds between epochs cannot eject the target into an epoch
 /// that will charge it, so the conviction is recorded as due rather than lost
-/// on the ended epoch's roster, and the target's withdrawal settles it, paying
-/// the tie-breakers who ruled (wienerlabs/leviathan-net#36).
+/// on the ended epoch's roster, and the target's withdrawal settles it
+/// (wienerlabs/leviathan-net#36), owing the tie-breakers who ruled, who are
+/// credited by seat (wienerlabs/leviathan-net#64).
 #[tokio::test]
 pub async fn an_appeal_upheld_between_epochs_settles_at_withdrawal() {
     let mut h = setup("Leviathan appeals late uphold", 106).await;
@@ -657,16 +655,17 @@ pub async fn an_appeal_upheld_between_epochs_settles_at_withdrawal() {
     );
     let mut bench_before = vec![];
     for appellate in &bench {
-        bench_before.push(h.collateral_of(*appellate).await);
+        bench_before.push(h.holdings_of(*appellate).await);
     }
     let before = h.collateral_of(target).await;
-    h.finalize_withdraw_paying(target, &bench).await.unwrap();
+    h.try_finalize_withdraw(target).await.unwrap();
     assert_eq!(h.collateral_of(target).await - before, BOND - SLASHING_RATE);
     assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Upheld);
+    h.pay_every_seat_of(&target_key).await;
     let share =
         (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64 / bench.len() as u64;
     for (appellate, before) in bench.iter().zip(bench_before) {
-        assert_eq!(h.collateral_of(*appellate).await - before, share);
+        assert_eq!(h.holdings_of(*appellate).await - before, share);
     }
 }
 
@@ -706,9 +705,19 @@ pub async fn a_verdict_quorum_reached_between_epochs_is_due() {
     assert_eq!(h.client_state(&target_key).await, Some(ClientState::Healthy));
 
     h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    let mut voters_before = vec![];
+    for voter in &voters {
+        voters_before.push(h.holdings_of(*voter).await);
+    }
     let before = h.collateral_of(target).await;
-    h.finalize_withdraw_paying(target, &voters).await.unwrap();
+    h.try_finalize_withdraw(target).await.unwrap();
     assert_eq!(h.collateral_of(target).await - before, BOND - SLASHING_RATE);
+    h.pay_every_seat_of(&target_key).await;
+    let share = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64
+        / voters.len() as u64;
+    for (voter, before) in voters.iter().zip(voters_before) {
+        assert_eq!(h.holdings_of(*voter).await - before, share);
+    }
 }
 
 /// A conviction finalised in a warmup is not ejected, because pausing a warmup
@@ -812,15 +821,6 @@ pub async fn a_challenge_window_needs_an_appeal_deadline() {
     )
     .await
     .unwrap();
-}
-
-async fn token_amount(endpoint: &mut ToolboxEndpoint, account: &Pubkey) -> u64 {
-    endpoint
-        .get_spl_token_account(account)
-        .await
-        .unwrap()
-        .unwrap()
-        .amount
 }
 
 /// A seat is read from a voter's index in the roster now, and drawn over the

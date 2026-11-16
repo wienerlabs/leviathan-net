@@ -1,7 +1,9 @@
 //! Verdict votes hold their voters' bonds until they can no longer cost them
-//! (wienerlabs/leviathan-net#39). These send the instructions that free a
-//! vote, charge a losing one, or credit the bench its share of the losers'
-//! forfeits, reading from chain whom each one names.
+//! (wienerlabs/leviathan-net#39), and a verdict owes its winning side a bounty
+//! out of the losing side's forfeit (wienerlabs/leviathan-net#64). These send
+//! the instructions that free a vote, charge a losing verifier or a convicted
+//! target, or credit a recipient its share, reading from chain whom each one
+//! names.
 
 use anchor_lang::InstructionData;
 use anchor_lang::ToAccountMetas;
@@ -9,21 +11,27 @@ use anyhow::Context;
 use anyhow::Result;
 use psyche_solana_coordinator::coordinator_account_from_bytes;
 use psyche_solana_treasurer::accounts::ParticipantReleaseVerdictVoteAccounts;
+use psyche_solana_treasurer::accounts::RunChargeConvictionAccounts;
 use psyche_solana_treasurer::accounts::RunFinalizeSlashAccounts;
-use psyche_solana_treasurer::accounts::RunPayBenchBountyAccounts;
+use psyche_solana_treasurer::accounts::RunPayVerdictBountyAccounts;
 use psyche_solana_treasurer::accounts::RunSlashLosingVerifierAccounts;
 use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::instruction::ParticipantReleaseVerdictVote;
+use psyche_solana_treasurer::instruction::RunChargeConviction;
 use psyche_solana_treasurer::instruction::RunFinalizeSlash;
-use psyche_solana_treasurer::instruction::RunPayBenchBounty;
+use psyche_solana_treasurer::instruction::RunPayVerdictBounty;
 use psyche_solana_treasurer::instruction::RunSlashLosingVerifier;
 use psyche_solana_treasurer::logic::ParticipantReleaseVerdictVoteParams;
+use psyche_solana_treasurer::logic::RunChargeConvictionParams;
 use psyche_solana_treasurer::logic::RunFinalizeSlashParams;
-use psyche_solana_treasurer::logic::RunPayBenchBountyParams;
+use psyche_solana_treasurer::logic::RunPayVerdictBountyParams;
 use psyche_solana_treasurer::logic::RunSlashLosingVerifierParams;
 use psyche_solana_treasurer::state::appeal_window_open;
+use psyche_solana_treasurer::state::conviction_landing;
 use psyche_solana_treasurer::state::AuditVerdict;
+use psyche_solana_treasurer::state::Landing;
+use psyche_solana_treasurer::state::ConvictionCharge;
 use psyche_solana_treasurer::state::VerdictStatus;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -109,13 +117,136 @@ pub async fn get_audit_verdict(
 pub struct DisputeSettlement {
     /// A conviction whose windows had closed, or that was due, finalised.
     pub conviction_finalized: bool,
+    /// A conviction that ejected the target charged against its bond, now
+    /// that the ledger has charged the ejection.
+    pub conviction_charged: bool,
     /// Votes released from a standing conviction, or withdrawn from a dispute
     /// whose round is over.
     pub votes_freed: usize,
     /// Losing verifiers of an overturn charged by the crank.
     pub losers_charged: usize,
-    /// Tie-breakers credited their share of the losers' forfeits.
-    pub bench_paid: usize,
+    /// Recipients credited their share of the losing side's forfeit: the
+    /// bench of an overturn, or the voters, or the upholding bench, of a
+    /// conviction that stands.
+    pub seats_credited: usize,
+}
+
+/// The verdicts in `run` that are not settled: a dispute whose votes still
+/// hold bonds, a conviction not yet finalised or charged, or a verdict that
+/// still owes a recipient its share. Sorted by target.
+pub async fn unsettled_disputes(
+    endpoint: &mut ToolboxEndpoint,
+    run: &Pubkey,
+) -> Result<Vec<AuditVerdict>> {
+    // A verdict account starts with its discriminator, then its bump, then
+    // the run it belongs to.
+    let discriminator: &[u8] =
+        <AuditVerdict as anchor_lang::Discriminator>::DISCRIMINATOR;
+    let addresses = endpoint
+        .search_addresses(
+            &psyche_solana_treasurer::ID,
+            Some(AuditVerdict::space_with_discriminator()),
+            &[(0, discriminator), (8 + 1, run.as_ref())],
+        )
+        .await?;
+    let mut verdicts = vec![];
+    for address in addresses {
+        let Some(account) = endpoint.get_account(&address).await? else {
+            continue;
+        };
+        let Some(verdict) =
+            AuditVerdict::from_pda_account(&account.owner, &account.data)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Unable to decode the audit verdict {address}: {error}"
+                    )
+                })?
+        else {
+            continue;
+        };
+        if verdict.run == *run && !verdict.is_settled() {
+            verdicts.push(verdict);
+        }
+    }
+    verdicts.sort_by_key(|verdict| verdict.target);
+    Ok(verdicts)
+}
+
+/// What [`settle_open_disputes`] did across a run.
+#[derive(Debug, Default)]
+pub struct DisputeSweep {
+    /// The verdicts that were not settled when the sweep began.
+    pub open: usize,
+    /// Convictions whose windows had closed, or that were due, finalised.
+    pub convictions_finalized: usize,
+    /// Convictions that ejected their target charged against its bond.
+    pub convictions_charged: usize,
+    /// Votes released or withdrawn.
+    pub votes_freed: usize,
+    /// Losing verifiers of an overturn charged.
+    pub losers_charged: usize,
+    /// Recipients credited their share of a bounty.
+    pub seats_credited: usize,
+    /// Targets whose dispute a step failed on, with why. The rest of the
+    /// sweep goes on without them.
+    pub failures: Vec<(Pubkey, anyhow::Error)>,
+}
+
+impl DisputeSweep {
+    /// Whether the sweep did anything or met a failure worth reporting.
+    pub fn is_quiet(&self) -> bool {
+        self.convictions_finalized
+            + self.convictions_charged
+            + self.votes_freed
+            + self.losers_charged
+            + self.seats_credited
+            == 0
+            && self.failures.is_empty()
+    }
+
+    fn add(&mut self, settled: DisputeSettlement) {
+        self.convictions_finalized += usize::from(settled.conviction_finalized);
+        self.convictions_charged += usize::from(settled.conviction_charged);
+        self.votes_freed += settled.votes_freed;
+        self.losers_charged += settled.losers_charged;
+        self.seats_credited += settled.seats_credited;
+    }
+}
+
+/// Settles, as far as nobody's consent is needed, every dispute in `run` that
+/// is not settled: [`settle_previous_dispute`] for each target in turn.
+///
+/// A dispute used to be settled only by a verifier about to open the next one
+/// against the same target. A conviction's bounty is now credited only once
+/// the target's bond is charged and each recipient credited by seat, so a
+/// target nobody disputes again would leave its convicting voters unpaid. The
+/// verifier daemon sweeps every pass instead (wienerlabs/leviathan-net#64).
+pub async fn settle_open_disputes(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+) -> Result<DisputeSweep> {
+    let open = unsettled_disputes(endpoint, run).await?;
+    let mut sweep = DisputeSweep {
+        open: open.len(),
+        ..DisputeSweep::default()
+    };
+    for verdict in open {
+        match settle_previous_dispute(
+            endpoint,
+            payer,
+            run,
+            coordinator_account,
+            &verdict.target,
+        )
+        .await
+        {
+            Ok(settled) => sweep.add(settled),
+            Err(err) => sweep.failures.push((verdict.target, err)),
+        }
+    }
+    Ok(sweep)
 }
 
 /// How many times a step that another sender may be racing is read afresh and
@@ -127,15 +258,22 @@ const SETTLEMENT_ATTEMPTS: usize = 3;
 ///
 /// - it finalises a conviction whose windows have closed, or a due one that
 ///   can land now;
+/// - it charges the target's bond for a conviction that ejected it, once the
+///   epoch it was ejected in has been charged;
 /// - it frees the votes of a conviction that stands, or of a dispute whose
 ///   round is over;
-/// - it charges an overturn's losing verifiers, and credits the bench.
+/// - it charges an overturn's losing verifiers;
+/// - it credits every recipient its share of the losing side's forfeit.
 ///
 /// A verifier opening a new dispute against `target` sends this first: the
 /// account is taken over only once the last dispute holds nobody's bond and
-/// owes the bench nothing. Other verifiers may be settling the same dispute at
+/// owes nobody a bounty. Other verifiers may be settling the same dispute at
 /// the same time, so each step reads the verdict afresh, and a step someone
 /// else already took is not an error.
+///
+/// Every step is tried, whatever an earlier one met: a vote that can be
+/// released, or a seat that can be credited, does not wait on a finalisation
+/// that keeps failing. The first failure is returned once all have run.
 pub async fn settle_previous_dispute(
     endpoint: &mut ToolboxEndpoint,
     payer: &Keypair,
@@ -147,32 +285,70 @@ pub async fn settle_previous_dispute(
     if get_audit_verdict(endpoint, run, target).await?.is_none() {
         return Ok(settlement);
     }
-    settlement.conviction_finalized = finalize_closed_conviction(
+    let mut first_error = None;
+    let mut note = |error: anyhow::Error| {
+        first_error.get_or_insert(error);
+    };
+    match finalize_closed_conviction(
         endpoint,
         payer,
         run,
         coordinator_account,
         target,
     )
-    .await?;
-    settlement.votes_freed =
-        free_settled_votes(endpoint, payer, run, coordinator_account, target)
-            .await?;
-    settlement.losers_charged =
-        charge_losers(endpoint, payer, run, coordinator_account, target)
-            .await?;
-    settlement.bench_paid = credit_bench(endpoint, payer, run, target).await?;
-    Ok(settlement)
+    .await
+    {
+        Ok(finalized) => settlement.conviction_finalized = finalized,
+        Err(error) => note(error),
+    }
+    match charge_ejected_conviction(
+        endpoint,
+        payer,
+        run,
+        coordinator_account,
+        target,
+    )
+    .await
+    {
+        Ok(charged) => settlement.conviction_charged = charged,
+        Err(error) => note(error),
+    }
+    match free_settled_votes(endpoint, payer, run, coordinator_account, target)
+        .await
+    {
+        Ok(freed) => settlement.votes_freed = freed,
+        Err(error) => note(error),
+    }
+    match charge_losers(endpoint, payer, run, coordinator_account, target).await
+    {
+        Ok(charged) => settlement.losers_charged = charged,
+        Err(error) => note(error),
+    }
+    match credit_seats(endpoint, payer, run, target).await {
+        Ok(credited) => settlement.seats_credited = credited,
+        Err(error) => note(error),
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(settlement),
+    }
 }
 
 /// The coordinator state a settlement reads, taken in place: the account is
 /// too large to copy onto an async task's stack.
 struct CoordinatorView {
     round_over: bool,
-    /// Where the target sits on the roster, and whether an ejection now is
-    /// certain to be charged.
+    /// Where the target sits on the roster.
     target_index: Option<u64>,
-    ejections_charged: bool,
+    /// Whether a conviction finalised now would eject the target into an
+    /// epoch that will charge it, as `conviction_landing` decides on chain.
+    /// A due conviction lands only then: off the roster, outside a charging
+    /// state, or with the target already ejected by another conviction, the
+    /// program refuses to finalise it again.
+    lands_now: bool,
+    /// Whether the ledger has charged the ejection the verdict's conviction
+    /// landed, if it landed one.
+    ejection_charged: bool,
 }
 
 async fn coordinator_view(
@@ -199,10 +375,17 @@ async fn coordinator_view(
         .iter()
         .position(|client| *client.id.signer() == signer)
         .map(|index| index as u64);
+    let lands_now = target_index.is_some_and(|index| {
+        matches!(
+            conviction_landing(coordinator, &verdict.target, index),
+            Ok(Landing::Eject(_))
+        )
+    });
     let view = CoordinatorView {
         round_over: verdict.round_over(coordinator),
         target_index,
-        ejections_charged: coordinator.ejections_charged(),
+        lands_now,
+        ejection_charged: verdict.ejection_charged(coordinator),
     };
     Ok(view)
 }
@@ -225,7 +408,7 @@ async fn finalize_closed_conviction(
     let now = endpoint.get_sysvar_clock().await?.unix_timestamp;
     let view =
         coordinator_view(endpoint, coordinator_account, &verdict).await?;
-    let lands_now = view.target_index.is_some() && view.ejections_charged;
+    let lands_now = view.lands_now;
     let finalizable = match verdict.status {
         VerdictStatus::SlashPending => {
             now >= verdict.pending_since_unix
@@ -272,6 +455,46 @@ async fn finalize_closed_conviction(
             if get_audit_verdict(endpoint, run, target)
                 .await?
                 .is_some_and(|now| now.status != verdict.status) =>
+        {
+            Ok(false)
+        },
+        Err(err) => Err(err),
+    }
+}
+
+/// Charges `target`'s bond for the conviction that ejected it, once the epoch
+/// it was ejected in has been charged. Returns whether it did.
+async fn charge_ejected_conviction(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+) -> Result<bool> {
+    let Some(verdict) = get_audit_verdict(endpoint, run, target).await? else {
+        return Ok(false);
+    };
+    if !verdict.awaits_charge() {
+        return Ok(false);
+    }
+    let view =
+        coordinator_view(endpoint, coordinator_account, &verdict).await?;
+    if !view.ejection_charged {
+        return Ok(false);
+    }
+    let instruction = run_charge_conviction_instruction(
+        &payer.pubkey(),
+        run,
+        coordinator_account,
+        target,
+    );
+    match endpoint.process_instruction(payer, instruction).await {
+        Ok(_) => Ok(true),
+        // Someone else charged it first, or the target's withdrawal did.
+        Err(_)
+            if get_audit_verdict(endpoint, run, target)
+                .await?
+                .is_some_and(|now| now.charge != ConvictionCharge::Ejected) =>
         {
             Ok(false)
         },
@@ -395,9 +618,10 @@ async fn charge_losers(
     }
 }
 
-/// Credits every tie-breaker on `target`'s overturned verdict that has not
-/// been credited its share, once every loser is charged.
-async fn credit_bench(
+/// Credits every recipient on `target`'s verdict that has not been credited
+/// its share, once what the verdict owes is final. A seat that fails does not
+/// hold back the others; the first failure is returned once all were tried.
+async fn credit_seats(
     endpoint: &mut ToolboxEndpoint,
     payer: &Keypair,
     run: &Pubkey,
@@ -406,18 +630,16 @@ async fn credit_bench(
     let Some(verdict) = get_audit_verdict(endpoint, run, target).await? else {
         return Ok(0);
     };
-    if verdict.status != VerdictStatus::Overturned
-        || !verdict.all_losers_settled()
-        || verdict.bench_share() == 0
-    {
+    if verdict.bounty_final().is_err() || verdict.bounty_share() == 0 {
         return Ok(0);
     }
     let mut credited = 0;
-    for seat in 0..verdict.appeal_voters.len() {
-        if verdict.bench_seat_paid(seat) {
+    let mut first_error = None;
+    for seat in 0..verdict.bounty_recipients().len() {
+        if verdict.bounty_seat_paid(seat) {
             continue;
         }
-        match process_treasurer_run_pay_bench_bounty(
+        match process_treasurer_run_pay_verdict_bounty(
             endpoint,
             payer,
             run,
@@ -428,16 +650,20 @@ async fn credit_bench(
         {
             Ok(()) => credited += 1,
             Err(err) => {
+                // Someone else credited it first.
                 let paid = get_audit_verdict(endpoint, run, target)
                     .await?
-                    .is_some_and(|now| now.bench_seat_paid(seat));
+                    .is_some_and(|now| now.bounty_seat_paid(seat));
                 if !paid {
-                    return Err(err);
+                    first_error.get_or_insert(err);
                 }
             },
         }
     }
-    Ok(credited)
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(credited),
+    }
 }
 
 /// Charges the losing verifier at `voter_position` of `target`'s overturned
@@ -483,28 +709,71 @@ pub async fn process_treasurer_run_slash_losing_verifier(
     Ok(())
 }
 
-/// The instruction crediting `tie_breaker`, at `seat` of `target`'s
-/// overturned verdict, its share of the losers' forfeits.
-pub fn run_pay_bench_bounty_instruction(
+/// The instruction charging `target`'s bond for the conviction that ejected
+/// it.
+pub fn run_charge_conviction_instruction(
+    payer: &Pubkey,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+) -> Instruction {
+    let accounts = RunChargeConvictionAccounts {
+        payer: *payer,
+        run: *run,
+        coordinator_account: *coordinator_account,
+        audit_verdict: find_audit_verdict(run, target),
+        target_participant: find_participant(run, target),
+    };
+    Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunChargeConviction {
+            params: RunChargeConvictionParams { target: *target },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    }
+}
+
+/// Charges `target`'s bond for the conviction that ejected it.
+pub async fn process_treasurer_run_charge_conviction(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+) -> Result<()> {
+    let instruction = run_charge_conviction_instruction(
+        &payer.pubkey(),
+        run,
+        coordinator_account,
+        target,
+    );
+    endpoint.process_instruction(payer, instruction).await?;
+    Ok(())
+}
+
+/// The instruction crediting `recipient`, at `seat` of `target`'s verdict's
+/// bounty recipients, its share of the losing side's forfeit.
+pub fn run_pay_verdict_bounty_instruction(
     payer: &Pubkey,
     run: &Pubkey,
     target: &Pubkey,
     seat: u16,
-    tie_breaker: &Pubkey,
+    recipient: &Pubkey,
 ) -> Instruction {
-    let accounts = RunPayBenchBountyAccounts {
+    let accounts = RunPayVerdictBountyAccounts {
         payer: *payer,
         run: *run,
         audit_verdict: find_audit_verdict(run, target),
-        tie_breaker_participant: find_participant(run, tie_breaker),
+        recipient_participant: find_participant(run, recipient),
     };
     Instruction {
         accounts: accounts.to_account_metas(None),
-        data: RunPayBenchBounty {
-            params: RunPayBenchBountyParams {
+        data: RunPayVerdictBounty {
+            params: RunPayVerdictBountyParams {
                 target: *target,
                 seat,
-                tie_breaker: *tie_breaker,
+                recipient: *recipient,
             },
         }
         .data(),
@@ -512,9 +781,9 @@ pub fn run_pay_bench_bounty_instruction(
     }
 }
 
-/// Credits the tie-breaker at `seat` of `target`'s overturned verdict its
-/// share of the losers' forfeits. Whom to credit is read from the verdict.
-pub async fn process_treasurer_run_pay_bench_bounty(
+/// Credits the recipient at `seat` of `target`'s verdict its share of the
+/// losing side's forfeit. Whom to credit is read from the verdict.
+pub async fn process_treasurer_run_pay_verdict_bounty(
     endpoint: &mut ToolboxEndpoint,
     payer: &Keypair,
     run: &Pubkey,
@@ -524,17 +793,17 @@ pub async fn process_treasurer_run_pay_bench_bounty(
     let verdict = get_audit_verdict(endpoint, run, target)
         .await?
         .context("no dispute was ever opened against the target")?;
-    let tie_breaker = verdict
-        .appeal_voters
+    let recipient = verdict
+        .bounty_recipients()
         .get(seat as usize)
         .copied()
-        .context("no tie-breaker sits at that seat")?;
-    let instruction = run_pay_bench_bounty_instruction(
+        .context("no recipient sits at that seat")?;
+    let instruction = run_pay_verdict_bounty_instruction(
         &payer.pubkey(),
         run,
         target,
         seat,
-        &tie_breaker,
+        &recipient,
     );
     endpoint.process_instruction(payer, instruction).await?;
     Ok(())

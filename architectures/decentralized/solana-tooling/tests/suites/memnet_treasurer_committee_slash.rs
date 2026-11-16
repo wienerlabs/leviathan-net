@@ -23,7 +23,11 @@ use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_a
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_voters;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
+use psyche_solana_tooling::get_accounts::get_participant;
+use psyche_solana_tooling::verdict_votes::get_audit_verdict;
+use psyche_solana_tooling::verdict_votes::process_treasurer_run_pay_verdict_bounty;
+use psyche_solana_treasurer::find_participant;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
@@ -465,16 +469,10 @@ pub async fn run() {
         .iter()
         .position(|k| k.pubkey() == target_key)
         .unwrap();
-    let voter_collaterals: Vec<Pubkey> = verifiers
+    let voters: Vec<Pubkey> = verifiers
         .iter()
         .take(quorum as usize)
-        .map(|(verifier, _)| {
-            let position = clients
-                .iter()
-                .position(|k| k.pubkey() == verifier.pubkey())
-                .unwrap();
-            clients_collateral[position]
-        })
+        .map(|(verifier, _)| verifier.pubkey())
         .collect();
 
     process_treasurer_participant_bond_request_withdraw(
@@ -490,7 +488,7 @@ pub async fn run() {
         .forward_clock_unix_timestamp(100)
         .await
         .unwrap();
-    process_treasurer_participant_bond_finalize_withdraw_with_voters(
+    process_treasurer_participant_bond_finalize_withdraw(
         &mut endpoint,
         &payer,
         &clients[target_position],
@@ -498,15 +496,39 @@ pub async fn run() {
         &collateral_mint,
         &run,
         &coordinator_account,
-        &voter_collaterals,
     )
     .await
     .unwrap();
 
+    // The withdrawal charged the conviction and recorded its bounty for the
+    // voters the verdict names; anyone credits each one's bond by seat.
     let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
-    let share = bounty / voter_collaterals.len() as u64;
-    for voter_collateral in &voter_collaterals {
-        assert_amount(&mut endpoint, voter_collateral, share).await;
+    let share = bounty / voters.len() as u64;
+    let verdict = get_audit_verdict(&mut endpoint, &run, &target_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(verdict.bounty_recipients(), voters.as_slice());
+    assert_eq!(verdict.bounty_owed, bounty);
+    for seat in 0..voters.len() {
+        process_treasurer_run_pay_verdict_bounty(
+            &mut endpoint,
+            &payer,
+            &run,
+            &target_key,
+            seat as u16,
+        )
+        .await
+        .unwrap();
+    }
+    for voter in &voters {
+        let bond =
+            get_participant(&mut endpoint, &find_participant(&run, voter))
+                .await
+                .unwrap()
+                .unwrap()
+                .bond_amount;
+        assert_eq!(bond, BOND + share);
     }
     assert_amount(
         &mut endpoint,

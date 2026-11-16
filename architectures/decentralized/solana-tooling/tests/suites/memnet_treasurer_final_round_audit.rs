@@ -9,6 +9,7 @@ use psyche_coordinator::ClientState;
 use psyche_coordinator::RunState;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_challenge_config;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
+use psyche_solana_tooling::verdict_votes::settle_previous_dispute;
 use psyche_solana_treasurer::state::VerdictStatus;
 use psyche_solana_treasurer::ProgramError;
 use solana_sdk::signer::Signer;
@@ -213,7 +214,10 @@ pub async fn a_client_leaving_the_final_round_does_not_shut_the_cooldown() {
 /// epoch records the conviction as due: the coordinator would refuse a second
 /// ejection, and that refusal used to undo the vote that reached the quorum.
 /// The epoch charges the authority's ejection, and the target's withdrawal
-/// settles the committee's conviction against the bond.
+/// settles the committee's conviction against the bond. Each forfeit's bounty
+/// goes where it belongs: the committee's to its voters, by seat, and the
+/// authority's to the reporter the withdrawal names
+/// (wienerlabs/leviathan-net#64).
 #[tokio::test]
 pub async fn a_conviction_of_a_target_already_ejected_is_due() {
     let mut h = convicting_at_once("Leviathan final ejected", 143).await;
@@ -240,21 +244,58 @@ pub async fn a_conviction_of_a_target_already_ejected_is_due() {
             .unwrap();
     }
     assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Due);
+    // The ejected target cannot be ejected again, so anyone settling the
+    // dispute leaves the conviction due instead of failing on it, and goes on
+    // to what else it can settle.
+    let payer = h.payer.insecure_clone();
+    let settled = settle_previous_dispute(
+        &mut h.endpoint,
+        &payer,
+        &h.run,
+        &h.coordinator_account,
+        &target_key,
+    )
+    .await
+    .unwrap();
+    assert!(!settled.conviction_finalized);
+    assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Due);
 
     h.finish_epoch_with_witnesses().await;
     // The ledger charged the authority's ejection once.
     assert_eq!(h.slashed_of(&target_key).await, SLASHING_RATE);
     h.request_withdraw(target, BOND).await;
     h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    // The authority's slash owes a reporter, which the withdrawal must name.
+    assert_eq!(
+        refusal_code(h.try_finalize_withdraw(target).await),
+        treasurer_refusal(ProgramError::MissingReporter),
+    );
+    let reporter = committee.trainers[1].0;
+    assert_ne!(reporter, target);
+    let reporter_before = h.holdings_of(reporter).await;
+    let mut voters_before = vec![];
+    for voter in &voters {
+        voters_before.push(h.holdings_of(*voter).await);
+    }
     let before = h.collateral_of(target).await;
-    // The bounty goes to the voters the verdict names, in its order.
-    h.finalize_withdraw_paying(target, &voters).await.unwrap();
+    h.try_finalize_withdraw_naming(target, reporter)
+        .await
+        .unwrap();
     // Both convictions, each charged once.
     assert_eq!(
         h.collateral_of(target).await - before,
         BOND - 2 * SLASHING_RATE
     );
     assert_eq!(h.verdict_status_of(target).await, VerdictStatus::Upheld);
+    let bounty = SLASHING_RATE * BOUNTY_BPS as u64 / 10_000;
+    assert_eq!(h.holdings_of(reporter).await - reporter_before, bounty);
+    // The committee's conviction owes its own voters, credited by seat.
+    assert_eq!(h.verdict_of(&target_key).await.bounty_owed, bounty);
+    h.pay_every_seat_of(&target_key).await;
+    let share = bounty / voters.len() as u64;
+    for (voter, before) in voters.iter().zip(voters_before) {
+        assert_eq!(h.holdings_of(*voter).await - before, share);
+    }
 }
 
 /// A round that gathers no witness ends the epoch with every client
@@ -301,8 +342,18 @@ pub async fn a_round_that_loses_its_witnesses_still_convicts_through_the_bond()
     assert_eq!(h.slashed_of(&target_key).await, 0);
     h.request_withdraw(target, BOND).await;
     h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
+    let mut voters_before = vec![];
+    for voter in &voters {
+        voters_before.push(h.holdings_of(*voter).await);
+    }
     let before = h.collateral_of(target).await;
-    h.finalize_withdraw_paying(target, &voters).await.unwrap();
+    h.try_finalize_withdraw(target).await.unwrap();
     assert_eq!(h.collateral_of(target).await - before, BOND - SLASHING_RATE);
     assert_eq!(h.verdict_status().await, VerdictStatus::Upheld);
+    h.pay_every_seat_of(&target_key).await;
+    let share =
+        SLASHING_RATE * BOUNTY_BPS as u64 / 10_000 / voters.len() as u64;
+    for (voter, before) in voters.iter().zip(voters_before) {
+        assert_eq!(h.holdings_of(*voter).await - before, share);
+    }
 }

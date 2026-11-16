@@ -2,8 +2,23 @@ use anchor_lang::prelude::*;
 use psyche_coordinator::ClientState;
 use psyche_coordinator::Coordinator;
 use psyche_coordinator::RunState;
+use psyche_solana_coordinator::CoordinatorAccount;
 
+use crate::state::EjectionCharge;
 use crate::ProgramError;
+
+/// What the ledger will charge an ejection landed now, in the epoch the
+/// coordinator in `account` is in.
+pub fn ejection_charge(account: &CoordinatorAccount) -> EjectionCharge {
+    EjectionCharge {
+        epoch_start: account.state.coordinator.epoch_state.start_timestamp,
+        rate: account
+            .state
+            .clients_state
+            .current_epoch_rates
+            .slashing_rate_per_client,
+    }
+}
 
 /// Where a conviction against a target lands right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

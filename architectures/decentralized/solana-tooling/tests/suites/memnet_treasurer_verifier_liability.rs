@@ -11,7 +11,7 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_open_challenge;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_challenge_config;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_update;
-use psyche_solana_tooling::verdict_votes::run_pay_bench_bounty_instruction;
+use psyche_solana_tooling::verdict_votes::run_pay_verdict_bounty_instruction;
 use psyche_solana_tooling::verdict_votes::settle_previous_dispute;
 use psyche_solana_tooling::verdict_votes::DisputeSettlement;
 use psyche_solana_treasurer::accounts::RunSlashLosingVerifierAccounts;
@@ -84,7 +84,7 @@ pub async fn an_overturn_charges_each_losing_verifier_and_credits_the_bench() {
 
     let verdict = h.verdict_of(&target_key).await;
     assert_eq!(
-        verdict.bench_bounty_owed,
+        verdict.bounty_owed,
         bench_share(1) * losers.len() as u64,
         "each forfeit's bounty is owed to the bench",
     );
@@ -95,7 +95,7 @@ pub async fn an_overturn_charges_each_losing_verifier_and_credits_the_bench() {
     for (seat, (tie_breaker, before)) in
         bench.iter().zip(bench_before).enumerate()
     {
-        h.pay_bench_seat(seat as u16).await.unwrap();
+        h.pay_seat(seat as u16).await.unwrap();
         assert_eq!(
             h.participant_of(*tie_breaker).await.bond_amount - before,
             bench_share(bench.len()) * losers.len() as u64,
@@ -104,8 +104,8 @@ pub async fn an_overturn_charges_each_losing_verifier_and_credits_the_bench() {
     }
     h.endpoint.forward_clock_unix_timestamp(1).await.unwrap();
     assert_eq!(
-        refusal_code(h.pay_bench_seat(0).await),
-        treasurer_refusal(ProgramError::BenchSeatPaid),
+        refusal_code(h.pay_seat(0).await),
+        treasurer_refusal(ProgramError::BountySeatPaid),
     );
     // The forfeits left the bonded total, and the bench's shares came back
     // into it as the tie-breakers' bonds.
@@ -163,7 +163,7 @@ pub async fn a_losing_verifier_cannot_leave_before_the_crank() {
 
     // The bench is paid once every loser is charged, and not before.
     assert_eq!(
-        refusal_code(h.pay_bench_seat(0).await),
+        refusal_code(h.pay_seat(0).await),
         treasurer_refusal(ProgramError::LosersNotAllSettled),
     );
     let losers = h.quorum_voters();
@@ -173,7 +173,7 @@ pub async fn a_losing_verifier_cannot_leave_before_the_crank() {
     let bench = h.bench();
     for (seat, tie_breaker) in bench.iter().enumerate() {
         let before = h.participant_of(*tie_breaker).await.bond_amount;
-        h.pay_bench_seat(seat as u16).await.unwrap();
+        h.pay_seat(seat as u16).await.unwrap();
         assert_eq!(
             h.participant_of(*tie_breaker).await.bond_amount - before,
             bench_share(bench.len()) * losers.len() as u64,
@@ -525,7 +525,7 @@ pub async fn the_bench_is_credited_only_to_its_recorded_seats() {
 
     // The first seat's share, credited to the loser instead.
     let loser_key = h.clients[loser].pubkey();
-    let diverted = run_pay_bench_bounty_instruction(
+    let diverted = run_pay_verdict_bounty_instruction(
         &payer.pubkey(),
         &h.run,
         &target_key,
@@ -537,7 +537,7 @@ pub async fn the_bench_is_credited_only_to_its_recorded_seats() {
         treasurer_refusal(ProgramError::InvalidParameter),
     );
     // A seat past the bench names nobody.
-    let past_bench = run_pay_bench_bounty_instruction(
+    let past_bench = run_pay_verdict_bounty_instruction(
         &payer.pubkey(),
         &h.run,
         &target_key,
@@ -554,7 +554,7 @@ pub async fn the_bench_is_credited_only_to_its_recorded_seats() {
     );
 
     let before = h.participant_of(bench[0]).await.bond_amount;
-    h.pay_bench_seat(0).await.unwrap();
+    h.pay_seat(0).await.unwrap();
     assert_eq!(
         h.participant_of(bench[0]).await.bond_amount - before,
         bench_share(bench.len()) * losers.len() as u64,
@@ -627,7 +627,10 @@ pub async fn switching_appeals_off_ends_an_open_appeal() {
 
 /// A conviction left inside nobody's hands after its challenge window closed
 /// is finalised by the settlement a new dispute sends first, and its votes are
-/// released, so the account can be taken over.
+/// released. The account is taken over only once the epoch it ejected the
+/// target in has been charged, the target's bond charged for it and every
+/// voter credited, all of which the same settlement does
+/// (wienerlabs/leviathan-net#64).
 #[tokio::test]
 pub async fn a_closed_conviction_is_finalised_and_released_before_a_takeover() {
     let mut h = setup("Leviathan liability closed", 131).await;
@@ -657,10 +660,33 @@ pub async fn a_closed_conviction_is_finalised_and_released_before_a_takeover() {
         }
     );
     assert_eq!(h.verdict_status().await, VerdictStatus::Upheld);
-    assert!(h.verdict_of(&target_key).await.is_settled());
     for voter in h.quorum_voters() {
         assert_eq!(h.participant_of(voter).await.open_verdict_votes, 0);
     }
+    assert!(
+        !h.verdict_of(&target_key).await.is_settled(),
+        "the bounty is owed until the target is charged and its voters credited"
+    );
+
+    h.finish_epoch_with_witnesses().await;
+    let settled = settle_previous_dispute(
+        &mut h.endpoint,
+        &payer,
+        &h.run,
+        &h.coordinator_account,
+        &target_key,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled,
+        DisputeSettlement {
+            conviction_charged: true,
+            seats_credited: h.quorum_voters().len(),
+            ..DisputeSettlement::default()
+        }
+    );
+    assert!(h.verdict_of(&target_key).await.is_settled());
 }
 
 /// The verifier daemon settles an overturned dispute before it opens a new one
@@ -687,9 +713,10 @@ pub async fn an_overturned_dispute_is_settled_in_full_before_a_takeover() {
         settled,
         DisputeSettlement {
             conviction_finalized: false,
+            conviction_charged: false,
             votes_freed: 0,
             losers_charged: losers.len(),
-            bench_paid: bench.len(),
+            seats_credited: bench.len(),
         }
     );
     let verdict = h.verdict_of(&target_key).await;

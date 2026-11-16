@@ -62,6 +62,19 @@ pub struct Participant {
 impl Participant {
     pub const SEEDS_PREFIX: &'static [u8] = b"Participant";
 
+    /// The participant held by the account at a participant PDA, given that
+    /// account's owner and data. An empty account, or one the treasurer does
+    /// not own, is no participant: the wallet never created one.
+    pub fn from_pda_account(
+        owner: &Pubkey,
+        data: &[u8],
+    ) -> Result<Option<Participant>> {
+        if data.is_empty() || owner != &crate::ID {
+            return Ok(None);
+        }
+        Ok(Some(Participant::try_deserialize(&mut &data[..])?))
+    }
+
     /// Points a conviction has charged that this bond has not paid yet.
     ///
     /// A slash reaches `bond_amount` only when the participant itself finalizes
@@ -128,6 +141,35 @@ impl Participant {
                 error!(ProgramError::OpenVerdictVotesInconsistent)
             })?;
         Ok(())
+    }
+
+    /// Pays `amount` of the points the ledger charged out of the bond, as
+    /// settlement does: the bond loses it and it counts as settled, so it is
+    /// never charged again. A pending withdrawal is cut down to what is left.
+    ///
+    /// The caller passes no more than the unsettled points and the bond.
+    pub fn settle_ledger_points(&mut self, amount: u64) {
+        self.bond_amount -= amount;
+        self.bond_settled_slashed_points += amount;
+        self.bond_withdraw_pending_amount =
+            self.bond_withdraw_pending_amount.min(self.bond_amount);
+    }
+
+    /// What a conviction that ejected this participant takes from its bond
+    /// once the ledger charged the ejection `rate`: that charge, out of what is
+    /// still unsettled and what the bond holds.
+    ///
+    /// The ledger charges a client at most once per epoch, so the charge for
+    /// the epoch a conviction ejected it in is that conviction's. Taking no
+    /// more than `rate` leaves every other unsettled point, such as a
+    /// `run_slash` in another epoch, to settlement (wienerlabs/leviathan-net#64).
+    pub fn ejected_conviction_forfeit(
+        &self,
+        coordinator_slashed_points: u64,
+        rate: u64,
+    ) -> u64 {
+        rate.min(self.unsettled_slashed_points(coordinator_slashed_points))
+            .min(self.bond_amount)
     }
 
     /// Forfeits up to `amount` of the bond, out of what convictions the ledger
@@ -253,6 +295,34 @@ mod tests {
         assert_eq!(p.unforfeited_bond(400), 0);
         assert_eq!(p.forfeit_unclaimed_bond(200, 400), 0);
         assert_eq!(p.bond_amount, 400);
+    }
+
+    #[test]
+    fn settled_ledger_points_leave_the_bond_once() {
+        let mut p = participant(500, 0, 450);
+        p.settle_ledger_points(200);
+        assert_eq!(p.bond_amount, 300);
+        assert_eq!(p.bond_settled_slashed_points, 200);
+        assert_eq!(p.bond_withdraw_pending_amount, 300);
+        // The points are settled, so the same ledger owes nothing more.
+        assert_eq!(p.unsettled_slashed_points(200), 0);
+        assert_eq!(p.unforfeited_bond(200), 300);
+    }
+
+    #[test]
+    fn an_ejected_conviction_takes_its_own_charge_and_no_more() {
+        // 200 from another slash, then 200 for the conviction: the conviction
+        // takes its 200, the other stays for settlement.
+        let p = participant(500, 0, 0);
+        assert_eq!(p.ejected_conviction_forfeit(400, 200), 200);
+        // What the ledger charged is all the conviction can take.
+        assert_eq!(p.ejected_conviction_forfeit(150, 200), 150);
+        // Already settled: nothing left to take.
+        let settled = participant(300, 200, 0);
+        assert_eq!(settled.ejected_conviction_forfeit(200, 200), 0);
+        // A bond short of the charge pays what it holds.
+        let short = participant(120, 0, 0);
+        assert_eq!(short.ejected_conviction_forfeit(200, 200), 120);
     }
 
     #[test]

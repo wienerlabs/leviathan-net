@@ -12,6 +12,7 @@ use crate::state::VerdictStatus;
 use crate::state::Landing;
 use crate::state::appeal_window_open;
 use crate::state::conviction_landing;
+use crate::state::ejection_charge;
 use crate::ProgramError;
 
 #[derive(Accounts)]
@@ -76,13 +77,16 @@ pub fn run_finalize_slash_processor(
     let appeal_window_seconds = context.accounts.run.appeal_window_seconds;
 
     let target_index = params.target_index;
-    let landing = {
+    let (landing, ejection) = {
         let account = context.accounts.coordinator_account.load()?;
-        conviction_landing(
-            &account.state.coordinator,
-            &context.accounts.audit_verdict.target,
-            target_index,
-        )?
+        (
+            conviction_landing(
+                &account.state.coordinator,
+                &context.accounts.audit_verdict.target,
+                target_index,
+            )?,
+            ejection_charge(&account),
+        )
     };
 
     let batch_start;
@@ -121,7 +125,7 @@ pub fn run_finalize_slash_processor(
             _ => return err!(ProgramError::VerdictNotPending),
         }
         match landing {
-            Landing::Eject(_) => verdict.status = VerdictStatus::Upheld,
+            Landing::Eject(_) => verdict.land_ejection(ejection),
             // Finalising where no ejection would be charged (between epochs, in
             // a warmup, or with the target off the roster) used to eject onto a
             // roster nobody charges and lose the conviction. It is recorded as

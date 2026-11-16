@@ -17,6 +17,7 @@ use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
 use crate::state::committee_matches_roster;
 use crate::state::conviction_landing;
+use crate::state::ejection_charge;
 use crate::ProgramError;
 
 #[derive(Accounts)]
@@ -84,7 +85,7 @@ pub fn run_submit_appeal_verdict_processor(
     let appellate_key = context.accounts.appellate.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
-    let (quorum, landing) = {
+    let (quorum, landing, ejection) = {
         let account = context.accounts.coordinator_account.load()?;
 
         // A tie-breaker sits on a bonded bench for the same reason a verifier
@@ -130,7 +131,11 @@ pub fn run_submit_appeal_verdict_processor(
             conviction_landing(coordinator, &params.target, params.target_index)?;
 
         let tie_breaker_nodes = selection.get_num_tie_breaker_nodes();
-        ((2u64 * tie_breaker_nodes).div_ceil(3).max(1), landing)
+        (
+            (2u64 * tie_breaker_nodes).div_ceil(3).max(1),
+            landing,
+            ejection_charge(&account),
+        )
     };
 
     let should_slash;
@@ -186,9 +191,10 @@ pub fn run_submit_appeal_verdict_processor(
             should_slash = false;
             msg!("appeal_verdict: overturned, verifiers forfeit their bonds");
         } else if (verdict.uphold_count as u64) >= quorum {
+            verdict.appeal_upheld = true;
             match landing {
                 Landing::Eject(_) => {
-                    verdict.status = VerdictStatus::Upheld;
+                    verdict.land_ejection(ejection);
                     should_slash = true;
                     msg!("appeal_verdict: upheld, target slash finalizes");
                 },

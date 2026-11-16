@@ -21,6 +21,7 @@ use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
 use crate::state::committee_matches_roster;
 use crate::state::conviction_landing;
+use crate::state::ejection_charge;
 use crate::ProgramError;
 
 /// The smallest verifier committee a slash may come out of.
@@ -122,7 +123,15 @@ pub fn run_submit_audit_verdict_processor(
     let verifier_key = context.accounts.verifier.key();
     let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
-    let (current_epoch, current_round, quorum, landing, target_p2p, run) = {
+    let (
+        current_epoch,
+        current_round,
+        quorum,
+        landing,
+        ejection,
+        target_p2p,
+        run,
+    ) = {
         let account = context.accounts.coordinator_account.load()?;
 
         // A verdict that turns out wrong is paid for out of this bond, at the
@@ -209,6 +218,7 @@ pub fn run_submit_audit_verdict_processor(
             current_round,
             quorum,
             landing,
+            ejection_charge(&account),
             target_p2p,
             run,
         )
@@ -312,7 +322,7 @@ pub fn run_submit_audit_verdict_processor(
             } else {
                 match landing {
                     Landing::Eject(_) => {
-                        verdict.status = VerdictStatus::Upheld;
+                        verdict.land_ejection(ejection);
                         should_slash = true;
                     },
                     // Reached where no ejection would be charged: the

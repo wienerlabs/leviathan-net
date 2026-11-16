@@ -39,7 +39,7 @@ use psyche_solana_tooling::process_coordinator_instructions::process_coordinator
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_voters;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_reporter;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
@@ -53,7 +53,8 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_tooling::verdict_votes::get_audit_verdict;
 use psyche_solana_tooling::verdict_votes::process_treasurer_participant_release_verdict_vote;
-use psyche_solana_tooling::verdict_votes::process_treasurer_run_pay_bench_bounty;
+use psyche_solana_tooling::verdict_votes::process_treasurer_run_charge_conviction;
+use psyche_solana_tooling::verdict_votes::process_treasurer_run_pay_verdict_bounty;
 use psyche_solana_tooling::verdict_votes::process_treasurer_run_slash_losing_verifier;
 use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::find_participant;
@@ -121,7 +122,34 @@ pub(super) struct AppealsHarness {
     pub(super) tie_breaker_quorum: u64,
 }
 
+/// How big a run the harness sets up.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RunSize {
+    pub(super) clients: usize,
+    pub(super) verification_percent: u8,
+    /// How many of the clients, the last ones, never create a participant
+    /// account: the run's join authority admits them all the same, and they
+    /// hold no bond.
+    pub(super) unbonded: usize,
+}
+
+/// Six clients, half of those not on the bench verifying: two verifiers, two
+/// tie-breakers and two trainers.
+pub(super) const SMALL_RUN: RunSize = RunSize {
+    clients: 6,
+    verification_percent: 50,
+    unbonded: 0,
+};
+
 pub(super) async fn setup(run_id: &str, index: u64) -> AppealsHarness {
+    setup_sized(run_id, index, SMALL_RUN).await
+}
+
+pub(super) async fn setup_sized(
+    run_id: &str,
+    index: u64,
+    size: RunSize,
+) -> AppealsHarness {
     let mut endpoint = create_memnet_endpoint().await;
 
     let payer = Keypair::new();
@@ -134,7 +162,8 @@ pub(super) async fn setup(run_id: &str, index: u64) -> AppealsHarness {
     let main_authority = Keypair::new();
     let join_authority = Keypair::new();
     let ticker = Keypair::new();
-    let clients: Vec<Keypair> = (0..6).map(|_| Keypair::new()).collect();
+    let clients: Vec<Keypair> =
+        (0..size.clients).map(|_| Keypair::new()).collect();
     let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
     let warmup_time = 10;
 
@@ -204,7 +233,8 @@ pub(super) async fn setup(run_id: &str, index: u64) -> AppealsHarness {
     .unwrap();
 
     let mut clients_collateral = vec![];
-    for client in &clients {
+    let bonded = size.clients - size.unbonded;
+    for (client_idx, client) in clients.iter().enumerate() {
         let ata = endpoint
             .process_spl_associated_token_account_get_or_init(
                 &payer,
@@ -213,6 +243,10 @@ pub(super) async fn setup(run_id: &str, index: u64) -> AppealsHarness {
             )
             .await
             .unwrap();
+        if client_idx >= bonded {
+            clients_collateral.push(ata);
+            continue;
+        }
         endpoint
             .process_spl_token_mint_to(
                 &payer,
@@ -243,6 +277,10 @@ pub(super) async fn setup(run_id: &str, index: u64) -> AppealsHarness {
         .await
         .unwrap();
         clients_collateral.push(ata);
+        // A large run sends more transactions here than one blockhash lasts
+        // for; a new slot renews it without moving the clock
+        // (wienerlabs/leviathan-net#53).
+        endpoint.forward_clock_slot(1).await.unwrap();
     }
 
     process_treasurer_run_update(
@@ -264,7 +302,7 @@ pub(super) async fn setup(run_id: &str, index: u64) -> AppealsHarness {
                 global_batch_size_start: 1,
                 global_batch_size_end: clients.len() as u16,
                 global_batch_size_warmup_tokens: 0,
-                verification_percent: 50,
+                verification_percent: size.verification_percent,
                 witness_nodes: 0,
                 epoch_time: EPOCH_TIME,
                 total_steps: 100,
@@ -302,6 +340,7 @@ pub(super) async fn setup(run_id: &str, index: u64) -> AppealsHarness {
     .unwrap();
 
     for (client, p2p) in clients.iter().zip(&p2ps) {
+        endpoint.forward_clock_slot(1).await.unwrap();
         let authorization = process_authorizer_authorization_create(
             &mut endpoint,
             &payer,
@@ -485,6 +524,7 @@ impl AppealsHarness {
             .map(|(i, _)| *i)
             .collect();
         for client_idx in voters {
+            self.endpoint.forward_clock_slot(1).await.unwrap();
             self.cast_verdict(client_idx).await.unwrap();
         }
     }
@@ -547,6 +587,29 @@ impl AppealsHarness {
         .await
     }
 
+    /// `client_idx` finalizes its pending withdrawal, naming `reporter_idx`'s
+    /// collateral account as the reporter of a slash no verdict accounts for.
+    pub(super) async fn try_finalize_withdraw_naming(
+        &mut self,
+        client_idx: usize,
+        reporter_idx: usize,
+    ) -> anyhow::Result<()> {
+        let client = self.clients[client_idx].insecure_clone();
+        let collateral = self.clients_collateral[client_idx];
+        let reporter = self.clients_collateral[reporter_idx];
+        process_treasurer_participant_bond_finalize_withdraw_with_reporter(
+            &mut self.endpoint,
+            &self.payer,
+            &client,
+            &collateral,
+            &self.collateral_mint,
+            &self.run,
+            &self.coordinator_account,
+            &reporter,
+        )
+        .await
+    }
+
     /// Every client joins the next epoch with the authorization the run's join
     /// authority granted it, and the run is ticked into that epoch's warmup,
     /// paced by the run's own config.
@@ -596,6 +659,19 @@ impl AppealsHarness {
         let config = self.config().await;
         self.tick_after(config.warmup_time).await;
         assert_eq!(self.run_state().await, RunState::RoundTrain);
+    }
+
+    /// The coordinator account's state as it stands.
+    pub(super) async fn coordinator_state(
+        &mut self,
+    ) -> psyche_solana_coordinator::CoordinatorInstanceState {
+        get_coordinator_account_state(
+            &mut self.endpoint,
+            &self.coordinator_account,
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     pub(super) async fn config(&mut self) -> CoordinatorConfig {
@@ -759,6 +835,9 @@ impl AppealsHarness {
                                 .add(&sha256(participant.signer()));
                         }
                         let witness = self.clients[client_idx].insecure_clone();
+                        // A large roster sends more witnesses than one
+                        // blockhash lasts for (wienerlabs/leviathan-net#53).
+                        self.endpoint.forward_clock_slot(1).await.unwrap();
                         process_coordinator_witness(
                             &mut self.endpoint,
                             &self.payer,
@@ -870,6 +949,49 @@ impl AppealsHarness {
         committee
     }
 
+    /// Runs the swarm on a round at a time until `client_idx` trains in the
+    /// round under way, and returns where it sits on the roster. The draw is
+    /// fresh each round, so a node on a bench now trains in a later one. An
+    /// epoch that ends first is followed into the next: every client rejoins.
+    pub(super) async fn advance_until_trains(
+        &mut self,
+        client_idx: usize,
+    ) -> u64 {
+        for _ in 0..32 {
+            let committee = self.committee_now().await;
+            let trains = committee
+                .trainers
+                .iter()
+                .find(|(trainer, _)| *trainer == client_idx)
+                .map(|(_, index)| *index);
+            if self.run_state().await == RunState::RoundTrain {
+                if let Some(index) = trains {
+                    return index;
+                }
+            }
+            let state = self.coordinator_state().await;
+            let start = (
+                state.coordinator.progress.epoch,
+                state.coordinator.current_round().map(|round| round.height),
+            );
+            self.advance_with_witnesses(|coordinator| {
+                coordinator.run_state == RunState::WaitingForMembers
+                    || (coordinator.run_state == RunState::RoundTrain
+                        && (
+                            coordinator.progress.epoch,
+                            coordinator
+                                .current_round()
+                                .map(|round| round.height),
+                        ) != start)
+            })
+            .await;
+            if self.run_state().await == RunState::WaitingForMembers {
+                self.rejoin_all_and_start_epoch().await;
+            }
+        }
+        panic!("client {client_idx} was never drawn to train");
+    }
+
     /// What `client_idx` signed for the batch it trained in the round the
     /// coordinator is in.
     pub(super) async fn signed_payload_of(
@@ -976,30 +1098,6 @@ impl AppealsHarness {
             .status
     }
 
-    pub(super) async fn finalize_withdraw_paying(
-        &mut self,
-        client_idx: usize,
-        recipients: &[usize],
-    ) -> anyhow::Result<()> {
-        let client = self.clients[client_idx].insecure_clone();
-        let collateral = self.clients_collateral[client_idx];
-        let recipient_collaterals: Vec<Pubkey> = recipients
-            .iter()
-            .map(|i| self.clients_collateral[*i])
-            .collect();
-        process_treasurer_participant_bond_finalize_withdraw_with_voters(
-            &mut self.endpoint,
-            &self.payer,
-            &client,
-            &collateral,
-            &self.collateral_mint,
-            &self.run,
-            &self.coordinator_account,
-            &recipient_collaterals,
-        )
-        .await
-    }
-
     /// Where `key` sits in the current epoch's roster.
     pub(super) async fn roster_index_of(&mut self, key: &Pubkey) -> u64 {
         get_coordinator_account_state(
@@ -1015,15 +1113,6 @@ impl AppealsHarness {
         .iter()
         .position(|c| *c.id.signer() == key.to_bytes())
         .expect("the client is in this epoch's roster") as u64
-    }
-
-    /// The verifiers whose votes convicted the target, as bounty recipients.
-    pub(super) fn convicting_verifier_collaterals(&self) -> Vec<Pubkey> {
-        self.verifiers
-            .iter()
-            .take(self.verifier_quorum as usize)
-            .map(|(client_idx, _)| self.clients_collateral[*client_idx])
-            .collect()
     }
 
     /// The standing run-manager reads before it sends a finalize: the run, its
@@ -1151,21 +1240,60 @@ impl AppealsHarness {
         .await
     }
 
-    /// Anyone pays the tie-breaker at `seat` of the target's overturned
-    /// verdict its share of the losers' forfeits.
-    pub(super) async fn pay_bench_seat(
+    /// Anyone credits the recipient at `seat` of the target's verdict its
+    /// share of the losing side's forfeit.
+    pub(super) async fn pay_seat(&mut self, seat: u16) -> anyhow::Result<()> {
+        let target_key = self.target_key;
+        self.pay_seat_of(&target_key, seat).await
+    }
+
+    /// Anyone credits the recipient at `seat` of `target`'s verdict its share
+    /// of the losing side's forfeit.
+    pub(super) async fn pay_seat_of(
         &mut self,
+        target: &Pubkey,
         seat: u16,
     ) -> anyhow::Result<()> {
-        let target_key = self.target_key;
-        process_treasurer_run_pay_bench_bounty(
+        process_treasurer_run_pay_verdict_bounty(
             &mut self.endpoint,
             &self.payer,
             &self.run,
-            &target_key,
+            target,
             seat,
         )
         .await
+    }
+
+    /// Anyone credits every recipient of `target`'s verdict its share, one
+    /// seat per transaction.
+    pub(super) async fn pay_every_seat_of(&mut self, target: &Pubkey) {
+        let seats = self.verdict_of(target).await.bounty_recipients().len();
+        for seat in 0..seats {
+            self.endpoint.forward_clock_slot(1).await.unwrap();
+            self.pay_seat_of(target, seat as u16).await.unwrap();
+        }
+    }
+
+    /// Anyone charges `target`'s bond for the conviction that ejected it.
+    pub(super) async fn charge_conviction_of(
+        &mut self,
+        target: &Pubkey,
+    ) -> anyhow::Result<()> {
+        process_treasurer_run_charge_conviction(
+            &mut self.endpoint,
+            &self.payer,
+            &self.run,
+            &self.coordinator_account,
+            target,
+        )
+        .await
+    }
+
+    /// What `client_idx` holds of the run's collateral: its wallet and its
+    /// bond.
+    pub(super) async fn holdings_of(&mut self, client_idx: usize) -> u64 {
+        let bond = self.participant_of(client_idx).await.bond_amount;
+        self.collateral_of(client_idx).await + bond
     }
 
     /// `authority` (the payer when `None`) releases `voter`'s vote on the
@@ -1206,26 +1334,12 @@ impl AppealsHarness {
             .status
     }
 
-    /// The convicted target finalizes its withdrawal, paying the bounty to the
-    /// verifiers whose quorum convicted it.
+    /// The convicted target finalizes its withdrawal. Its conviction's bounty
+    /// is recorded on the verdict, not paid here.
     pub(super) async fn finalize_target_withdrawal(
         &mut self,
     ) -> anyhow::Result<()> {
-        let target_idx = self.target_client_idx;
-        let target = self.clients[target_idx].insecure_clone();
-        let target_collateral = self.clients_collateral[target_idx];
-        let voters = self.convicting_verifier_collaterals();
-        process_treasurer_participant_bond_finalize_withdraw_with_voters(
-            &mut self.endpoint,
-            &self.payer,
-            &target,
-            &target_collateral,
-            &self.collateral_mint,
-            &self.run,
-            &self.coordinator_account,
-            &voters,
-        )
-        .await
+        self.try_finalize_withdraw(self.target_client_idx).await
     }
 
     pub(super) async fn collateral_of(&mut self, client_idx: usize) -> u64 {

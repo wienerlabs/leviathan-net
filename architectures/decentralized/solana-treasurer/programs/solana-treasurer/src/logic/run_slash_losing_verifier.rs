@@ -72,7 +72,7 @@ pub struct RunSlashLosingVerifierParams {
 /// withdrawal. It settles every loser wherever it is, and the loser's
 /// withdrawal, held while the vote was counted against it, waits for exactly
 /// this. The bench's share is paid seat by seat through
-/// `run_pay_bench_bounty`, so no payout, and no number of seats, can stop a
+/// `run_pay_verdict_bounty`, so no payout, and no number of seats, can stop a
 /// loser being charged (wienerlabs/leviathan-net#39).
 pub fn run_slash_losing_verifier_processor(
     context: Context<RunSlashLosingVerifierAccounts>,

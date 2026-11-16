@@ -585,31 +585,60 @@ pub fn treasurer_run_slash_losing_verifier(
     )
 }
 
-/// Credits `tie_breaker`, at `seat` of `target`'s overturned verdict in run
-/// `treasurer_index`, its share of the losers' forfeits, to its bond. Anyone
-/// may send it once every loser is charged (wienerlabs/leviathan-net#39).
-pub fn treasurer_run_pay_bench_bounty(
+/// Credits `recipient`, at `seat` of `target`'s verdict's bounty recipients in
+/// run `treasurer_index`, its share of the losing side's forfeit, to its bond:
+/// a tie-breaker of an overturn once every loser is charged
+/// (wienerlabs/leviathan-net#39), or a voter, or upholding tie-breaker, of a
+/// conviction once the target is charged (wienerlabs/leviathan-net#64). Anyone
+/// may send it.
+pub fn treasurer_run_pay_verdict_bounty(
     treasurer_index: u64,
     payer: &Pubkey,
     target: &Pubkey,
     seat: u16,
-    tie_breaker: &Pubkey,
+    recipient: &Pubkey,
 ) -> Instruction {
     let run = psyche_solana_treasurer::find_run(treasurer_index);
     anchor_instruction(
         psyche_solana_treasurer::ID,
-        psyche_solana_treasurer::accounts::RunPayBenchBountyAccounts {
+        psyche_solana_treasurer::accounts::RunPayVerdictBountyAccounts {
             payer: *payer,
             run,
             audit_verdict: psyche_solana_treasurer::find_audit_verdict(&run, target),
-            tie_breaker_participant: psyche_solana_treasurer::find_participant(&run, tie_breaker),
+            recipient_participant: psyche_solana_treasurer::find_participant(&run, recipient),
         },
-        psyche_solana_treasurer::instruction::RunPayBenchBounty {
-            params: psyche_solana_treasurer::logic::RunPayBenchBountyParams {
+        psyche_solana_treasurer::instruction::RunPayVerdictBounty {
+            params: psyche_solana_treasurer::logic::RunPayVerdictBountyParams {
                 target: *target,
                 seat,
-                tie_breaker: *tie_breaker,
+                recipient: *recipient,
             },
+        },
+    )
+}
+
+/// Charges `target`'s bond in run `treasurer_index` for the conviction that
+/// ejected it, once the epoch it was ejected in has been charged, and records
+/// what that owes the conviction's recipients. Anyone may send it
+/// (wienerlabs/leviathan-net#64).
+pub fn treasurer_run_charge_conviction(
+    treasurer_index: u64,
+    coordinator_account: &Pubkey,
+    payer: &Pubkey,
+    target: &Pubkey,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunChargeConvictionAccounts {
+            payer: *payer,
+            run,
+            coordinator_account: *coordinator_account,
+            audit_verdict: psyche_solana_treasurer::find_audit_verdict(&run, target),
+            target_participant: psyche_solana_treasurer::find_participant(&run, target),
+        },
+        psyche_solana_treasurer::instruction::RunChargeConviction {
+            params: psyche_solana_treasurer::logic::RunChargeConvictionParams { target: *target },
         },
     )
 }
