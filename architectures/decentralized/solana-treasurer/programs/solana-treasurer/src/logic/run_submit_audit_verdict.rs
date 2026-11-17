@@ -21,6 +21,8 @@ use crate::state::MAX_VERDICT_VOTERS;
 use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
 use crate::state::committee_matches_roster;
+use crate::state::read_own_verdict;
+use crate::state::unledgered_conviction_charge;
 use crate::state::conviction_landing;
 use crate::state::ejection_charge;
 use crate::ProgramError;
@@ -102,6 +104,22 @@ pub struct RunSubmitAuditVerdictAccounts<'info> {
     /// precompile instruction proving the target signed the commitment.
     #[account(address = instructions_sysvar::ID)]
     pub instructions: UncheckedAccount<'info>,
+
+    /// CHECK: the verifier's own verdict, pinned to its PDA by the seeds below
+    /// and read only after this checks that it exists and belongs to this
+    /// program. A conviction there that stands but has not reached the ledger
+    /// still owes its charge, which the bond behind the vote has to cover
+    /// too. Last, so a client that passes it still works with a treasurer
+    /// that does not read it.
+    #[account(
+        seeds = [
+            AuditVerdict::SEEDS_PREFIX,
+            run.key().as_ref(),
+            verifier.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub verifier_verdict: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -129,6 +147,9 @@ pub fn run_submit_audit_verdict_processor(
     if verifier_key == params.target {
         return err!(ProgramError::VerifierIsTarget);
     }
+    let verifier_verdict = read_own_verdict(
+        &context.accounts.verifier_verdict.to_account_info(),
+    )?;
 
     let (
         current_epoch,
@@ -143,14 +164,20 @@ pub fn run_submit_audit_verdict_processor(
 
         // A verdict that turns out wrong is paid for out of this bond, at the
         // epoch boundary after an overturn. So the bond that counts is the one
-        // still standing then: not what a conviction already charged, and not a
-        // withdrawal already requested, which could leave before the overturn
-        // reaches it (wienerlabs/leviathan-net#34).
-        if context
-            .accounts
-            .verifier_participant
-            .committed_bond(coordinator_slashed_points(&account, &verifier_key))
-            < context.accounts.run.bond_minimum_amount
+        // still standing then: not what a conviction already charged, not what
+        // a conviction of the verifier's own will charge once it reaches the
+        // ledger, and not a withdrawal already requested, which could leave
+        // before the overturn reaches it (wienerlabs/leviathan-net#34).
+        if context.accounts.verifier_participant.committed_bond_owing(
+            coordinator_slashed_points(&account, &verifier_key),
+            unledgered_conviction_charge(
+                &context.accounts.run,
+                &account,
+                &verifier_key,
+                verifier_verdict.as_ref(),
+                Clock::get()?.unix_timestamp,
+            ),
+        ) < context.accounts.run.bond_minimum_amount
         {
             return err!(ProgramError::BondBelowMinimum);
         }

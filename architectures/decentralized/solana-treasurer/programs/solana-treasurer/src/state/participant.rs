@@ -106,6 +106,31 @@ impl Participant {
             .saturating_sub(self.bond_withdraw_pending_amount)
     }
 
+    /// `unforfeited_bond`, less what the participant's own conviction will
+    /// still take that the ledger has not charged
+    /// (`unledgered_conviction_charge`): the bond as it will stand once that
+    /// conviction is charged too.
+    pub fn unforfeited_bond_owing(
+        &self,
+        coordinator_slashed_points: u64,
+        unledgered_conviction: u64,
+    ) -> u64 {
+        self.unforfeited_bond(coordinator_slashed_points)
+            .saturating_sub(unledgered_conviction)
+    }
+
+    /// `committed_bond`, less what the participant's own conviction will
+    /// still take that the ledger has not charged. This is what backs a seat
+    /// or a vote.
+    pub fn committed_bond_owing(
+        &self,
+        coordinator_slashed_points: u64,
+        unledgered_conviction: u64,
+    ) -> u64 {
+        self.committed_bond(coordinator_slashed_points)
+            .saturating_sub(unledgered_conviction)
+    }
+
     /// Counted against the Borsh layout rather than taken from
     /// `std::mem::size_of`, which reports the padded Rust layout (finding 13).
     pub fn space_with_discriminator() -> usize {
@@ -247,6 +272,18 @@ mod tests {
         assert_eq!(p.unforfeited_bond(0), 500);
         assert_eq!(p.committed_bond(0), 400);
         assert_eq!(p.committed_bond(200), 200);
+    }
+
+    /// A conviction that has not reached the ledger comes off both, on top of
+    /// what the ledger charged and the withdrawal requested.
+    #[test]
+    fn a_conviction_off_the_ledger_comes_off_what_the_bond_backs() {
+        let p = participant(900, 0, 200);
+        assert_eq!(p.unforfeited_bond_owing(200, 0), 700);
+        assert_eq!(p.unforfeited_bond_owing(200, 200), 500);
+        assert_eq!(p.committed_bond_owing(200, 0), 500);
+        assert_eq!(p.committed_bond_owing(200, 200), 300);
+        assert_eq!(p.committed_bond_owing(200, 1_000), 0);
     }
 
     #[test]

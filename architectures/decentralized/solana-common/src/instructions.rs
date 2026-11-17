@@ -173,6 +173,7 @@ pub fn treasurer_participant_join_run(
             authorizer_program: psyche_solana_authorizer::ID,
             coordinator_program: psyche_solana_coordinator::ID,
             system_program: system_program::ID,
+            own_verdict: psyche_solana_treasurer::find_audit_verdict(run, &user),
         },
         psyche_solana_treasurer::instruction::ParticipantJoinRun {
             params: psyche_solana_treasurer::logic::ParticipantJoinRunParams { client_id },
@@ -430,6 +431,7 @@ pub fn treasurer_participant_claim(
             participant,
             coordinator_account: *coordinator_account,
             token_program: token::ID,
+            own_verdict: psyche_solana_treasurer::find_audit_verdict(&run, user),
         },
         psyche_solana_treasurer::instruction::ParticipantClaim {
             params: psyche_solana_treasurer::logic::ParticipantClaimParams {

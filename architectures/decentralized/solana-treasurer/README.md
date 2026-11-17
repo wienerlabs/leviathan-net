@@ -33,7 +33,7 @@ To achieve this the smart contract provides the following capabilities:
 
 Leviathan adds bonded participation on top of the rewards above. A conviction reaches a bond in two steps: the coordinator charges slashed points at the epoch boundary, and settlement forfeits them from the bond when the participant finalizes a withdrawal. Every bond check reads what is actually left, from chain state:
 
-- the **unforfeited bond** is the posted bond less the convictions it has not settled yet, which is what a slash could still take; claims and challenges are held to it;
+- the **unforfeited bond** is the posted bond less the convictions it has not settled yet, which is what a slash could still take; claims and challenges are held to it. Claims, joins and votes also count what has not reached the ledger yet: an ejection in the epoch under way, whatever ejected it, and the participant's own conviction once it can no longer be overturned but has not landed (`Due`, or past its challenge window or its appeal's deadline). A conviction still open to a challenge or an appeal is not counted, since the withdrawal hold already keeps the bond for it;
 - the **committed bond** also leaves out a withdrawal already requested, which is the bond that stays behind new work; joins and verdict or appeal votes are held to it.
 
 The bond instructions:

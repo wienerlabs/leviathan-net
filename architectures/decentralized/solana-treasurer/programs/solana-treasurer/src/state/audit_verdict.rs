@@ -2,7 +2,9 @@ use anchor_lang::prelude::*;
 
 use psyche_coordinator::Coordinator;
 
+use crate::state::appeal_window_open;
 use crate::state::CommitmentEvidence;
+use crate::state::Run;
 use crate::ProgramError;
 
 pub const MAX_VERDICT_VOTERS: usize = 64;
@@ -527,6 +529,40 @@ impl AuditVerdict {
         !(coordinator.charges_pending()
             && coordinator.epoch_state.start_timestamp
                 == self.charge_epoch_start)
+    }
+
+    /// What this conviction will still take from its target's bond before
+    /// it lands, at `now` in `run`, if it lands at `rate`.
+    ///
+    /// A conviction that cannot be overturned any more but has not landed is
+    /// owed in full: a `Due` one, and one whose challenge window or whose
+    /// appeal's deadline has passed, which only waits for
+    /// `run_finalize_slash`. A withdrawal already settles each of those as
+    /// owed (`withdrawal_standing`). One still open to a challenge or an
+    /// appeal is not counted: it may yet be overturned, and the withdrawal
+    /// hold keeps the bond for it. One that landed has ejected its target,
+    /// which the coordinator charges and `unledgered_conviction_charge`
+    /// counts by the target's ejection, or has been charged already.
+    pub fn unledgered_charge(&self, run: &Run, now: i64, rate: u64) -> u64 {
+        let owed = match self.status {
+            VerdictStatus::Due => true,
+            VerdictStatus::SlashPending => {
+                now >= self.pending_since_unix + run.challenge_window_seconds
+            },
+            VerdictStatus::Challenged => !appeal_window_open(
+                run.appeal_window_seconds,
+                self.challenged_since_unix,
+                now,
+            ),
+            VerdictStatus::Voting
+            | VerdictStatus::Upheld
+            | VerdictStatus::Overturned => false,
+        };
+        if owed {
+            rate
+        } else {
+            0
+        }
     }
 
     /// Records that the target's bond paid for the conviction, and what that
@@ -1134,6 +1170,79 @@ mod tests {
             RunState::Cooldown,
         ] {
             assert!(v.ejection_charged(&at(state, 1_100)), "{state}");
+        }
+    }
+
+    /// A run with a challenge window of 50 seconds and an appeal window of
+    /// 100.
+    fn run_with_windows() -> Run {
+        Run {
+            bump: 0,
+            index: 0,
+            main_authority: Pubkey::default(),
+            join_authority: Pubkey::default(),
+            coordinator_account: Pubkey::default(),
+            coordinator_instance: Pubkey::default(),
+            collateral_mint: Pubkey::default(),
+            total_claimed_collateral_amount: 0,
+            total_claimed_earned_points: 0,
+            total_bonded_amount: 0,
+            bond_minimum_amount: 0,
+            bond_withdraw_delay_seconds: 0,
+            slash_bounty_bps: 0,
+            challenge_window_seconds: 50,
+            tie_breaker_committee_size: 0,
+            appeal_window_seconds: 100,
+        }
+    }
+
+    /// A conviction is owed in full once it can no longer be overturned and
+    /// has not landed: due, or past its challenge window or its appeal's
+    /// deadline. Open to a challenge or an appeal, landed, charged,
+    /// overturned or never reached, it is not.
+    #[test]
+    fn a_conviction_that_can_no_longer_be_overturned_is_owed() {
+        const RATE: u64 = 300;
+        let run = run_with_windows();
+
+        let due = verdict(VerdictStatus::Due, &voters(2));
+        assert_eq!(due.unledgered_charge(&run, 0, RATE), RATE);
+
+        let mut pending = verdict(VerdictStatus::SlashPending, &voters(2));
+        pending.pending_since_unix = 1_000;
+        assert_eq!(pending.unledgered_charge(&run, 1_049, RATE), 0);
+        assert_eq!(
+            pending.unledgered_charge(&run, 1_050, RATE),
+            RATE,
+            "its challenge window has closed"
+        );
+
+        let mut challenged = verdict(VerdictStatus::Challenged, &voters(2));
+        challenged.challenged_since_unix = 2_000;
+        assert_eq!(challenged.unledgered_charge(&run, 2_099, RATE), 0);
+        assert_eq!(
+            challenged.unledgered_charge(&run, 2_100, RATE),
+            RATE,
+            "its appeal's deadline has passed"
+        );
+
+        // The coordinator charges an ejection; `unledgered_conviction_charge`
+        // counts it by the target's state, not here.
+        let mut ejected = verdict(VerdictStatus::Voting, &voters(2));
+        ejected.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate: 200,
+        });
+        assert_eq!(ejected.unledgered_charge(&run, 5_000, RATE), 0);
+        ejected.record_charge(0);
+        assert_eq!(ejected.unledgered_charge(&run, 5_000, RATE), 0);
+
+        for status in [VerdictStatus::Voting, VerdictStatus::Overturned] {
+            assert_eq!(
+                verdict(status, &voters(2)).unledgered_charge(&run, 5_000, RATE),
+                0,
+                "{status:?}"
+            );
         }
     }
 
