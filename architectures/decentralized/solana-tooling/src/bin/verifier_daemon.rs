@@ -439,6 +439,10 @@ async fn main() -> Result<()> {
                 if let Some(exporter) = &exporter {
                     exporter.metrics.pass_failed(&args.run_id);
                 }
+                // A single pass is one pass, whether or not it worked.
+                if args.once {
+                    return Err(err);
+                }
             }
         }
         note_pass(

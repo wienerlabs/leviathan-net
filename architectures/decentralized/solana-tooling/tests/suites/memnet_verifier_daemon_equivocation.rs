@@ -15,6 +15,7 @@ use psyche_solana_tooling::daemon::AuditConfig;
 use psyche_solana_tooling::daemon_equivocation::equivocation_key;
 use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::PayloadHeader;
+use psyche_solana_treasurer::state::VerdictStatus;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
@@ -406,3 +407,41 @@ pub async fn an_equivocation_is_convicted_with_nothing_to_replay_against() {
     );
     assert!(judged.contains(&equivocation_key(&key)));
 }
+
+/// A pass with nothing to replay against still sweeps the run's open
+/// disputes, as every pass of a voting daemon does: a conviction whose
+/// challenge window closed is finalised, though no payload is judged.
+#[tokio::test]
+pub async fn a_pass_with_nothing_to_replay_against_still_settles_open_disputes() {
+    let mut h = setup("Leviathan sweep no replay", 173).await;
+    h.reach_verifier_quorum().await;
+    assert_eq!(h.verdict_status().await, VerdictStatus::SlashPending);
+    h.endpoint
+        .forward_clock_unix_timestamp((CHALLENGE_WINDOW + 5) as u64)
+        .await
+        .unwrap();
+
+    let daemon = funded_daemon(&mut h).await;
+    let replaying = AuditConfig {
+        reference_dir: None,
+        ..config(&h, scratch("sweep-submitted"), "sweep", false)
+    };
+    let report = audit_pass(
+        &mut h.endpoint,
+        &daemon,
+        &h.coordinator_account,
+        &h.run,
+        &replaying,
+        None,
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report, PassReport::default(), "no payload was judged");
+    assert_eq!(
+        h.verdict_status().await,
+        VerdictStatus::Upheld,
+        "the conviction whose window closed was not finalised"
+    );
+}
+
