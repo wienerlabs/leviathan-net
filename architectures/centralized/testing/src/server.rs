@@ -18,6 +18,11 @@ use tokio::{
 };
 use tracing::debug;
 
+/// The stack of every thread the coordinator server runs on: its runtime's
+/// workers and the thread that drives it. The client binaries give their
+/// runtimes the same.
+const SERVER_STACK_SIZE: usize = 10 * 1024 * 1024;
+
 enum TestingQueryMsg {
     Clients {
         respond_to: oneshot::Sender<FixedVec<Client, SOLANA_MAX_NUM_CLIENTS>>,
@@ -213,7 +218,7 @@ impl CoordinatorServerHandle {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_time()
             .enable_io()
-            .thread_stack_size(10 * 1024 * 1024)
+            .thread_stack_size(SERVER_STACK_SIZE)
             .max_blocking_threads(8192)
             .build()
             .unwrap();
@@ -232,11 +237,19 @@ impl CoordinatorServerHandle {
         let server_port = server.port;
         let run_id = server.run_id.clone();
 
-        // the above line will stack overflow, for reasons best left to contemplative reflection.
-        // as a substitute to madness, we suggest the reader trust us on this point.
-        std::thread::spawn(move || {
-            rt.block_on(server.run());
-        });
+        // `block_on` polls the server on the thread that calls it, not on a
+        // runtime worker, so this thread needs the workers' stack. The server
+        // copies its ~94 KiB `Coordinator` by value as it ticks and
+        // broadcasts, which takes a little over the 2 MiB a spawned thread
+        // gets by default; the real server runs the same future on the
+        // process's main thread, which has 8 MiB.
+        std::thread::Builder::new()
+            .name("coordinator-server".to_string())
+            .stack_size(SERVER_STACK_SIZE)
+            .spawn(move || {
+                rt.block_on(server.run());
+            })
+            .expect("failed to spawn the coordinator server thread");
         debug!("coordinator server created on port {server_port}");
 
         Self {

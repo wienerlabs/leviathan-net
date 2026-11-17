@@ -746,8 +746,8 @@ const LAST_STEP: u32 = 4;
 /// Waits for every client to return from its run, and checks that each
 /// returned cleanly rather than with an error.
 async fn assert_clients_stop_cleanly(client_handles: Vec<ClientHandle>) {
-    for (index, handle) in client_handles.into_iter().enumerate() {
-        match tokio::time::timeout(Duration::from_secs(120), handle.client_handle).await {
+    for (index, mut handle) in client_handles.into_iter().enumerate() {
+        match tokio::time::timeout(Duration::from_secs(120), &mut handle.client_handle).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => panic!("client {index} stopped with an error: {error:#}"),
             Ok(Err(join)) => panic!("client {index} crashed: {join}"),
@@ -922,7 +922,7 @@ async fn a_client_whose_last_checkpoint_fails_stops_with_its_error() {
     ));
     std::fs::write(&not_a_dir, b"not a directory").unwrap();
 
-    let failing = ClientHandle::new_with_checkpoint_dir(
+    let mut failing = ClientHandle::new_with_checkpoint_dir(
         server_handle.server_port,
         &server_handle.run_id,
         &not_a_dir,
@@ -931,7 +931,7 @@ async fn a_client_whose_last_checkpoint_fails_stops_with_its_error() {
     let healthy = ClientHandle::default(server_handle.server_port, &server_handle.run_id).await;
 
     assert_with_retries(|| server_handle.get_run_state(), RunState::Finished).await;
-    let outcome = tokio::time::timeout(Duration::from_secs(120), failing.client_handle).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(120), &mut failing.client_handle).await;
     std::fs::remove_file(&not_a_dir).unwrap();
     match outcome {
         Ok(Ok(Err(error))) => assert!(
