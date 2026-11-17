@@ -241,9 +241,14 @@ impl AuditVerdict {
     }
 
     /// Whether the vote at `position` in `voters` convicts on other evidence
-    /// than this verdict records.
+    /// than this verdict records. A vote with no commitment recorded is not
+    /// known to dissent, so it is held like any vote of the quorum rather than
+    /// released at once.
     pub fn dissents(&self, position: usize) -> bool {
-        self.vote_commitments.get(position) != Some(&self.committed_hash)
+        matches!(
+            self.vote_commitments.get(position),
+            Some(cast) if cast != &self.committed_hash
+        )
     }
 
     /// Counts `voter`'s vote for `vote` and returns how many votes now convict
@@ -1319,5 +1324,21 @@ mod tests {
         v.reset_for_round(2, 0);
         assert!(v.vote_commitments.is_empty());
         assert_eq!(v.committed_hash, [0; 32]);
+    }
+
+    /// A vote is a dissent only when the commitment it convicts on is known
+    /// and is not the recorded one. Without one, the vote is held with the
+    /// quorum instead of being released at once.
+    #[test]
+    fn a_vote_with_no_commitment_recorded_is_not_taken_for_a_dissent() {
+        let voters = [Pubkey::new_unique(), Pubkey::new_unique()];
+        let mut v = verdict(VerdictStatus::Upheld, &voters);
+        v.vote_commitments.truncate(1);
+        assert!(!v.dissents(0));
+        assert!(!v.dissents(1));
+        assert_eq!(v.bounty_recipients(), voters.to_vec());
+        v.vote_commitments[0] = [9u8; 32];
+        assert!(v.dissents(0));
+        assert_eq!(v.bounty_recipients(), vec![voters[1]]);
     }
 }

@@ -253,7 +253,7 @@ pub fn run_submit_audit_verdict_processor(
     }
 
     let should_slash;
-    let replayed_hash;
+    let recorded;
     {
         let verdict = &mut context.accounts.audit_verdict;
         let fresh_account = verdict.run == Pubkey::default();
@@ -307,16 +307,26 @@ pub fn run_submit_audit_verdict_processor(
         context.accounts.verifier_participant.open_verdict_vote()?;
 
         msg!(
-            "audit_verdict: target_index={} epoch={} round={} count={} quorum={}",
+            "audit_verdict: target_index={} epoch={} round={} count={} recorded={} quorum={}",
             params.target_index,
             current_epoch,
             current_round,
             agreeing,
+            verdict.verdict_count,
             quorum
         );
 
-        replayed_hash = verdict.replayed_hash;
-        let quorum_reached = (agreeing as u64) >= quorum;
+        // The quorum is the recorded evidence's, and so is what a slash
+        // charges: the verdict, not the vote that happened to complete it, is
+        // what an appeal and every reader of the account see.
+        recorded = SlashClientParams {
+            index: verdict.target_index,
+            batch_start: verdict.batch_start,
+            batch_end: verdict.batch_end,
+            committed_hash: verdict.committed_hash,
+            replayed_hash: verdict.replayed_hash,
+        };
+        let quorum_reached = (verdict.verdict_count as u64) >= quorum;
         if quorum_reached {
             if context.accounts.run.challenge_window_seconds > 0 {
                 verdict.status = VerdictStatus::SlashPending;
@@ -365,13 +375,7 @@ pub fn run_submit_audit_verdict_processor(
                 },
             )
             .with_signer(run_signer_seeds),
-            SlashClientParams {
-                index: params.target_index,
-                batch_start: params.batch_start,
-                batch_end: params.batch_end,
-                committed_hash,
-                replayed_hash,
-            },
+            recorded,
         )?;
     }
 
