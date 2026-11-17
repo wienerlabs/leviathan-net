@@ -786,23 +786,35 @@ impl Coordinator {
         let round = self
             .previous_round()
             .ok_or(CoordinatorError::NoActiveRound)?;
+        let selection = CommitteeSelection::from_coordinator(self, -1)?;
         // The proof is read off the previous round's draw, by seat. Every
         // round starts by compacting the roster, so once a client has left
         // since that draw, every seat after its own holds the client that sat
         // one further along. Judged by the seat's old role, an honest verifier
         // moved onto a trainer's seat read as a trainer that trained nothing,
-        // and was dropped. Upstream every seat trained, so no role moved; with
-        // verification on, a roster that moved is not judged at all until a
-        // round is drawn over it.
+        // and was dropped. A roster that moved under a draw with verifier or
+        // tie-breaker seats is not judged until a round is drawn over it.
+        //
+        // In a draw where every seat trains, no role moves with the roster:
+        // each client is judged by its own id in the witnesses' blooms, as
+        // upstream judged it, but only over the clients still on the roster.
+        // A seat past its end names a client that already left, which a
+        // health check has no seat to drop.
         if round.clients_len as usize != self.epoch_state.clients.len() {
-            return Err(CoordinatorError::RosterMoved);
+            let every_seat_trains = selection.get_num_verifier_nodes() == 0
+                && selection.get_num_tie_breaker_nodes() == 0;
+            if !every_seat_trains {
+                return Err(CoordinatorError::RosterMoved);
+            }
+            if proof.index as usize >= self.epoch_state.clients.len() {
+                return Err(CoordinatorError::InvalidCommitteeProof);
+            }
         }
         let index = proof.index;
         if index < round.clients_len as u64 {
             let client = self
                 .get_client_at_historical_index(index as usize, round.clients_len)
                 .ok_or(CoordinatorError::InvalidCommitteeProof)?;
-            let selection = CommitteeSelection::from_coordinator(self, -1)?;
             if client.id != *id
                 || !selection.verify_committee_for_client(
                     &client.id,

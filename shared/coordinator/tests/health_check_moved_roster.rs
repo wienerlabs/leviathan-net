@@ -45,6 +45,15 @@ fn client(seed: u8, state: ClientState) -> Client {
 /// drawn from `round_seed` over `roster`, whose witness phase is over. Its one
 /// witness heard every healthy client the round seated as a trainer.
 fn witnessed_round(roster: &[ClientState], round_seed: u64) -> Box<Coordinator> {
+    witnessed_round_verifying(roster, round_seed, 50)
+}
+
+/// As `witnessed_round`, with `verification_percent` of the seats verifying.
+fn witnessed_round_verifying(
+    roster: &[ClientState],
+    round_seed: u64,
+    verification_percent: u8,
+) -> Box<Coordinator> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../config/leviathan/genesis-rehearsal.toml"
@@ -52,7 +61,7 @@ fn witnessed_round(roster: &[ClientState], round_seed: u64) -> Box<Coordinator> 
     let run: RunConfig = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let mut coordinator = Box::new(Coordinator::zeroed());
     coordinator.config = run.config;
-    coordinator.config.verification_percent = 50;
+    coordinator.config.verification_percent = verification_percent;
     coordinator.model = run.model;
     coordinator.run_state = RunState::RoundWitness;
     coordinator.progress.step = STEP;
@@ -245,5 +254,72 @@ fn a_roster_that_did_not_move_is_health_checked_as_drawn() {
     assert_eq!(
         coordinator.epoch_state.clients[silent].state,
         ClientState::Dropped
+    );
+}
+
+/// Takes `silent`'s id out of the round's one witness bloom: a trainer that
+/// trained nothing, still on the roster.
+fn silence(coordinator: &mut Coordinator, silent: usize) {
+    let hash = sha256(coordinator.epoch_state.clients[silent].id.signer());
+    let signers: Vec<_> = coordinator
+        .epoch_state
+        .clients
+        .iter()
+        .map(|client| sha256(client.id.signer()))
+        .collect();
+    let bloom = &mut coordinator.epoch_state.rounds[0].witnesses[0].participant_bloom;
+    let mut without = participant_bloom();
+    for signer_hash in signers {
+        if signer_hash != hash && bloom.contains(&signer_hash) {
+            without.add(&signer_hash);
+        }
+    }
+    *bloom = without;
+}
+
+/// In a draw where every seat trains, no role moves with the roster, and each
+/// client is judged by its own id: a roster that moved is still checked over
+/// the clients on it, so a silent trainer is dropped as it was upstream, and
+/// the others are not.
+#[test]
+fn a_moved_roster_whose_every_seat_trains_is_still_checked() {
+    let mut coordinator = witnessed_round_verifying(&roster_with_a_leaver(), 7, 0);
+    // The trainer that sits third in the draw trained nothing.
+    let silent = coordinator.epoch_state.clients[3].id;
+    silence(&mut coordinator, 3);
+    next_round(&mut coordinator);
+    assert_eq!(coordinator.epoch_state.clients.len(), CLIENTS - 1);
+    assert_eq!(coordinator.epoch_state.clients[2].id, silent);
+
+    let (heard, heard_proof) = proof_at(&coordinator, 1);
+    assert_eq!(heard_proof.committee, Committee::Trainer);
+    assert!(matches!(coordinator.healthy(&heard, &heard_proof), Ok(true)));
+
+    let (id, proof) = proof_at(&coordinator, 2);
+    assert!(matches!(coordinator.healthy(&id, &proof), Ok(false)));
+    assert!(matches!(
+        coordinator.health_check(&id, vec![(id, proof)]),
+        Ok(1)
+    ));
+    assert_eq!(
+        coordinator.epoch_state.clients[2].state,
+        ClientState::Dropped
+    );
+}
+
+/// A seat past the end of a moved roster names a client that already left.
+/// It is refused: a health check that took it used to index past the roster
+/// and abort, which on the centralized server takes the server down.
+#[test]
+fn a_seat_past_a_moved_roster_is_refused() {
+    let mut coordinator = witnessed_round_verifying(&roster_with_a_leaver(), 7, 0);
+    let leaver = coordinator.epoch_state.clients[0].id;
+    next_round(&mut coordinator);
+    let draw = CommitteeSelection::from_coordinator(&coordinator, -1).unwrap();
+    let past_the_end = draw.get_committee((CLIENTS - 1) as u64);
+    let refused = coordinator.health_check(&leaver, vec![(leaver, past_the_end)]);
+    assert!(
+        matches!(refused, Err(CoordinatorError::InvalidCommitteeProof)),
+        "{refused:?}"
     );
 }
