@@ -687,11 +687,6 @@ pub async fn an_honest_node_whose_seat_moved_is_judged_against_its_own_batch() {
     let mut r = start_replay_run(75, RUN_ID_MOVED, &[]).await;
     let first_round =
         coordinator_state(&mut r.endpoint, &r.coordinator_account).await;
-    let tie_breakers = get_run(&mut r.endpoint, &r.run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     let run_id = String::from(&first_round.coordinator.run_id);
     let node_at = |seat: usize| {
         let signer = *first_round.coordinator.epoch_state.clients[seat]
@@ -715,7 +710,6 @@ pub async fn an_honest_node_whose_seat_moved_is_judged_against_its_own_batch() {
     for node in [leaver, honest, cheater] {
         let header = payload_header(
             &first_round.coordinator,
-            tie_breakers,
             &identity(&r.clients[node], &r.p2ps[node]),
         );
         let data = distinct_batch_data(&llm, header.batch_id);
