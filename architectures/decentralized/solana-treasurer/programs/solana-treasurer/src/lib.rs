@@ -279,6 +279,8 @@ pub enum ProgramError {
     #[msg("The previous dispute for this target has not been settled yet")]
     PreviousVerdictUnsettled,
 
+    // No longer returned: votes for different evidence are counted apart
+    // rather than refused. Kept so the codes after it do not move.
     #[msg("This verdict already records different evidence for this target")]
     EvidenceMismatch,
 
@@ -364,4 +366,7 @@ pub enum ProgramError {
 
     #[msg("The participant a verdict convicts cannot judge its own appeal")]
     AppellateIsTarget,
+
+    #[msg("The participant a verdict would convict cannot vote on it")]
+    VerifierIsTarget,
 }

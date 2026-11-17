@@ -227,6 +227,7 @@ The treasurer's own accounts grow the same way:
 | wienerlabs/leviathan-net#39: gained `released_voters`, `bench_bounty_owed` and `bench_paid` | `AuditVerdict` | 4392 |
 | wienerlabs/leviathan-net#67: evidence gained the epoch it was trained in | `AuditVerdict` | 4400 |
 | wienerlabs/leviathan-net#64: bounty fields renamed `bounty_owed` and `bounty_paid`; gained `charge`, `charge_epoch_start`, `charge_rate` and `appeal_upheld` | `AuditVerdict` | 4418 |
+| Votes counted per signed payload: gained `vote_commitments`, the commitment hash each vote convicts on | `AuditVerdict` | 6470 |
 
 An older, shorter account does not deserialize with the new layout, so the treasurer that carries them deploys under a new id too.
 

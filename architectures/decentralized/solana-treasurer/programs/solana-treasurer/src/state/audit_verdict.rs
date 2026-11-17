@@ -13,6 +13,18 @@ pub const MAX_APPEAL_VOTERS: usize = 64;
 const _: () = assert!(MAX_VERDICT_VOTERS <= u64::BITS as usize);
 const _: () = assert!(MAX_APPEAL_VOTERS <= u64::BITS as usize);
 
+/// What a vote convicts on: the payload the target signed, where it sits, and
+/// what the voter's own replay of it hashed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoteEvidence {
+    pub committed_hash: [u8; 32],
+    pub evidence: CommitmentEvidence,
+    pub target_index: u64,
+    pub batch_start: u64,
+    pub batch_end: u64,
+    pub replayed_hash: [u8; 32],
+}
+
 /// How a vote stopped holding its voter's bond.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoteRelease {
@@ -104,8 +116,14 @@ pub struct AuditVerdict {
     /// (wienerlabs/leviathan#15, finding 3).
     pub round_height: u32,
     pub status: VerdictStatus,
+    /// How many votes in `voters` convict on the evidence this verdict
+    /// records, the votes a quorum is counted in.
     pub verdict_count: u16,
     pub committed_hash: [u8; 32],
+    /// One voter's replay of the payload: that of the vote that put the
+    /// recorded evidence in the lead. Verifiers replay within a tolerance band
+    /// of each other, not bit for bit, so no single replayed hash is the
+    /// committee's, and votes are not asked to agree on it.
     pub replayed_hash: [u8; 32],
     pub target_index: u64,
     pub batch_start: u64,
@@ -155,6 +173,26 @@ pub struct AuditVerdict {
     pub appeal_upheld: bool,
     pub voters: Vec<Pubkey>,
     pub appeal_voters: Vec<Pubkey>,
+    /// The commitment hash each vote in `voters` convicts on, position for
+    /// position.
+    ///
+    /// A quorum is two thirds of one committee agreeing on one payload the
+    /// target signed, so votes are counted per commitment, and the verdict
+    /// records the evidence with the most votes. The first vote used to fix
+    /// the evidence for every vote after it. Every payload is broadcast, so
+    /// one verifier seat, or the target voting on itself, could cite another
+    /// payload the target signed, and each honest vote after it was refused:
+    /// one seat vetoed what two thirds agreed on. Requiring the replayed hash
+    /// to match as well refused honest verifiers whose replays differ in the
+    /// last bits, which is what the tolerance band is for.
+    ///
+    /// A vote for evidence the verdict does not record (`dissents`) convicted
+    /// nobody: it is no seat of the bounty, the crank charges it nothing on an
+    /// overturn, and it is released once the verdict resolves.
+    ///
+    /// Last in the account, so a decoder of the previous layout still reads
+    /// every field before it.
+    pub vote_commitments: Vec<[u8; 32]>,
 }
 
 impl AuditVerdict {
@@ -170,20 +208,74 @@ impl AuditVerdict {
     ///
     /// An overturned verdict used to name its losers here, so a target cleared
     /// on appeal paid them the bounty of any other conviction it carried
-    /// (wienerlabs/leviathan-net#64).
-    pub fn bounty_recipients(&self) -> &[Pubkey] {
+    /// (wienerlabs/leviathan-net#64). A vote for other evidence than the
+    /// conviction records was not part of the quorum that convicted, so it is
+    /// no seat here.
+    pub fn bounty_recipients(&self) -> Vec<Pubkey> {
         match self.status {
-            VerdictStatus::Overturned => &self.appeal_voters,
+            VerdictStatus::Overturned => self.appeal_voters.clone(),
             VerdictStatus::Upheld | VerdictStatus::Due
                 if self.appeal_upheld =>
             {
-                &self.appeal_voters
+                self.appeal_voters.clone()
             },
-            VerdictStatus::Upheld | VerdictStatus::Due => &self.voters,
+            VerdictStatus::Upheld | VerdictStatus::Due => self
+                .voters
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| !self.dissents(*position))
+                .map(|(_, voter)| *voter)
+                .collect(),
             VerdictStatus::Voting
             | VerdictStatus::SlashPending
-            | VerdictStatus::Challenged => &[],
+            | VerdictStatus::Challenged => vec![],
         }
+    }
+
+    /// How many votes in `voters` convict on `committed_hash`.
+    pub fn votes_for(&self, committed_hash: &[u8; 32]) -> u16 {
+        self.vote_commitments
+            .iter()
+            .filter(|cast| *cast == committed_hash)
+            .count() as u16
+    }
+
+    /// Whether the vote at `position` in `voters` convicts on other evidence
+    /// than this verdict records. A vote with no commitment recorded is not
+    /// known to dissent, so it is held like any vote of the quorum rather than
+    /// released at once.
+    pub fn dissents(&self, position: usize) -> bool {
+        matches!(
+            self.vote_commitments.get(position),
+            Some(cast) if cast != &self.committed_hash
+        )
+    }
+
+    /// Counts `voter`'s vote for `vote` and returns how many votes now convict
+    /// on its evidence.
+    ///
+    /// The verdict records the evidence with the most votes, the earliest of a
+    /// tie, so a vote that completes a quorum is always for the evidence
+    /// recorded: one seat cannot hold a vote to the evidence it chose. A
+    /// recorded evidence nobody votes for any more, after withdrawals, gives
+    /// way to the next vote cast.
+    pub fn cast_vote(&mut self, voter: Pubkey, vote: VoteEvidence) -> u16 {
+        let leading = self.votes_for(&self.committed_hash);
+        self.voters.push(voter);
+        self.vote_commitments.push(vote.committed_hash);
+        let agreeing = self.votes_for(&vote.committed_hash);
+        let takes_the_lead =
+            vote.committed_hash != self.committed_hash && agreeing > leading;
+        if leading == 0 || takes_the_lead {
+            self.committed_hash = vote.committed_hash;
+            self.evidence = vote.evidence;
+            self.target_index = vote.target_index;
+            self.batch_start = vote.batch_start;
+            self.batch_end = vote.batch_end;
+            self.replayed_hash = vote.replayed_hash;
+        }
+        self.verdict_count = self.votes_for(&self.committed_hash);
+        agreeing
     }
 
     /// The verdict held by the account at a participant's verdict PDA, given
@@ -228,6 +320,7 @@ impl AuditVerdict {
             + 1 // appeal_upheld
             + 4 + MAX_VERDICT_VOTERS * 32 // voters
             + 4 + MAX_APPEAL_VOTERS * 32 // appeal_voters
+            + 4 + MAX_VERDICT_VOTERS * 32 // vote_commitments
     }
 
     /// Whether a fresh dispute may take this account over.
@@ -320,8 +413,23 @@ impl AuditVerdict {
                 // Nothing on a verdict that has not convicted is released, so
                 // no bit is shifted by taking the vote out.
                 self.voters.remove(position);
-                self.verdict_count = self.voters.len() as u16;
+                self.vote_commitments.remove(position);
+                self.verdict_count = self.votes_for(&self.committed_hash);
                 Ok(VoteRelease::Withdrawn)
+            },
+            // A vote for other evidence than a resolved verdict records was
+            // not part of its quorum, so nothing the verdict comes to can cost
+            // it.
+            VerdictStatus::SlashPending
+            | VerdictStatus::Challenged
+            | VerdictStatus::Overturned
+                if self.dissents(position) =>
+            {
+                if self.vote_released(position) {
+                    return err!(ProgramError::VoteAlreadyReleased);
+                }
+                self.released_voters |= Self::voter_bit(position);
+                Ok(VoteRelease::Released)
             },
             VerdictStatus::Upheld | VerdictStatus::Due => {
                 if self.vote_released(position) {
@@ -385,6 +493,13 @@ impl AuditVerdict {
         self.released_voters |= Self::voter_bit(position);
         self.settled_count += 1;
         self.bounty_owed += bench_bounty;
+    }
+
+    /// Records that the crank passed the vote at `position`, one for other
+    /// evidence than the overturned conviction, without charging it.
+    pub fn settle_dissenting_vote(&mut self, position: usize) {
+        self.released_voters |= Self::voter_bit(position);
+        self.settled_count += 1;
     }
 
     /// Records that the conviction stands and ejected the target where the
@@ -528,6 +643,7 @@ impl AuditVerdict {
         self.appeal_upheld = false;
         self.voters.clear();
         self.appeal_voters.clear();
+        self.vote_commitments.clear();
     }
 }
 
@@ -565,6 +681,8 @@ mod tests {
             appeal_upheld: false,
             voters: voters.to_vec(),
             appeal_voters: vec![],
+            // Every vote for the evidence recorded, as a quorum casts them.
+            vote_commitments: vec![[0u8; 32]; voters.len()],
         }
     }
 
@@ -1057,5 +1175,170 @@ mod tests {
         assert!(!v.appeal_upheld);
         assert!(v.voters.is_empty());
         assert_eq!(v.status, VerdictStatus::Voting);
+    }
+
+    /// A vote for the payload with `digest` as its commitment hash, replayed
+    /// to `replayed`.
+    fn vote(digest: u8, replayed: u8) -> VoteEvidence {
+        VoteEvidence {
+            committed_hash: [digest; 32],
+            evidence: CommitmentEvidence::default(),
+            target_index: 3,
+            batch_start: digest as u64,
+            batch_end: digest as u64,
+            replayed_hash: [replayed; 32],
+        }
+    }
+
+    fn fresh() -> AuditVerdict {
+        let mut v = verdict(VerdictStatus::Voting, &[]);
+        v.reset_for_round(1, 2);
+        v
+    }
+
+    /// Votes are counted per payload, so a vote citing another payload the
+    /// target signed does not stop the others reaching a quorum on theirs,
+    /// and the verdict records the evidence the most votes are for.
+    #[test]
+    fn votes_are_counted_per_evidence_and_the_most_voted_is_recorded() {
+        let cast = voters(4);
+        let mut v = fresh();
+        // The first vote cites another payload.
+        assert_eq!(v.cast_vote(cast[0], vote(9, 1)), 1);
+        assert_eq!(v.committed_hash, [9; 32]);
+        // The honest votes count among themselves, not against it.
+        assert_eq!(v.cast_vote(cast[1], vote(5, 2)), 1);
+        assert_eq!(v.committed_hash, [9; 32], "a tie keeps the earliest");
+        assert_eq!(v.cast_vote(cast[2], vote(5, 3)), 2);
+        assert_eq!(
+            v.committed_hash, [5; 32],
+            "the evidence with more votes is recorded"
+        );
+        assert_eq!((v.batch_start, v.batch_end), (5, 5));
+        assert_eq!(v.verdict_count, 2);
+        // The replay recorded is the vote that took the lead, and a later
+        // vote for the same evidence does not rewrite it.
+        assert_eq!(v.replayed_hash, [3; 32]);
+        assert_eq!(v.cast_vote(cast[3], vote(5, 4)), 3);
+        assert_eq!(v.replayed_hash, [3; 32]);
+        assert_eq!(v.verdict_count, 3);
+        assert_eq!(v.voters, cast);
+        assert!(v.dissents(0));
+        assert!((1..4).all(|position| !v.dissents(position)));
+    }
+
+    /// Replays agree within the band, not bit for bit: two verifiers who
+    /// replayed the same payload to different hashes still vote together.
+    #[test]
+    fn votes_on_one_payload_agree_whatever_their_replays_hashed_to() {
+        let cast = voters(2);
+        let mut v = fresh();
+        assert_eq!(v.cast_vote(cast[0], vote(5, 1)), 1);
+        assert_eq!(v.cast_vote(cast[1], vote(5, 2)), 2);
+        assert_eq!(v.verdict_count, 2);
+        assert_eq!(v.replayed_hash, [1; 32]);
+    }
+
+    /// A withdrawn vote leaves both lists together, and recorded evidence
+    /// that nobody votes for any more gives way to the next vote.
+    #[test]
+    fn a_withdrawn_vote_leaves_its_evidence_with_it() {
+        let cast = voters(3);
+        let mut v = fresh();
+        v.cast_vote(cast[0], vote(9, 1));
+        v.cast_vote(cast[1], vote(5, 1));
+        v.release_vote(&cast[0], true, false).unwrap();
+        assert_eq!(v.voters, vec![cast[1]]);
+        assert_eq!(v.vote_commitments, vec![[5; 32]]);
+        assert_eq!(
+            v.verdict_count, 0,
+            "nobody votes for the recorded evidence"
+        );
+        assert_eq!(v.cast_vote(cast[2], vote(7, 1)), 1);
+        assert_eq!(v.committed_hash, [7; 32]);
+        assert_eq!(v.verdict_count, 1);
+    }
+
+    /// A vote for other evidence than a resolved verdict records convicted
+    /// nobody: it is no seat of the conviction's bounty, and it is released
+    /// whatever the verdict comes to, once.
+    #[test]
+    fn a_dissenting_vote_is_neither_paid_nor_held() {
+        let cast = voters(3);
+        for status in [
+            VerdictStatus::SlashPending,
+            VerdictStatus::Challenged,
+            VerdictStatus::Overturned,
+            VerdictStatus::Upheld,
+            VerdictStatus::Due,
+        ] {
+            let mut v = fresh();
+            v.cast_vote(cast[0], vote(9, 1));
+            v.cast_vote(cast[1], vote(5, 1));
+            v.cast_vote(cast[2], vote(5, 1));
+            v.status = status;
+            let stands =
+                matches!(status, VerdictStatus::Upheld | VerdictStatus::Due);
+            if stands {
+                assert_eq!(v.bounty_recipients(), vec![cast[1], cast[2]]);
+            }
+            assert_eq!(
+                v.release_vote(&cast[0], false, false).unwrap(),
+                VoteRelease::Released,
+                "{status:?}"
+            );
+            assert!(v.release_vote(&cast[0], false, false).is_err());
+            // The votes that convicted stay held until the verdict says
+            // otherwise.
+            assert_eq!(
+                v.release_vote(&cast[1], false, false).is_err(),
+                !stands,
+                "{status:?}"
+            );
+        }
+    }
+
+    /// The crank passes a dissenting vote without charging it, whether or not
+    /// it was released first, and counts it toward settling the overturn.
+    #[test]
+    fn the_crank_passes_a_dissenting_vote_uncharged() {
+        let cast = voters(3);
+        let mut v = fresh();
+        v.cast_vote(cast[0], vote(5, 1));
+        v.cast_vote(cast[1], vote(9, 1));
+        v.cast_vote(cast[2], vote(5, 1));
+        v.status = VerdictStatus::Overturned;
+        v.settle_losing_vote(0, 40);
+        v.release_vote(&cast[1], false, false).unwrap();
+        v.settle_dissenting_vote(1);
+        v.settle_losing_vote(2, 40);
+        assert!(v.all_losers_settled());
+        assert!(v.all_votes_released());
+        assert_eq!(v.bounty_owed, 80);
+    }
+
+    #[test]
+    fn a_reset_clears_the_vote_commitments() {
+        let mut v = fresh();
+        v.cast_vote(Pubkey::new_unique(), vote(5, 1));
+        v.reset_for_round(2, 0);
+        assert!(v.vote_commitments.is_empty());
+        assert_eq!(v.committed_hash, [0; 32]);
+    }
+
+    /// A vote is a dissent only when the commitment it convicts on is known
+    /// and is not the recorded one. Without one, the vote is held with the
+    /// quorum instead of being released at once.
+    #[test]
+    fn a_vote_with_no_commitment_recorded_is_not_taken_for_a_dissent() {
+        let voters = [Pubkey::new_unique(), Pubkey::new_unique()];
+        let mut v = verdict(VerdictStatus::Upheld, &voters);
+        v.vote_commitments.truncate(1);
+        assert!(!v.dissents(0));
+        assert!(!v.dissents(1));
+        assert_eq!(v.bounty_recipients(), voters.to_vec());
+        v.vote_commitments[0] = [9u8; 32];
+        assert!(v.dissents(0));
+        assert_eq!(v.bounty_recipients(), vec![voters[1]]);
     }
 }

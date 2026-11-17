@@ -388,6 +388,17 @@ treasurer checks it (wienerlabs/leviathan-net#43):
 - **The record is self-checking.** The verdict stores the evidence alongside
   the hash, so anyone can rebuild the hash from the account and its run.
   Holding the dump, anyone can check its sha256 against the digest.
+- **Votes agree on the payload, not on the replay.** Votes are counted per
+  commitment the target signed: a quorum is two thirds of the committee voting
+  for one payload, and the verdict records the payload most votes are for. The
+  first vote used to fix the evidence for the rest of the round, its replayed
+  hash included. Every payload is broadcast, so one seat could cite another
+  payload the target signed and veto what two thirds agreed on, and honest
+  verifiers whose replays differ in the last bits, which is what the band is
+  for, never reached a quorum. A vote for evidence the verdict does not record
+  convicted nobody: it is no seat of the bounty, an overturn charges it
+  nothing, and it is released once the verdict resolves. The target never
+  votes on its own verdict (`VerifierIsTarget`).
 
 Before this, a quorum could record a hash the target never committed to, and
 the record an appeal bench or an observer reads would have been fiction. A
