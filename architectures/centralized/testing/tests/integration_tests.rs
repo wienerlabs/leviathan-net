@@ -738,3 +738,209 @@ async fn two_clients_join_in_training_and_get_model_using_p2p() {
     // check that the clients length shows the new joined client trained with new p2p shared model
     assert_with_retries(|| server_handle.get_clients_len(), 4).await;
 }
+
+/// The step a short run ends at: three rounds train, and the witness of the
+/// third takes the run to its last step and its final cooldown.
+const LAST_STEP: u32 = 4;
+
+/// Waits for every client to return from its run, and checks that each
+/// returned cleanly rather than with an error.
+async fn assert_clients_stop_cleanly(client_handles: Vec<ClientHandle>) {
+    for (index, mut handle) in client_handles.into_iter().enumerate() {
+        match tokio::time::timeout(Duration::from_secs(120), &mut handle.client_handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => panic!("client {index} stopped with an error: {error:#}"),
+            Ok(Err(join)) => panic!("client {index} crashed: {join}"),
+            Err(_) => panic!("client {index} kept running after its run finished"),
+        }
+    }
+}
+
+/// A run that reaches its last step ends with a cooldown and then `Finished`.
+/// Each client finishes that cooldown, shuts its networking down and returns,
+/// instead of stopping on a desync between its step and the run's state
+/// (wienerlabs/leviathan-net#82).
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn clients_stop_cleanly_when_the_run_finishes() {
+    let init_min_clients = 2;
+    let server_handle =
+        CoordinatorServerHandle::new_with_total_steps(init_min_clients, 2, 1, LAST_STEP).await;
+    let client_handles = spawn_clients(
+        init_min_clients as usize,
+        server_handle.server_port,
+        &server_handle.run_id,
+    )
+    .await;
+
+    assert_with_retries(|| server_handle.get_run_state(), RunState::RoundTrain).await;
+    assert_with_retries(|| server_handle.get_run_state(), RunState::Finished).await;
+    assert_eq!(
+        server_handle.get_coordinator().await.progress.step,
+        LAST_STEP
+    );
+    assert_clients_stop_cleanly(client_handles).await;
+}
+
+/// A run paused in its last round cools down into `Paused`, and its clients
+/// wait in warmup. Resumed, the run is over, so it goes straight to
+/// `Finished`, and the waiting clients return cleanly from there too
+/// (wienerlabs/leviathan-net#82).
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn clients_stop_cleanly_when_a_run_paused_at_its_end_is_resumed() {
+    let init_min_clients = 2;
+    let server_handle =
+        CoordinatorServerHandle::new_with_total_steps(init_min_clients, 2, 1, LAST_STEP).await;
+    let client_handles = spawn_clients(
+        init_min_clients as usize,
+        server_handle.server_port,
+        &server_handle.run_id,
+    )
+    .await;
+
+    // Pause in the last round: the run still cools down at its last step,
+    // and the pause takes effect when the cooldown ends.
+    wait_for_the_last_round(&server_handle).await;
+    server_handle.toggle_pause().await;
+
+    assert_with_retries(|| server_handle.get_run_state(), RunState::Paused).await;
+    assert_eq!(
+        server_handle.get_coordinator().await.progress.step,
+        LAST_STEP
+    );
+    server_handle.toggle_pause().await;
+    assert_with_retries(|| server_handle.get_run_state(), RunState::Finished).await;
+    assert_clients_stop_cleanly(client_handles).await;
+}
+
+/// Waits until the run trains its last round.
+async fn wait_for_the_last_round(server_handle: &CoordinatorServerHandle) {
+    for _ in 0..600 {
+        let coordinator = server_handle.get_coordinator().await;
+        if coordinator.progress.step == LAST_STEP - 1
+            && coordinator.run_state == RunState::RoundTrain
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("the run never reached its last round");
+}
+
+/// A client that joins in a run's last round is never let in: the run
+/// finishes before another warmup. It returns cleanly once the run is over,
+/// instead of waiting for a warmup that never comes
+/// (wienerlabs/leviathan-net#82).
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn a_client_that_joins_too_late_stops_cleanly_when_the_run_finishes() {
+    let init_min_clients = 2;
+    let server_handle =
+        CoordinatorServerHandle::new_with_total_steps(init_min_clients, 2, 1, LAST_STEP).await;
+    let mut client_handles = spawn_clients(
+        init_min_clients as usize,
+        server_handle.server_port,
+        &server_handle.run_id,
+    )
+    .await;
+
+    wait_for_the_last_round(&server_handle).await;
+    client_handles
+        .push(ClientHandle::default(server_handle.server_port, &server_handle.run_id).await);
+
+    assert_with_retries(|| server_handle.get_run_state(), RunState::Finished).await;
+    assert_eq!(
+        server_handle.get_clients_len().await,
+        init_min_clients as usize
+    );
+    assert_clients_stop_cleanly(client_handles).await;
+}
+
+/// The run's last cooldown checkpoints the model a finished run publishes.
+/// Each client finishes writing that checkpoint before it returns, rather than
+/// stopping with it still in flight (wienerlabs/leviathan-net#82).
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn clients_finish_the_last_checkpoint_before_they_stop() {
+    let init_min_clients = 2;
+    let server_handle =
+        CoordinatorServerHandle::new_with_total_steps(init_min_clients, 2, 1, LAST_STEP).await;
+    let checkpoint_dirs: Vec<_> = (0..init_min_clients)
+        .map(|node| {
+            let dir = std::env::temp_dir().join(format!(
+                "psyche-last-checkpoint-{}-{}-{node}",
+                std::process::id(),
+                server_handle.run_id
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        })
+        .collect();
+    let mut client_handles = Vec::new();
+    for dir in &checkpoint_dirs {
+        client_handles.push(
+            ClientHandle::new_with_checkpoint_dir(
+                server_handle.server_port,
+                &server_handle.run_id,
+                dir,
+            )
+            .await,
+        );
+    }
+
+    assert_with_retries(|| server_handle.get_run_state(), RunState::Finished).await;
+    assert_clients_stop_cleanly(client_handles).await;
+    // The cooldown checkpoints the step the model was last trained at.
+    for dir in &checkpoint_dirs {
+        let last = dir.join(format!("{}-step{}", server_handle.run_id, LAST_STEP - 1));
+        let written: Vec<_> = std::fs::read_dir(&last)
+            .unwrap_or_else(|error| panic!("no checkpoint at {}: {error}", last.display()))
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            written
+                .iter()
+                .any(|name| name.to_string_lossy().ends_with(".safetensors")),
+            "the last checkpoint at {} holds no weights: {written:?}",
+            last.display()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// A client that cannot write the run's last checkpoint has not finished the
+/// run cleanly: it stops with the checkpoint's error, rather than returning as
+/// if the model had been kept (wienerlabs/leviathan-net#82).
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn a_client_whose_last_checkpoint_fails_stops_with_its_error() {
+    let init_min_clients = 2;
+    let server_handle =
+        CoordinatorServerHandle::new_with_total_steps(init_min_clients, 2, 1, LAST_STEP).await;
+    // A file where its checkpoint directory should be: no checkpoint can be
+    // written under it, whoever the test runs as.
+    let not_a_dir = std::env::temp_dir().join(format!(
+        "psyche-not-a-checkpoint-dir-{}-{}",
+        std::process::id(),
+        server_handle.run_id
+    ));
+    std::fs::write(&not_a_dir, b"not a directory").unwrap();
+
+    let mut failing = ClientHandle::new_with_checkpoint_dir(
+        server_handle.server_port,
+        &server_handle.run_id,
+        &not_a_dir,
+    )
+    .await;
+    let healthy = ClientHandle::default(server_handle.server_port, &server_handle.run_id).await;
+
+    assert_with_retries(|| server_handle.get_run_state(), RunState::Finished).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(120), &mut failing.client_handle).await;
+    std::fs::remove_file(&not_a_dir).unwrap();
+    match outcome {
+        Ok(Ok(Err(error))) => assert!(
+            format!("{error:#}").contains("a checkpoint failed"),
+            "the client stopped with another error: {error:#}"
+        ),
+        Ok(Ok(Ok(()))) => panic!("a client whose last checkpoint failed returned cleanly"),
+        Ok(Err(join)) => panic!("the client crashed: {join}"),
+        Err(_) => panic!("the client kept running after its run finished"),
+    }
+    assert_clients_stop_cleanly(vec![healthy]).await;
+}

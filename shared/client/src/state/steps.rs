@@ -812,6 +812,7 @@ impl StepStateMachine {
                             &mut self.current_round,
                         ))
                     }
+                    ActiveStep::Finished => ActiveStep::Finished,
                 };
                 self.active_step = new_step;
 
@@ -903,6 +904,24 @@ impl StepStateMachine {
 
                 ActiveStep::Cooldown(self.cooldown.start(trainers, &state)?)
             }
+            // the run is over: its last cooldown checkpoints the model, and
+            // the client stops once that is done (wienerlabs/leviathan-net#82)
+            (ActiveStep::Cooldown(cooldown), RunState::Finished) => {
+                let (evals, upload_handle) = cooldown.finish().await?;
+                if let Some(handle) = upload_handle {
+                    self.pending_upload_handles.push(handle);
+                }
+                evals.stop_evals().await?;
+                // Its upload stays held, finished or not, so the shutdown
+                // reads its outcome rather than dropping it unread.
+                ActiveStep::Finished
+            }
+            // a run paused at its end, and resumed, is over: its last cooldown
+            // already finished on the way into the pause
+            (ActiveStep::Warmup(warmup), RunState::Finished) => {
+                warmup.finish().stop_evals().await?;
+                ActiveStep::Finished
+            }
             // cooldown is done, we consider waiting for members and warmup to be basically the same
             (ActiveStep::Cooldown(cooldown), RunState::WaitingForMembers)
             | (ActiveStep::Cooldown(cooldown), RunState::Warmup)
@@ -960,6 +979,8 @@ enum ActiveStep {
     Training(TrainingStep),
     Witness(WitnessStep),
     Cooldown(CooldownStep),
+    /// The run is over; nothing is left to train or checkpoint.
+    Finished,
 }
 
 impl ActiveStep {
@@ -975,6 +996,7 @@ impl ActiveStep {
             (ActiveStep::Cooldown(..), RunState::Cooldown) => true,
             (ActiveStep::Training(..), RunState::RoundTrain) => true,
             (ActiveStep::Witness(..), RunState::RoundWitness) => true,
+            (ActiveStep::Finished, RunState::Finished) => true,
             _ => false,
         }
     }
@@ -988,6 +1010,7 @@ impl fmt::Display for ActiveStep {
             ActiveStep::Training(_) => write!(f, "Training"),
             ActiveStep::Witness(_) => write!(f, "Witness"),
             ActiveStep::Cooldown(_) => write!(f, "Cooldown"),
+            ActiveStep::Finished => write!(f, "Finished"),
         }
     }
 }
@@ -1002,6 +1025,8 @@ pub enum InitStage {
         )>,
     ),
     Running(Box<StepStateMachine>),
+    /// The run finished before this client was running in it.
+    Finished,
 }
 
 pub struct RunManager(InitStage);
@@ -1025,6 +1050,7 @@ impl RunManager {
             InitStage::NotYetInitialized(..) => None,
             InitStage::Initializing(init_state) => Some(&init_state.1),
             InitStage::Running(step_state_machine) => Some(&step_state_machine.coordinator_state),
+            InitStage::Finished => None,
         }
     }
 
@@ -1076,6 +1102,22 @@ impl RunManager {
     }
 
     pub async fn apply_state(&mut self, state: Coordinator) -> Result<(), ApplyStateError> {
+        // A run that is over has nothing for a client that is not running in
+        // it yet: it will never warm up again (wienerlabs/leviathan-net#82).
+        if state.run_state == RunState::Finished {
+            match &mut self.0 {
+                InitStage::Running(..) | InitStage::Finished => {}
+                InitStage::Initializing(init) => {
+                    init.0.abort();
+                    self.0 = InitStage::Finished;
+                    return Ok(());
+                }
+                InitStage::NotYetInitialized(..) => {
+                    self.0 = InitStage::Finished;
+                    return Ok(());
+                }
+            }
+        }
         let new_state = match &mut self.0 {
             InitStage::NotYetInitialized(init_info @ Some(..))
             // We run the initialization only when we are sure that we didn't just recently joined in Warmup
@@ -1118,6 +1160,8 @@ impl RunManager {
             }
             // we're running, process it in a sec
             InitStage::Running(..) => None,
+            // the run is over
+            InitStage::Finished => return Ok(()),
             // not initialized but we haven't seen a warmup yet, we're just waiting!
             InitStage::NotYetInitialized(_) => {
                 return Ok(());
@@ -1151,6 +1195,41 @@ impl RunManager {
             run.set_endpoint_info(endpoint_info)?;
         }
         Ok(())
+    }
+
+    /// Waits for every checkpoint upload this client still holds, and returns
+    /// the first that failed. A run's last checkpoint is the model it
+    /// publishes, so a client that could not write or upload it has not
+    /// finished cleanly (wienerlabs/leviathan-net#82).
+    pub async fn finish_uploads(&mut self) -> anyhow::Result<()> {
+        let InitStage::Running(step_state_machine) = &mut self.0 else {
+            return Ok(());
+        };
+        let mut failed = None;
+        for handle in std::mem::take(&mut step_state_machine.pending_upload_handles) {
+            let outcome = match handle.await {
+                Ok(Ok(())) => continue,
+                Ok(Err(error)) => anyhow::anyhow!("a checkpoint failed: {error}"),
+                Err(error) => anyhow::anyhow!("a checkpoint task crashed: {error}"),
+            };
+            failed.get_or_insert(outcome);
+        }
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the run is over for this client: it has seen the run finish,
+    /// and finished its last cooldown if it was training in it.
+    pub fn is_finished(&self) -> bool {
+        match &self.0 {
+            InitStage::Running(step_state_machine) => {
+                matches!(step_state_machine.active_step, ActiveStep::Finished)
+            }
+            InitStage::Finished => true,
+            InitStage::NotYetInitialized(..) | InitStage::Initializing(..) => false,
+        }
     }
 
     pub fn doing_checkpoint(&self) -> bool {

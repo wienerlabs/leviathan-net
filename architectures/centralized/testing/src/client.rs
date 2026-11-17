@@ -1,3 +1,5 @@
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Error, Result};
@@ -7,11 +9,10 @@ use psyche_client::NC;
 use psyche_client::RunInitConfig;
 use psyche_network::allowlist;
 use tokio::runtime::Runtime;
-use tokio::select;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use crate::test_utils::dummy_client_app_params_with_training_delay;
+use crate::test_utils::dummy_client_app_params;
 
 /// The training delay of a client spawned with `ClientHandle::default`.
 const DEFAULT_TRAINING_DELAY_SECS: u64 = 5;
@@ -36,13 +37,16 @@ struct Client {
 }
 
 impl Client {
-    pub async fn new_with_training_delay(
+    /// A client that trains for `training_delay_secs` a step, and keeps its
+    /// checkpoints in `checkpoint_dir` if one is given.
+    pub async fn new(
         server_port: u16,
         run_id: &str,
         training_delay_secs: u64,
+        checkpoint_dir: Option<&Path>,
     ) -> (Self, allowlist::AllowDynamic, NC, RunInitConfig) {
         let client_app_params =
-            dummy_client_app_params_with_training_delay(server_port, run_id, training_delay_secs);
+            dummy_client_app_params(server_port, run_id, training_delay_secs, checkpoint_dir);
         let (client_app, allowlist, p2p, state_options) = build_client_app(
             client_app_params.cancel,
             client_app_params.server_addr,
@@ -62,13 +66,9 @@ impl Client {
         state_options: RunInitConfig,
     ) -> Result<()> {
         debug!("spawned new client: {:?}", p2p.endpoint_addr().await);
-        let client_run = self.inner.run(allowlist, p2p, state_options);
-        tokio::pin!(client_run);
-        loop {
-            select! {
-                run_res = &mut client_run => run_res?,
-            }
-        }
+        // The app returns once its run is over (wienerlabs/leviathan-net#82),
+        // or with the error that stopped it.
+        self.inner.run(allowlist, p2p, state_options).await
     }
 }
 
@@ -88,6 +88,7 @@ impl ClientHandle {
             server_port,
             run_id,
             DEFAULT_TRAINING_DELAY_SECS,
+            None,
             Duration::from_millis(50),
         )
         .await
@@ -103,11 +104,28 @@ impl ClientHandle {
             server_port,
             run_id,
             training_delay_secs,
+            None,
             Duration::from_millis(100),
         )
         .await;
         debug!("new client spawned!");
         handle
+    }
+
+    /// A client that keeps its checkpoints in `checkpoint_dir`.
+    pub async fn new_with_checkpoint_dir(
+        server_port: u16,
+        run_id: &str,
+        checkpoint_dir: &Path,
+    ) -> Self {
+        Self::spawn(
+            server_port,
+            run_id,
+            DEFAULT_TRAINING_DELAY_SECS,
+            Some(checkpoint_dir.to_path_buf()),
+            Duration::from_millis(50),
+        )
+        .await
     }
 
     /// Builds a client and runs it on a runtime of its own, set up as the
@@ -116,13 +134,20 @@ impl ClientHandle {
         server_port: u16,
         run_id: &str,
         training_delay_secs: u64,
+        checkpoint_dir: Option<PathBuf>,
         settle: Duration,
     ) -> Self {
         let runtime = client_runtime();
         let run_id = run_id.to_string();
         let (mut client, allowlist, p2p, state_options) = runtime
             .spawn(async move {
-                Client::new_with_training_delay(server_port, &run_id, training_delay_secs).await
+                Client::new(
+                    server_port,
+                    &run_id,
+                    training_delay_secs,
+                    checkpoint_dir.as_deref(),
+                )
+                .await
             })
             .await
             .expect("building the client panicked");

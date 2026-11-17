@@ -33,6 +33,9 @@ tracing.workspace = true
 psyche-python-extension-impl = { workspace = true, optional = true }
 tikv-jemallocator.workspace = true
 
+[dev-dependencies]
+bytemuck.workspace = true
+
 [features]
 parallelism = ["psyche-client/parallelism"]
 python = ["psyche-python-extension-impl"]

@@ -7648,6 +7648,7 @@ dependencies = [
  "anchor-client",
  "anyhow",
  "async-trait",
+ "bytemuck",
  "clap",
  "clap-markdown",
  "psyche-client",
