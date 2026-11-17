@@ -362,3 +362,47 @@ pub async fn an_equivocation_ahead_of_the_daemons_view_is_looked_at_again() {
         assert!(!judged.contains(&equivocation_key(&key)));
     }
 }
+
+/// A daemon that replays instead of reading reference dumps has nothing to
+/// judge a payload against once the run is past its first epoch, nor while
+/// its replay cannot be prepared: no step there can be replayed
+/// (wienerlabs/leviathan-net#48). An equivocation needs neither, and it is
+/// the one fraud still provable then, so the pass convicts it anyway.
+#[tokio::test]
+pub async fn an_equivocation_is_convicted_with_nothing_to_replay_against() {
+    let mut h = setup("Leviathan equiv no replay", 170).await;
+    let p2p = h.p2ps[h.target_client_idx].insecure_clone();
+    let (dir, key) = kept_payloads(&mut h, "no-replay", &p2p).await;
+    let target_key = h.target_key;
+    let daemon = funded_daemon(&mut h).await;
+    let replaying = AuditConfig {
+        reference_dir: None,
+        ..config(&h, dir, "no-replay", false)
+    };
+
+    let mut judged = HashSet::new();
+    let report = audit_pass(
+        &mut h.endpoint,
+        &daemon,
+        &h.coordinator_account,
+        &h.run,
+        &replaying,
+        None,
+        &mut judged,
+    )
+    .await
+    .expect("a pass with no replay still judges equivocations");
+    assert_eq!(
+        report,
+        PassReport {
+            equivocations: 1,
+            submitted: 1,
+            ..PassReport::default()
+        }
+    );
+    assert_eq!(
+        h.client_state(&target_key).await,
+        Some(ClientState::Ejected)
+    );
+    assert!(judged.contains(&equivocation_key(&key)));
+}

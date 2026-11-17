@@ -260,11 +260,6 @@ pub async fn audit_pass(
         Some(dir) => Some(index_dir(dir)?),
         None => None,
     };
-    if reference.is_none() && replay.is_none() {
-        return Err(anyhow!(
-            "the daemon needs either a reference directory or a replay engine to audit against"
-        ));
-    }
     let device = Device::Cpu;
     let mut report = PassReport::default();
 
@@ -283,6 +278,15 @@ pub async fn audit_pass(
     }
     .convict_all(&submitted)
     .await;
+
+    // A daemon that replays has nothing to judge a payload against past the
+    // run's first epoch, where no step can be replayed
+    // (wienerlabs/leviathan-net#48), nor in a pass whose replay could not be
+    // prepared. Equivocation is the fraud still provable then, and it has
+    // just been judged.
+    if reference.is_none() && replay.is_none() {
+        return Ok(report);
+    }
 
     for (key, submitted_path) in &submitted {
         let Some(committer) = parse_committer(submitted_path) else {

@@ -292,6 +292,15 @@ impl Replayer {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // Without either, the daemon has nothing to judge a payload against. A
+    // pass with neither judges only equivocations, which is what a replaying
+    // daemon does once nothing can be replayed, so the mistake is caught here
+    // rather than read as that.
+    if args.reference_dir.is_none() && args.replay_data_dir.is_none() {
+        return Err(anyhow!(
+            "pass --reference-dir or --replay-data-dir: the daemon audits payloads against one or the other"
+        ));
+    }
     let authority = read_keypair_file(&args.authority).map_err(|err| {
         anyhow!(
             "cannot read authority keypair {}: {}",
@@ -376,37 +385,24 @@ async fn main() -> Result<()> {
         let engine = match replayer.as_mut() {
             Some(replayer) => match replayer.engine(&args, &mut endpoint, &coordinator_account).await {
                 Ok(Some(engine)) => Some(engine),
+                // Without a replay the pass still judges equivocation, which
+                // needs none and is the one fraud provable past the first
+                // epoch. Skipping the pass skipped it too, for the rest of
+                // the run.
                 Ok(None) => {
                     println!(
-                        "[verifier-daemon] the run is past its first epoch, so no contribution can be replayed (wienerlabs/leviathan-net#48)"
+                        "[verifier-daemon] the run is past its first epoch, so no contribution can be replayed (wienerlabs/leviathan-net#48); judging equivocations only"
                     );
-                    if args.once {
-                        break;
-                    }
-                    note_pass(
-                        &mut slowest_pass,
-                        &exporter,
-                        &args.run_id,
-                        pass_started,
-                        poll_interval,
-                    );
-                    tokio::time::sleep(poll_interval).await;
-                    continue;
+                    None
                 }
                 Err(err) => {
-                    eprintln!("[verifier-daemon] cannot prepare this pass: {err:#}");
+                    eprintln!(
+                        "[verifier-daemon] cannot prepare this pass's replay, judging equivocations only: {err:#}"
+                    );
                     if let Some(exporter) = &exporter {
                         exporter.metrics.pass_failed(&args.run_id);
                     }
-                    note_pass(
-                        &mut slowest_pass,
-                        &exporter,
-                        &args.run_id,
-                        pass_started,
-                        poll_interval,
-                    );
-                    tokio::time::sleep(poll_interval).await;
-                    continue;
+                    None
                 }
             },
             None => None,
