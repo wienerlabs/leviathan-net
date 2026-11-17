@@ -716,6 +716,20 @@ fn start_sending_health_checks(
         .committee_info
         .as_ref()
         .ok_or(TrainError::NoCommitteeInfo)?;
+    // The committee these checks are judged by was drawn over the previous
+    // round's roster, seat by seat. If anyone has left since, the seats no
+    // longer hold the clients it seated, and unless every seat trains the
+    // coordinator refuses every check this round
+    // (`CoordinatorError::RosterMoved`).
+    let roster_moved = state
+        .previous_round()
+        .is_some_and(|round| round.clients_len as usize != state.epoch_state.clients.len());
+    let roles_moved = committee_selection.get_num_verifier_nodes() > 0
+        || committee_selection.get_num_tie_breaker_nodes() > 0;
+    if roster_moved && roles_moved {
+        debug!("The roster moved since the previous round was drawn, so no health check is sent");
+        return Ok(None);
+    }
     Ok(
         if state.epoch_state.first_round.is_false() && witness_proof.witness.is_true() {
             let clients = state.epoch_state.clients;
