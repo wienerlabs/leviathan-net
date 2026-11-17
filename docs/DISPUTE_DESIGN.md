@@ -54,8 +54,11 @@ The `TieBreaker` committee is already a first-class arm of the coordinator's
 count. Rather than migrate the coordinator's zero-copy state, the treasurer draws
 its own selection with `from_coordinator_with_tie_breakers`, overriding the
 tie-breaker count from a per-run config (`tie_breaker_committee_size`). One
-selection partitions the epoch into disjoint tie-breaker / verifier / trainer sets,
-so a client is never both a verifier and its own appeals judge. The whole appeals
+selection partitions a round into disjoint tie-breaker / verifier / trainer sets.
+An appeal is judged over many rounds, each drawn afresh, so disjointness within
+one draw is not enough: the treasurer also refuses an appeal vote from a verifier
+who voted on the verdict (`AppellateVotedOnVerdict`) and from the target itself
+(`AppellateIsTarget`), the two parties no draw makes neutral. The whole appeals
 court is five treasurer instructions (`run_set_challenge_config`,
 `run_open_challenge`, `run_submit_appeal_verdict`, `run_finalize_slash`,
 `run_slash_losing_verifier`) plus a lifecycle on the existing `AuditVerdict`
@@ -218,7 +221,8 @@ takes over.
 
 The trust model is unchanged from the committee vote: adjudication is a bonded
 committee, not a key, and the appeals bench is drawn by the same lottery but from
-a disjoint, separately sized set, so buying it is a second independent purchase.
+a disjoint, separately sized set, and never seats the verdict's own voters or its
+target, so buying it is a second independent purchase.
 The recursion is bounded by economics, not by another layer of code. Backward
 compatibility is preserved, so the genesis run and token launch remain unblocked
 whether or not a given run turns appeals on.
