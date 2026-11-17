@@ -9,6 +9,7 @@ use psyche_coordinator::RunState;
 use psyche_solana_rpc::SolanaBackend;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::state::coordinator_slashed_points;
+use psyche_solana_treasurer::state::unledgered_conviction_charge;
 
 #[derive(Debug, Clone, Args)]
 #[command()]
@@ -60,12 +61,18 @@ impl Command for CommandCanJoin {
             let participant = backend
                 .get_treasurer_participant(&participant_address)
                 .await?;
+            let own_verdict = backend
+                .get_own_audit_verdict(&join_authority, &address)
+                .await?;
             let slashed_points = coordinator_slashed_points(&coordinator_account, &address);
-            let committed = participant.committed_bond(slashed_points);
+            let unledgered =
+                unledgered_conviction_charge(&coordinator_account, own_verdict.as_ref());
+            let committed = participant.committed_bond_owing(slashed_points, unledgered);
             println!(
-                "Bond-gated run: bond {}, unsettled slashed points {}, withdrawal pending {}, committed {}, minimum {}",
+                "Bond-gated run: bond {}, unsettled slashed points {}, conviction not yet charged {}, withdrawal pending {}, committed {}, minimum {}",
                 participant.bond_amount,
                 participant.unsettled_slashed_points(slashed_points),
+                unledgered,
                 participant.bond_withdraw_pending_amount,
                 committed,
                 run.bond_minimum_amount,

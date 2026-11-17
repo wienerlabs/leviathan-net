@@ -4,8 +4,36 @@ use psyche_coordinator::Coordinator;
 use psyche_coordinator::RunState;
 use psyche_solana_coordinator::CoordinatorAccount;
 
+use crate::state::AuditVerdict;
 use crate::state::EjectionCharge;
 use crate::ProgramError;
+
+/// What a participant's own conviction, `own_verdict`, will still take from
+/// its bond that the ledger in `account` has not charged
+/// (`AuditVerdict::unledgered_charge`).
+///
+/// The bond checks read what the ledger charged. A conviction that stands but
+/// has not reached the ledger used to count for nothing there, so its target
+/// joined, claimed and voted on a bond that conviction was about to take from.
+pub fn unledgered_conviction_charge(
+    account: &CoordinatorAccount,
+    own_verdict: Option<&AuditVerdict>,
+) -> u64 {
+    own_verdict.map_or(0, |verdict| {
+        verdict.unledgered_charge(
+            &account.state.coordinator,
+            ejection_charge(account).rate,
+        )
+    })
+}
+
+/// The verdict at a participant's own verdict PDA, read from the account
+/// passed for it. The address is pinned by the caller's seeds, so an empty
+/// account there means the participant was never disputed.
+pub fn read_own_verdict(account: &AccountInfo) -> Result<Option<AuditVerdict>> {
+    let data = account.try_borrow_data()?;
+    AuditVerdict::from_pda_account(account.owner, &data)
+}
 
 /// What the ledger will charge an ejection landed now, in the epoch the
 /// coordinator in `account` is in.

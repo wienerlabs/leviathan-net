@@ -16,6 +16,8 @@ use crate::state::MAX_APPEAL_VOTERS;
 use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
 use crate::state::committee_matches_roster;
+use crate::state::read_own_verdict;
+use crate::state::unledgered_conviction_charge;
 use crate::state::conviction_landing;
 use crate::state::ejection_charge;
 use crate::ProgramError;
@@ -69,6 +71,22 @@ pub struct RunSubmitAppealVerdictAccounts<'info> {
 
     #[account()]
     pub coordinator_program: Program<'info, PsycheSolanaCoordinator>,
+
+    /// CHECK: the tie-breaker's own verdict, pinned to its PDA by the seeds
+    /// below and read only after this checks that it exists and belongs to
+    /// this program. A conviction there that stands but has not reached the
+    /// ledger still owes its charge, which the bond behind the vote has to
+    /// cover too. Last, so a client that passes it still works with a
+    /// treasurer that does not read it.
+    #[account(
+        seeds = [
+            AuditVerdict::SEEDS_PREFIX,
+            run.key().as_ref(),
+            appellate.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub appellate_verdict: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -83,6 +101,9 @@ pub fn run_submit_appeal_verdict_processor(
     params: RunSubmitAppealVerdictParams,
 ) -> Result<()> {
     let appellate_key = context.accounts.appellate.key();
+    let appellate_verdict = read_own_verdict(
+        &context.accounts.appellate_verdict.to_account_info(),
+    )?;
 
     let (quorum, landing, ejection) = {
         let account = context.accounts.coordinator_account.load()?;
@@ -90,12 +111,12 @@ pub fn run_submit_appeal_verdict_processor(
         // A tie-breaker sits on a bonded bench for the same reason a verifier
         // does, so it is held to the same bond: what is still standing once
         // convictions are charged and requested withdrawals have left
-        // (wienerlabs/leviathan-net#34).
-        if context
-            .accounts
-            .appellate_participant
-            .committed_bond(coordinator_slashed_points(&account, &appellate_key))
-            < context.accounts.run.bond_minimum_amount
+        // (wienerlabs/leviathan-net#34), a conviction of its own that has not
+        // reached the ledger yet included.
+        if context.accounts.appellate_participant.committed_bond_owing(
+            coordinator_slashed_points(&account, &appellate_key),
+            unledgered_conviction_charge(&account, appellate_verdict.as_ref()),
+        ) < context.accounts.run.bond_minimum_amount
         {
             return err!(ProgramError::BondBelowMinimum);
         }

@@ -497,6 +497,24 @@ impl SolanaBackend {
             .map_err(|error| anyhow!("Unable to decode treasurer participant data: {error}"))
     }
 
+    /// The audit verdict that names `user` as its target in `treasurer_run`,
+    /// if `user` was ever disputed there.
+    pub async fn get_own_audit_verdict(
+        &self,
+        treasurer_run: &Pubkey,
+        user: &Pubkey,
+    ) -> Result<Option<psyche_solana_treasurer::state::AuditVerdict>> {
+        let address = psyche_solana_treasurer::find_audit_verdict(treasurer_run, user);
+        match self.get_account(&address).await? {
+            Some(account) => psyche_solana_treasurer::state::AuditVerdict::from_pda_account(
+                &account.owner,
+                &account.data,
+            )
+            .map_err(|error| anyhow!("Unable to decode the audit verdict: {error}")),
+            None => Ok(None),
+        }
+    }
+
     /// Every audit verdict the treasurer holds for `treasurer_run`, with its
     /// address. A verdict account keeps the run at a fixed offset, right after
     /// its discriminator and bump, so the cluster filters by it.

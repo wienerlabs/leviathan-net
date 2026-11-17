@@ -17,6 +17,9 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_coordinator::CoordinatorInstance;
 
 use crate::state::coordinator_slashed_points;
+use crate::state::read_own_verdict;
+use crate::state::unledgered_conviction_charge;
+use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::ProgramError;
@@ -101,6 +104,22 @@ pub struct ParticipantJoinRunAccounts<'info> {
 
     #[account()]
     pub system_program: Program<'info, System>,
+
+    /// CHECK: the joining signer's own verdict, pinned to its PDA by the seeds
+    /// below and read only after this checks that it exists and belongs to
+    /// this program. A conviction there that stands but has not reached the
+    /// ledger still owes its charge, which the bond has to cover too. Last,
+    /// so a client that passes it still works with a treasurer that does not
+    /// read it.
+    #[account(
+        seeds = [
+            AuditVerdict::SEEDS_PREFIX,
+            run.key().as_ref(),
+            user.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub own_verdict: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -113,16 +132,23 @@ pub fn participant_join_run_processor(
     params: ParticipantJoinRunParams,
 ) -> Result<()> {
     let user_key = context.accounts.user.key();
-    let slashed_points = coordinator_slashed_points(
-        &*context.accounts.coordinator_account.load()?,
-        &user_key,
-    );
-    let committed_bond =
-        context.accounts.participant.committed_bond(slashed_points);
+    let own_verdict =
+        read_own_verdict(&context.accounts.own_verdict.to_account_info())?;
+    let (slashed_points, unledgered_conviction) = {
+        let account = context.accounts.coordinator_account.load()?;
+        (
+            coordinator_slashed_points(&account, &user_key),
+            unledgered_conviction_charge(&account, own_verdict.as_ref()),
+        )
+    };
+    let committed_bond = context
+        .accounts
+        .participant
+        .committed_bond_owing(slashed_points, unledgered_conviction);
     let bond_minimum_amount = context.accounts.run.bond_minimum_amount;
     if committed_bond < bond_minimum_amount {
         msg!(
-            "participant_join_run: committed bond {} below the run minimum {} (bond {}, unsettled slash {}, pending withdrawal {})",
+            "participant_join_run: committed bond {} below the run minimum {} (bond {}, unsettled slash {}, unledgered conviction {}, pending withdrawal {})",
             committed_bond,
             bond_minimum_amount,
             context.accounts.participant.bond_amount,
@@ -130,6 +156,7 @@ pub fn participant_join_run_processor(
                 .accounts
                 .participant
                 .unsettled_slashed_points(slashed_points),
+            unledgered_conviction,
             context.accounts.participant.bond_withdraw_pending_amount,
         );
         return err!(ProgramError::BondBelowMinimum);

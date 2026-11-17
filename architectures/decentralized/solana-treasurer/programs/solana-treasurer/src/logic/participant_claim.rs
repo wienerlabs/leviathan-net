@@ -6,9 +6,12 @@ use anchor_spl::token::transfer;
 use psyche_solana_coordinator::CoordinatorAccount;
 
 use crate::ProgramError;
+use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::coordinator_slashed_points;
+use crate::state::read_own_verdict;
+use crate::state::unledgered_conviction_charge;
 
 #[derive(Accounts)]
 #[instruction(params: ParticipantClaimParams)]
@@ -55,6 +58,21 @@ pub struct ParticipantClaimAccounts<'info> {
 
     #[account()]
     pub token_program: Program<'info, Token>,
+
+    /// CHECK: the claimant's own verdict, pinned to its PDA by the seeds below
+    /// and read only after this checks that it exists and belongs to this
+    /// program. A conviction there that stands but has not reached the ledger
+    /// still owes its charge. Last, so a client that passes it still works
+    /// with a treasurer that does not read it.
+    #[account(
+        seeds = [
+            AuditVerdict::SEEDS_PREFIX,
+            run.key().as_ref(),
+            user.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub own_verdict: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -67,7 +85,13 @@ pub fn participant_claim_processor(
     params: ParticipantClaimParams,
 ) -> Result<()> {
     let user_key = context.accounts.user.key();
-    let (participant_earned_points, participant_slashed_points) = {
+    let own_verdict =
+        read_own_verdict(&context.accounts.own_verdict.to_account_info())?;
+    let (
+        participant_earned_points,
+        participant_slashed_points,
+        unledgered_conviction,
+    ) = {
         let coordinator_account = context.accounts.coordinator_account.load()?;
         let earned = coordinator_account
             .state
@@ -77,18 +101,25 @@ pub fn participant_claim_processor(
             .find(|client| *client.id.signer() == user_key.to_bytes())
             .map(|client| client.earned)
             .unwrap_or(0);
-        (earned, coordinator_slashed_points(&coordinator_account, &user_key))
+        (
+            earned,
+            coordinator_slashed_points(&coordinator_account, &user_key),
+            unledgered_conviction_charge(
+                &coordinator_account,
+                own_verdict.as_ref(),
+            ),
+        )
     };
 
     // Nothing is taken without something left to slash, and a bond a conviction
     // has already charged is not something left: it is only still counted in
     // `bond_amount` because settlement waits for the participant to withdraw
-    // (wienerlabs/leviathan-net#34).
-    if context
-        .accounts
-        .participant
-        .unforfeited_bond(participant_slashed_points)
-        < context.accounts.run.bond_minimum_amount
+    // (wienerlabs/leviathan-net#34). Nor is the bond a conviction that stands
+    // will take once it reaches the ledger.
+    if context.accounts.participant.unforfeited_bond_owing(
+        participant_slashed_points,
+        unledgered_conviction,
+    ) < context.accounts.run.bond_minimum_amount
     {
         return err!(ProgramError::BondBelowMinimum);
     }

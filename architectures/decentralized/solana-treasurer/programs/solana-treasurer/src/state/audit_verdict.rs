@@ -529,6 +529,34 @@ impl AuditVerdict {
                 == self.charge_epoch_start)
     }
 
+    /// What this conviction will still take from its target's bond that the
+    /// coordinator's ledger has not charged, given the epoch's
+    /// `slashing_rate`.
+    ///
+    /// A `Due` conviction reaches the ledger only once it lands in an epoch
+    /// that charges it, and the bond otherwise only at the target's
+    /// withdrawal, at the slashing rate either way. An ejection is charged
+    /// at its epoch's rate when that epoch ends, and from then on the ledger
+    /// counts it. A conviction still open to a challenge or an appeal is not
+    /// counted: it may yet be overturned, and the withdrawal hold already
+    /// keeps the bond for it.
+    pub fn unledgered_charge(
+        &self,
+        coordinator: &Coordinator,
+        slashing_rate: u64,
+    ) -> u64 {
+        match self.status {
+            VerdictStatus::Due => slashing_rate,
+            VerdictStatus::Upheld
+                if self.awaits_charge()
+                    && !self.ejection_charged(coordinator) =>
+            {
+                self.charge_rate
+            },
+            _ => 0,
+        }
+    }
+
     /// Records that the target's bond paid for the conviction, and what that
     /// forfeit owes the conviction's recipients.
     pub fn record_charge(&mut self, bounty: u64) {
@@ -1134,6 +1162,76 @@ mod tests {
             RunState::Cooldown,
         ] {
             assert!(v.ejection_charged(&at(state, 1_100)), "{state}");
+        }
+    }
+
+    /// Only a conviction that stands and has not reached the ledger is still
+    /// owed by the bond beyond what the ledger charged: one due, at the
+    /// slashing rate, and an ejection until its epoch's charge.
+    #[test]
+    fn a_standing_conviction_off_the_ledger_is_still_owed() {
+        use psyche_coordinator::RunState;
+
+        const RATE: u64 = 300;
+        let at = |run_state: RunState, start: u64| {
+            let mut coordinator =
+                Box::new(<Coordinator as bytemuck::Zeroable>::zeroed());
+            coordinator.run_state = run_state;
+            coordinator.epoch_state.start_timestamp = start;
+            coordinator
+        };
+        let running = at(RunState::RoundTrain, 1_000);
+
+        let due = verdict(VerdictStatus::Due, &voters(2));
+        assert_eq!(due.unledgered_charge(&running, RATE), RATE);
+        assert_eq!(
+            due.unledgered_charge(&at(RunState::WaitingForMembers, 1_000), RATE),
+            RATE,
+            "a due conviction is owed between epochs too"
+        );
+
+        let mut ejected = verdict(VerdictStatus::Voting, &voters(2));
+        ejected.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate: 200,
+        });
+        assert_eq!(
+            ejected.unledgered_charge(&running, RATE),
+            200,
+            "its own epoch's rate, until that epoch is charged"
+        );
+        assert_eq!(
+            ejected.unledgered_charge(&at(RunState::Cooldown, 1_000), RATE),
+            200
+        );
+        assert_eq!(
+            ejected.unledgered_charge(
+                &at(RunState::WaitingForMembers, 1_000),
+                RATE
+            ),
+            0,
+            "the ledger counts it once its epoch is charged"
+        );
+        assert_eq!(
+            ejected.unledgered_charge(&at(RunState::RoundTrain, 1_100), RATE),
+            0
+        );
+        ejected.record_charge(0);
+        assert_eq!(ejected.unledgered_charge(&running, RATE), 0);
+
+        // Open to a challenge or an appeal, overturned, or no conviction.
+        for status in [
+            VerdictStatus::Voting,
+            VerdictStatus::SlashPending,
+            VerdictStatus::Challenged,
+            VerdictStatus::Overturned,
+            VerdictStatus::Upheld,
+        ] {
+            assert_eq!(
+                verdict(status, &voters(2)).unledgered_charge(&running, RATE),
+                0,
+                "{status:?}"
+            );
         }
     }
 
