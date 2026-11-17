@@ -1,5 +1,10 @@
 [workspace]
-members = ["leviathan-multitude", "leviathan-multitude-sim"]
+members = [
+    "leviathan-multitude",
+    "leviathan-multitude-sim",
+    "leviathan-multitude-relay",
+    "leviathan-multitude-mobile",
+]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +14,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 leviathan-multitude = { path = "./leviathan-multitude" }
+leviathan-multitude-relay = { path = "./leviathan-multitude-relay" }
 psyche-verifier = { path = "../../shared/verifier" }
 candle-core = "0.11"
 candle-nn = "0.11"
@@ -21,6 +27,11 @@ sha2 = "0.10.8"
 thiserror = "2.0.3"
 anyhow = "1.0.86"
 clap = { version = "4.5.16", features = ["derive"] }
+axum = "0.8.9"
+tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "time"] }
+uniffi = "0.32.2"
+ureq = "3.5"
+getrandom = "0.3.4"
 
 [profile.dev]
 opt-level = 1

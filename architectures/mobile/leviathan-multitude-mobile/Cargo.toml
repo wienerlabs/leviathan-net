@@ -1,0 +1,37 @@
+[package]
+name = "leviathan-multitude-mobile"
+description = "The phone side of Leviathan Multitude: joins a relay's run, with Swift and Kotlin bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "multitude-phone"
+path = "src/bin/multitude-phone.rs"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+metal = ["leviathan-multitude/metal"]
+
+[dependencies]
+leviathan-multitude.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uniffi.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+leviathan-multitude-relay.workspace = true
+tokio.workspace = true

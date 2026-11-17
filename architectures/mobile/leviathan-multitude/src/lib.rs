@@ -43,6 +43,7 @@ pub mod protocol;
 pub mod rng;
 pub mod round;
 pub mod train;
+pub mod wire;
 
 pub use aggregate::{
     aggregate, verify_aggregate, AggregateClaim, AggregateFraud, Aggregation, Tally,
@@ -52,7 +53,7 @@ pub use candle_core::Device;
 pub use compress::{compress, CompressedUpdate};
 pub use config::RunConfig;
 pub use data::Corpus;
-pub use phone::{PhoneNode, RoundJob};
+pub use phone::{NodeState, PhoneNode, RoundJob};
 pub use protocol::{Contribution, ContributionHeader, ErrorReveal};
 pub use round::GlobalModel;
 

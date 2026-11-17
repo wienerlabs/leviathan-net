@@ -175,7 +175,7 @@ The protocol is live on devnet. Not there yet: the model is a test model (Nano-L
 
 ## Phones
 
-[architectures/mobile](architectures/mobile/README.md) holds Leviathan Multitude, a phone-class training run in Rust: DiLoCo local rounds, SparseLoCo sign votes, an integer tally anyone can recount bit for bit, and replay audits through the same `psyche-verifier`. It runs end to end in a simulator that catches sign-flipping, free-riding and lazy phones and a miscounting relay; it is not yet on chain or on a real phone.
+[architectures/mobile](architectures/mobile/README.md) holds Leviathan Multitude, a phone-class training run in Rust: DiLoCo local rounds, SparseLoCo sign votes, an integer tally anyone can recount bit for bit, and replay audits through the same `psyche-verifier`. It runs end to end in a simulator that catches sign-flipping, free-riding and lazy phones and a miscounting relay, and phones join a live run through an HTTP relay, from an Android app or the Swift and Kotlin bindings; it is not yet on chain or measured on a real phone.
 
 ## Lineage
 

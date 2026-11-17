@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use candle_core::Device;
 use ed25519_dalek::SigningKey;
+use serde::{Deserialize, Serialize};
 
 use crate::adversary::{jitter, Behavior};
 use crate::compress::{compress, selected_count, CompressedUpdate};
@@ -46,6 +47,13 @@ pub struct PhoneNode {
     last_round: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodeState {
+    pub error: Vec<f32>,
+    pub round_start_error: Vec<f32>,
+    pub last_round: Option<u32>,
+}
+
 impl PhoneNode {
     /// `secret` is the ed25519 seed. In the app it lives in the platform key
     /// store (Seed Vault on Solana phones, the Keychain or Keystore elsewhere).
@@ -58,6 +66,22 @@ impl PhoneNode {
             error: vec![0.0; num_params],
             round_start_error: vec![0.0; num_params],
             last_round: None,
+        }
+    }
+
+    pub fn restore(secret: [u8; 32], state: NodeState) -> Self {
+        let mut node = Self::new(secret, state.error.len());
+        node.error = state.error;
+        node.round_start_error = state.round_start_error;
+        node.last_round = state.last_round;
+        node
+    }
+
+    pub fn state(&self) -> NodeState {
+        NodeState {
+            error: self.error.clone(),
+            round_start_error: self.round_start_error.clone(),
+            last_round: self.last_round,
         }
     }
 
