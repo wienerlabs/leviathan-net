@@ -375,21 +375,19 @@ impl App {
                         }
                         _ => {
                             if ever_joined_run {
-                                let err = if latest_update.halted() {
-                                    Err(anyhow!("{}", latest_update.run_state))
-                                } else {
-                                    let me = latest_update.epoch_state.clients.iter().find(|x| x.id == id);
-                                    match me {
-                                        Some(me) => if me.state != ClientState::Healthy {
-                                            tracing::error!(id = %id, state = %me.state, "Coordinator says we're unhealthy, exiting");
-                                            Err(anyhow!("{}", me.state))
-                                        } else {
-                                            Ok(())
-                                        }
-                                        None => {
-                                            tracing::error!(id = %id, "Coordinator did not select us for the round, exiting");
-                                            Err(anyhow!("Not a participant"))
-                                        }
+                                let err = match standing(&latest_update, &id) {
+                                    // A finished run is not a halt to leave: the client
+                                    // finishes its last cooldown and stops on its own,
+                                    // and the app with it (wienerlabs/leviathan-net#82).
+                                    Standing::Training | Standing::Finished => Ok(()),
+                                    Standing::Halted(run_state) => Err(anyhow!("{run_state}")),
+                                    Standing::Unhealthy(state) => {
+                                        tracing::error!(id = %id, state = %state, "Coordinator says we're unhealthy, exiting");
+                                        Err(anyhow!("{state}"))
+                                    }
+                                    Standing::NotSelected => {
+                                        tracing::error!(id = %id, "Coordinator did not select us for the round, exiting");
+                                        Err(anyhow!("Not a participant"))
                                     }
                                 };
                                 if let Err(err) = err {
@@ -404,6 +402,9 @@ impl App {
                 }
                 res = client.finished() => {
                     res??;
+                    // The client stops on its own only once its run is over
+                    // (wienerlabs/leviathan-net#82), and then so does the app.
+                    break;
                 }
 
             }
@@ -428,5 +429,131 @@ impl App {
             tx_tui_state.send(states).await?;
         }
         Ok(())
+    }
+}
+
+/// What a run's state says a client that has joined it should do.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Standing {
+    /// The run goes on, with this client in it.
+    Training,
+    /// The run is over, with this client healthy in its roster. The client
+    /// finishes its last cooldown and stops on its own
+    /// (wienerlabs/leviathan-net#82).
+    Finished,
+    /// The run is halted short of its end: paused, or not set up.
+    Halted(RunState),
+    /// The coordinator no longer counts this client as healthy.
+    Unhealthy(ClientState),
+    /// The coordinator did not select this client for the round.
+    NotSelected,
+}
+
+fn standing(update: &Coordinator, id: &psyche_core::NodeIdentity) -> Standing {
+    let me = update
+        .epoch_state
+        .clients
+        .iter()
+        .find(|client| client.id == *id);
+    let healthy = me.is_some_and(|me| me.state == ClientState::Healthy);
+    // Only a healthy member finishes the run's last cooldown and stops on its
+    // own. A client the roster has let go never reaches it, so it is let go
+    // here as before, rather than waited for.
+    if update.run_state == RunState::Finished && healthy {
+        return Standing::Finished;
+    }
+    if update.halted() {
+        return Standing::Halted(update.run_state);
+    }
+    match me {
+        Some(me) if me.state != ClientState::Healthy => Standing::Unhealthy(me.state),
+        Some(_) => Standing::Training,
+        None => Standing::NotSelected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+    use psyche_core::NodeIdentity;
+
+    fn identity(byte: u8) -> NodeIdentity {
+        NodeIdentity::new([byte; 32], [byte; 32])
+    }
+
+    fn run(run_state: RunState, clients: &[(NodeIdentity, ClientState)]) -> Coordinator {
+        let mut coordinator = Coordinator::zeroed();
+        coordinator.run_state = run_state;
+        for (id, state) in clients {
+            coordinator
+                .epoch_state
+                .clients
+                .push(psyche_coordinator::Client {
+                    id: *id,
+                    state: *state,
+                    exited_height: 0,
+                })
+                .unwrap();
+        }
+        coordinator
+    }
+
+    #[test]
+    fn a_finished_run_is_its_healthy_members_end_and_not_a_halt() {
+        let (me, other) = (identity(1), identity(2));
+        assert_eq!(
+            standing(&run(RunState::Finished, &[(me, ClientState::Healthy)]), &me),
+            Standing::Finished
+        );
+        // A client the roster let go never finishes the run's last cooldown,
+        // so it leaves as it did before.
+        for clients in [
+            vec![],
+            vec![(other, ClientState::Healthy)],
+            vec![(me, ClientState::Withdrawn)],
+            vec![(me, ClientState::Dropped)],
+        ] {
+            assert_eq!(
+                standing(&run(RunState::Finished, &clients), &me),
+                Standing::Halted(RunState::Finished)
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_halted_short_of_its_end_is_left() {
+        let me = identity(1);
+        let clients = [(me, ClientState::Healthy)];
+        for run_state in [RunState::Paused, RunState::Uninitialized] {
+            assert_eq!(
+                standing(&run(run_state, &clients), &me),
+                Standing::Halted(run_state)
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_run_keeps_a_healthy_member_and_lets_go_of_the_rest() {
+        let (me, other) = (identity(1), identity(2));
+        for run_state in [
+            RunState::Warmup,
+            RunState::RoundTrain,
+            RunState::RoundWitness,
+            RunState::Cooldown,
+        ] {
+            assert_eq!(
+                standing(&run(run_state, &[(me, ClientState::Healthy)]), &me),
+                Standing::Training
+            );
+            assert_eq!(
+                standing(&run(run_state, &[(me, ClientState::Dropped)]), &me),
+                Standing::Unhealthy(ClientState::Dropped)
+            );
+            assert_eq!(
+                standing(&run(run_state, &[(other, ClientState::Healthy)]), &me),
+                Standing::NotSelected
+            );
+        }
     }
 }

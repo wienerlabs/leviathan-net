@@ -49,6 +49,9 @@ enum TestingQueryMsg {
     Coordinator {
         respond_to: oneshot::Sender<Coordinator>,
     },
+    TogglePause {
+        respond_to: oneshot::Sender<()>,
+    },
 }
 
 struct CoordinatorServer {
@@ -64,6 +67,7 @@ impl CoordinatorServer {
         min_clients: u16,
         global_batch_size: u16,
         witness_nodes: u16,
+        total_steps: u32,
     ) -> Self {
         let coordinator_config = CoordinatorConfig {
             warmup_time: WARMUP_TIME,
@@ -77,7 +81,7 @@ impl CoordinatorServer {
             global_batch_size_warmup_tokens: 0,
             verification_percent: 0,
             witness_nodes,
-            total_steps: 100,
+            total_steps,
             waiting_for_members_extra_time: 2,
             epoch_time: 30,
         };
@@ -164,6 +168,10 @@ impl CoordinatorServer {
                 let coordinator = self.inner.get_coordinator();
                 respond_to.send(coordinator).unwrap();
             }
+            TestingQueryMsg::TogglePause { respond_to } => {
+                self.inner.toggle_pause();
+                respond_to.send(()).unwrap();
+            }
         }
     }
 
@@ -189,6 +197,16 @@ pub struct CoordinatorServerHandle {
 
 impl CoordinatorServerHandle {
     pub async fn new(init_min_clients: u16, global_batch_size: u16, witness_nodes: u16) -> Self {
+        Self::new_with_total_steps(init_min_clients, global_batch_size, witness_nodes, 100).await
+    }
+
+    /// A server whose run ends once its step reaches `total_steps`.
+    pub async fn new_with_total_steps(
+        init_min_clients: u16,
+        global_batch_size: u16,
+        witness_nodes: u16,
+        total_steps: u32,
+    ) -> Self {
         debug!("creating coordinator server...");
         let (query_chan_sender, query_chan_receiver) = mpsc::channel(64);
 
@@ -206,6 +224,7 @@ impl CoordinatorServerHandle {
                 init_min_clients,
                 global_batch_size,
                 witness_nodes,
+                total_steps,
             ))
             .await
             .unwrap();
@@ -295,6 +314,15 @@ impl CoordinatorServerHandle {
     pub async fn get_coordinator(&self) -> Coordinator {
         let (send, recv) = oneshot::channel::<Coordinator>();
         let msg = TestingQueryMsg::Coordinator { respond_to: send };
+        let _ = self.query_chan_sender.send(msg).await;
+        recv.await.expect("Coordinator actor task has been killed")
+    }
+
+    /// Pauses the run, or resumes it if it is paused, as the server's
+    /// dashboard does.
+    pub async fn toggle_pause(&self) {
+        let (send, recv) = oneshot::channel::<()>();
+        let msg = TestingQueryMsg::TogglePause { respond_to: send };
         let _ = self.query_chan_sender.send(msg).await;
         recv.await.expect("Coordinator actor task has been killed")
     }

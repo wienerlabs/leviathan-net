@@ -386,7 +386,7 @@ impl App {
                 }
             } => {}
             _ = async { self.pause.as_ref().unwrap().notified().await }, if self.pause.is_some() => {
-                self.pause();
+                self.toggle_pause();
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -598,7 +598,8 @@ impl App {
         }
     }
 
-    fn pause(&mut self) {
+    /// Pauses the run, or resumes it if it is paused.
+    pub fn toggle_pause(&mut self) {
         if let Err(err) = match self.coordinator.run_state {
             RunState::Paused => self.coordinator.resume(Self::get_timestamp()),
             _ => self.coordinator.pause(Self::get_timestamp()),

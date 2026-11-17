@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::client::ClientHandle;
@@ -121,27 +122,43 @@ struct TestCli {
     train_args: TrainArgs,
 }
 
-#[rustfmt::skip]
 pub fn dummy_client_app_params_with_training_delay(
     server_port: u16,
     run_id: &str,
     training_delay_secs: u64,
 ) -> AppParams {
+    dummy_client_app_params(server_port, run_id, training_delay_secs, None)
+}
+
+/// A client's parameters, keeping its checkpoints in `checkpoint_dir` if one
+/// is given, without uploading them.
+#[rustfmt::skip]
+pub fn dummy_client_app_params(
+    server_port: u16,
+    run_id: &str,
+    training_delay_secs: u64,
+    checkpoint_dir: Option<&Path>,
+) -> AppParams {
+    let training_delay = training_delay_secs.to_string();
+    let mut args = vec![
+        "dummy",
+        "--run-id", run_id,
+        "--iroh-relay", "disabled",
+        "--iroh-discovery", "local",
+        "--data-parallelism", "1",
+        "--tensor-parallelism", "1",
+        "--micro-batch-size", "1",
+        "--max-concurrent-parameter-requests", "10",
+        "--hub-max-concurrent-downloads", "1",
+        "--dummy-training-delay-secs", training_delay.as_str(),
+    ];
+    let checkpoint_dir = checkpoint_dir.map(|dir| dir.to_string_lossy().into_owned());
+    if let Some(dir) = &checkpoint_dir {
+        args.extend(["--checkpoint-dir", dir.as_str()]);
+    }
     AppParams {
         cancel: CancellationToken::default(),
         server_addr: format!("localhost:{server_port}").to_string(),
-        train_args: TestCli::parse_from([
-            "dummy",
-            "--run-id", run_id,
-            "--iroh-relay", "disabled",
-            "--iroh-discovery", "local",
-            "--data-parallelism", "1",
-            "--tensor-parallelism", "1",
-            "--micro-batch-size", "1",
-            "--max-concurrent-parameter-requests", "10",
-            "--hub-max-concurrent-downloads", "1",
-            "--dummy-training-delay-secs", training_delay_secs.to_string().as_str(),
-        ])
-        .train_args,
+        train_args: TestCli::parse_from(args).train_args,
     }
 }
