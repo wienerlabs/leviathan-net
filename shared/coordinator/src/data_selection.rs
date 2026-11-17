@@ -66,6 +66,10 @@ pub fn get_batch_ids_for_round(
     let total_size = coordinator.get_target_global_batch_size(Some(round)) as u64;
     let end = start + total_size;
 
+    // A round with no trainer trains no batch. It is not a round to divide by.
+    if num_trainer_nodes == 0 {
+        return Vec::new();
+    }
     let base_size = total_size / num_trainer_nodes;
     let remainder = total_size % num_trainer_nodes;
 

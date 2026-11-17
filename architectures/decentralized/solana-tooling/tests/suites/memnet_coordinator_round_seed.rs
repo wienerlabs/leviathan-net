@@ -816,9 +816,10 @@ pub async fn the_tie_breaker_count_is_closed_once_the_seed_is_committed() {
     chain.tick(&run).await;
     let state = chain.state(&run).await;
     assert_eq!(state.coordinator.run_state, RunState::RoundTrain);
-    assert_eq!(
-        state.coordinator.current_round().unwrap().tie_breaker_tasks,
-        1,
-        "the round started with the seats set before its seed was committed"
-    );
+    assert_eq!(state.tie_breaker_nodes, 1, "the refused change left the count");
+    // The run's one client is its one trainer, so the round leaves it free
+    // and seats no tie-breaker (`Coordinator::seat_tie_breakers`).
+    let round = state.coordinator.current_round().unwrap();
+    assert_eq!(round.clients_len, 1);
+    assert_eq!(round.tie_breaker_tasks, 0);
 }

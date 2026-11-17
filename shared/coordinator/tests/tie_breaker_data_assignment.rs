@@ -16,6 +16,7 @@ use psyche_coordinator::ClientState;
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::Coordinator;
 use psyche_coordinator::assign_data_for_state;
+use psyche_coordinator::get_batch_ids_for_round;
 use psyche_core::FixedVec;
 use psyche_core::NodeIdentity;
 
@@ -85,16 +86,31 @@ fn reserving_tie_breaker_seats_just_leaves_them_out_of_the_data() {
 }
 
 /// A program running an appeals court seats its bench in each round as the
-/// round starts, and never more seats than the round's roster: a draw with
-/// more seats than clients cannot be made, and every witness would be refused.
+/// round starts, and always leaves a seat to train: a bench as large as the
+/// roster would leave no trainer for the round's batch.
 #[test]
-fn a_round_seats_its_tie_breakers_up_to_its_roster() {
+fn a_round_seats_its_tie_breakers_and_keeps_a_trainer() {
     let mut coordinator = coordinator_with(0);
     coordinator.seat_tie_breakers(3);
     assert_eq!(coordinator.current_round().unwrap().tie_breaker_tasks, 3);
-    coordinator.seat_tie_breakers(20);
-    assert_eq!(coordinator.current_round().unwrap().tie_breaker_tasks, 8);
-    assert!(CommitteeSelection::from_coordinator(&coordinator, 0).is_ok());
+    for bench in [8, 20] {
+        coordinator.seat_tie_breakers(bench);
+        assert_eq!(coordinator.current_round().unwrap().tie_breaker_tasks, 7);
+        let selection = CommitteeSelection::from_coordinator(&coordinator, 0).unwrap();
+        assert_eq!(selection.get_num_trainer_nodes(), 1);
+        let round = coordinator.current_round().unwrap();
+        assert!(!get_batch_ids_for_round(round, &coordinator, 1).is_empty());
+        assert!(!assign_data_for_state(&coordinator, &selection).is_empty());
+    }
+}
+
+/// A round with no trainer, which a run that verifies every seat still
+/// draws, assigns no batch rather than dividing the batch by none.
+#[test]
+fn a_round_with_no_trainer_divides_nothing() {
+    let coordinator = coordinator_with(0);
+    let round = coordinator.current_round().unwrap();
+    assert!(get_batch_ids_for_round(round, &coordinator, 0).is_empty());
 }
 
 /// The audit lottery draws the round the way its clients draw it, with the
