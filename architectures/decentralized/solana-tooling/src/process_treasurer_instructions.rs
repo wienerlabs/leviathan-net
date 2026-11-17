@@ -608,9 +608,16 @@ pub async fn process_treasurer_run_set_challenge_config(
     tie_breaker_committee_size: u16,
     appeal_window_seconds: i64,
 ) -> Result<()> {
+    // The bench size is carried into the coordinator, which the run drives.
+    let run_state = get_run(endpoint, run)
+        .await?
+        .ok_or_else(|| anyhow!("run {run} not found"))?;
     let accounts = RunSetChallengeConfigAccounts {
         main_authority: main_authority.pubkey(),
         run: *run,
+        coordinator_instance: run_state.coordinator_instance,
+        coordinator_account: run_state.coordinator_account,
+        coordinator_program: psyche_solana_coordinator::ID,
     };
     let instruction = Instruction {
         accounts: accounts.to_account_metas(None),

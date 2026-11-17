@@ -20,6 +20,7 @@ use psyche_solana_coordinator::instruction::JoinRun;
 use psyche_solana_coordinator::instruction::SetFutureEpochRates;
 use psyche_solana_coordinator::SlashClientParams;
 use psyche_solana_coordinator::instruction::SetPaused;
+use psyche_solana_coordinator::instruction::SetTieBreakerNodes;
 use psyche_solana_coordinator::instruction::SlashClient;
 use psyche_solana_coordinator::instruction::Tick;
 use psyche_solana_coordinator::instruction::Update;
@@ -164,6 +165,32 @@ pub async fn process_coordinator_set_paused(
     let instruction = Instruction {
         accounts: accounts.to_account_metas(None),
         data: SetPaused { paused }.data(),
+        program_id: psyche_solana_coordinator::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[authority])
+        .await?;
+    Ok(())
+}
+
+/// The run's authority sets how many tie-breaker seats each round reserves,
+/// from the next round to start.
+pub async fn process_coordinator_set_tie_breaker_nodes(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    authority: &Keypair,
+    coordinator_instance: &Pubkey,
+    coordinator_account: &Pubkey,
+    tie_breaker_nodes: u16,
+) -> Result<()> {
+    let accounts = OwnerCoordinatorAccounts {
+        authority: authority.pubkey(),
+        coordinator_instance: *coordinator_instance,
+        coordinator_account: *coordinator_account,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: SetTieBreakerNodes { tie_breaker_nodes }.data(),
         program_id: psyche_solana_coordinator::ID,
     };
     endpoint

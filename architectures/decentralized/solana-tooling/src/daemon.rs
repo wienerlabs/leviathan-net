@@ -33,7 +33,6 @@ use tch::Device;
 
 use crate::daemon_equivocation::EquivocationPass;
 use crate::get_accounts::get_coordinator_account_state;
-use crate::get_accounts::get_run;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use crate::verdict_votes::settle_open_disputes;
@@ -70,10 +69,7 @@ pub fn parse_committer(path: &Path) -> Option<String> {
 
 /// The contributions this round's committee assigns for audit, as the committer
 /// named in a dump and the batch it trained.
-fn audit_assignments(
-    coordinator: &Coordinator,
-    tie_breaker_committee_size: u16,
-) -> HashSet<(String, BatchId)> {
+fn audit_assignments(coordinator: &Coordinator) -> HashSet<(String, BatchId)> {
     // In a warmup, or once the roster has moved under the last round's draw,
     // no committee stands over the roster. Drawing one over it anyway indexes
     // past the round it was drawn for.
@@ -84,10 +80,9 @@ fn audit_assignments(
         );
         return HashSet::new();
     }
-    match select_audits_for_current_round(
-        coordinator,
-        tie_breaker_committee_size,
-    ) {
+    // Drawn with the tie-breaker seats the round reserves, as the round's
+    // clients and the treasurer draw it (wienerlabs/leviathan#15, finding 4).
+    match select_audits_for_current_round(coordinator) {
         Ok(audits) => audits
             .iter()
             // The full signer, as the dump names carry it (finding 20).
@@ -237,15 +232,6 @@ pub async fn audit_pass(
     // submitted again on the next pass.
     judged: &mut HashSet<String>,
 ) -> Result<PassReport> {
-    // The tie-breaker count comes from the run, because that is what the
-    // treasurer gates votes with. Deriving it any other way picks a different
-    // verifier set and every verdict is refused as `VerifierNotAssigned`
-    // (wienerlabs/leviathan#15, finding 4).
-    let tie_breaker_committee_size = get_run(endpoint, run)
-        .await?
-        .ok_or_else(|| anyhow!("run {} not found", run))?
-        .tie_breaker_committee_size;
-
     let state = get_coordinator_account_state(endpoint, coordinator_account)
         .await?
         .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
@@ -255,7 +241,7 @@ pub async fn audit_pass(
 
     let assigned = config
         .audit_assigned
-        .then(|| audit_assignments(coordinator, tie_breaker_committee_size));
+        .then(|| audit_assignments(coordinator));
 
     let submitted = index_dir(&config.submitted_dir)?;
     let reference = match &config.reference_dir {

@@ -14,7 +14,6 @@ use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::RunState;
 use psyche_core::payload_commitment_run;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use psyche_solana_tooling::process_treasurer_instructions::run_slash_instruction;
 use psyche_solana_tooling::process_treasurer_instructions::run_submit_audit_verdict_instruction;
@@ -383,12 +382,12 @@ pub async fn no_payload_is_assigned_in_a_warmup() {
     let coordinator = harness.state().await.coordinator;
     let identity = harness.nodes[SUBJECT].identity();
     assert!(
-        signed_commitment::payload_header(&coordinator, 0, &identity).is_err()
+        signed_commitment::payload_header(&coordinator, &identity).is_err()
     );
     harness.advance_to(RunState::RoundTrain).await;
     let coordinator = harness.state().await.coordinator;
     assert!(
-        signed_commitment::payload_header(&coordinator, 0, &identity).is_ok()
+        signed_commitment::payload_header(&coordinator, &identity).is_ok()
     );
 }
 
@@ -413,18 +412,8 @@ async fn committee_run(index: u64, run_id: &str) -> Harness {
 
 /// The verifiers and the trainers drawn for the round under way.
 async fn committee(harness: &mut Harness) -> (Vec<usize>, Vec<usize>) {
-    let tie_breakers = get_run(&mut harness.endpoint, &harness.run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     let coordinator = harness.state().await.coordinator;
-    let selection = CommitteeSelection::from_coordinator_with_tie_breakers(
-        &coordinator,
-        0,
-        tie_breakers,
-    )
-    .unwrap();
+    let selection = CommitteeSelection::from_coordinator(&coordinator, 0).unwrap();
     let (mut verifiers, mut trainers) = (vec![], vec![]);
     for node in harness.roster().await {
         let index = harness.roster_index(node).await;

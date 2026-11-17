@@ -83,3 +83,37 @@ fn reserving_tie_breaker_seats_just_leaves_them_out_of_the_data() {
         .sum();
     assert_eq!(total, 64, "the whole global batch is still assigned");
 }
+
+/// A program running an appeals court seats its bench in each round as the
+/// round starts, and never more seats than the round's roster: a draw with
+/// more seats than clients cannot be made, and every witness would be refused.
+#[test]
+fn a_round_seats_its_tie_breakers_up_to_its_roster() {
+    let mut coordinator = coordinator_with(0);
+    coordinator.seat_tie_breakers(3);
+    assert_eq!(coordinator.current_round().unwrap().tie_breaker_tasks, 3);
+    coordinator.seat_tie_breakers(20);
+    assert_eq!(coordinator.current_round().unwrap().tie_breaker_tasks, 8);
+    assert!(CommitteeSelection::from_coordinator(&coordinator, 0).is_ok());
+}
+
+/// The audit lottery draws the round the way its clients draw it, with the
+/// seats the round reserves: every audit names a batch its target was
+/// assigned, and no tie-breaker seat audits or is audited.
+#[test]
+fn the_audit_lottery_draws_the_round_its_clients_train() {
+    let mut coordinator = coordinator_with(0);
+    coordinator.config.verification_percent = 50;
+    coordinator.seat_tie_breakers(2);
+    let selection = CommitteeSelection::from_coordinator(&coordinator, 0).unwrap();
+    let trained = assign_data_for_state(&coordinator, &selection);
+    let audits = psyche_coordinator::select_audits_for_current_round(&coordinator).unwrap();
+    assert!(!audits.is_empty());
+    for audit in &audits {
+        assert_eq!(trained.get(&audit.batch_id), Some(&audit.target));
+        assert_eq!(
+            selection.get_committee(audit.verifier_index).committee,
+            psyche_coordinator::Committee::Verifier
+        );
+    }
+}

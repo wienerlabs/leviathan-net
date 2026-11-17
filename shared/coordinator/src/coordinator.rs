@@ -901,6 +901,20 @@ impl Coordinator {
             .get(self.epoch_state.rounds_head as usize)
     }
 
+    /// Reserves `tie_breaker_nodes` tie-breaker seats in the round under way,
+    /// as many as its roster has at most: a draw cannot seat more.
+    ///
+    /// A run's appeals court sizes its bench, but the coordinator draws the
+    /// rounds and starts each with none reserved. A program that runs one sets
+    /// the count on each round as it starts, before anyone draws it, so the
+    /// clients that train, the audit lottery and the treasurer all draw the
+    /// same committee from the round (wienerlabs/leviathan#15, finding 4).
+    pub fn seat_tie_breakers(&mut self, tie_breaker_nodes: u16) {
+        if let Some(round) = self.current_round_mut() {
+            round.tie_breaker_tasks = tie_breaker_nodes.min(round.clients_len);
+        }
+    }
+
     pub fn current_round_mut(&mut self) -> Option<&mut Round> {
         self.epoch_state
             .rounds

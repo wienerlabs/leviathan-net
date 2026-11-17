@@ -38,7 +38,6 @@ use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
-use psyche_solana_tooling::get_accounts::get_run;
 use solana_sdk::signer::Signer;
 
 use super::signed_payload::fixture;
@@ -308,14 +307,8 @@ pub async fn run() {
         .iter()
         .position(|k| k.pubkey() == target_key)
         .unwrap();
-    let tie_breakers = get_run(&mut endpoint, &run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     let header = payload_header(
         &state.coordinator,
-        tie_breakers,
         &identity(&clients[target], &p2ps[target]),
     );
     // The run every commitment here is made in, as the coordinator names it.

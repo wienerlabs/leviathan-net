@@ -12,7 +12,6 @@ use leviathan_verifier::contribution_key;
 use psyche_coordinator::RunState;
 use psyche_solana_tooling::daemon::audit_pass;
 use psyche_solana_tooling::daemon::AuditConfig;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::PayloadHeader;
 use solana_sdk::signer::Signer;
 
@@ -52,16 +51,10 @@ async fn kept_fraud_naming(
     tag: &str,
     header_of: impl Fn(PayloadHeader) -> PayloadHeader,
 ) -> (AuditConfig, String) {
-    let tie_breakers = get_run(&mut harness.endpoint, &harness.run)
-        .await
-        .unwrap()
-        .expect("the run exists")
-        .tie_breaker_committee_size;
     let coordinator = harness.state().await.coordinator;
     let subject = &harness.nodes[SUBJECT];
     let header = header_of(payload_header(
         &coordinator,
-        tie_breakers,
         &subject.identity(),
     ));
     let run_id = String::from(&coordinator.run_id);

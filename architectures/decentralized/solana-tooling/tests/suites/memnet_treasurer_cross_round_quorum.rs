@@ -66,7 +66,6 @@ use solana_toolbox_endpoint::ToolboxEndpoint;
 use std::collections::HashSet;
 
 use psyche_solana_tooling::get_accounts::get_participant;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::verdict_votes::settle_previous_dispute;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::state::Participant;
@@ -317,14 +316,8 @@ pub async fn votes_from_different_committees_do_not_add_up() {
         .iter()
         .position(|k| k.pubkey() == target_key)
         .unwrap();
-    let tie_breakers = get_run(&mut endpoint, &run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     let commitment = signed_payload(
         &state.coordinator,
-        tie_breakers,
         &identity(&clients[target_node], &p2ps[target_node]),
         &p2ps[target_node],
         FRAUD_PAYLOAD,

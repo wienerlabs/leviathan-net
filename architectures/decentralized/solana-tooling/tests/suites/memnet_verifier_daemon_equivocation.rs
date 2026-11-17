@@ -13,7 +13,6 @@ use psyche_coordinator::RunState;
 use psyche_solana_tooling::daemon::audit_pass;
 use psyche_solana_tooling::daemon::AuditConfig;
 use psyche_solana_tooling::daemon_equivocation::equivocation_key;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::PayloadHeader;
 use psyche_solana_treasurer::state::VerdictStatus;
 use solana_sdk::signature::Keypair;
@@ -63,15 +62,9 @@ async fn kept_payloads_naming(
         coordinator_state(&mut h.endpoint, &h.coordinator_account)
             .await
             .coordinator;
-    let tie_breakers = get_run(&mut h.endpoint, &h.run)
-        .await
-        .unwrap()
-        .expect("the run exists")
-        .tie_breaker_committee_size;
     let target = &h.clients[h.target_client_idx];
     let header = header_of(payload_header(
         &coordinator,
-        tie_breakers,
         &identity(target, &h.p2ps[h.target_client_idx]),
     ));
     let dir = scratch(tag);

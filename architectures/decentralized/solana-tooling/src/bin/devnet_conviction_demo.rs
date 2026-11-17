@@ -24,7 +24,6 @@ use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_participant;
 use psyche_solana_tooling::get_accounts::ensure_coordinator_version;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::payload_dump_digest;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
@@ -307,10 +306,6 @@ async fn main() -> Result<()> {
     let cheater_key = clients[cheater].pubkey().to_bytes();
     let mut slashed_done = false;
     let mut stranger_tried = false;
-    let tie_breaker_committee_size = get_run(&mut endpoint, &run)
-        .await?
-        .ok_or_else(|| anyhow!("run {run} not found"))?
-        .tie_breaker_committee_size;
     for step in 0..60 {
         let state = get_coordinator_account_state(&mut endpoint, &coordinator_account)
             .await
@@ -337,7 +332,6 @@ async fn main() -> Result<()> {
             NodeIdentity::new(cheater_key, p2ps[cheater].pubkey().to_bytes());
         let signed = SignedCommitment::for_round(
             &state.coordinator,
-            tie_breaker_committee_size,
             &cheater_identity,
             &p2ps[cheater],
             cheater_payload,

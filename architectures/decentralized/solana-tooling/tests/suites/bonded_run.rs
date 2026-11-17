@@ -22,7 +22,6 @@ use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::get_accounts::get_authorization;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::get_participant;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick_and_reveal;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
@@ -689,15 +688,9 @@ impl Harness {
     /// What `node` signed for the cheating payload it broadcast in the round
     /// under way.
     pub async fn signed_payload(&mut self, node: usize) -> SignedCommitment {
-        let tie_breakers = get_run(&mut self.endpoint, &self.run)
-            .await
-            .unwrap()
-            .unwrap()
-            .tie_breaker_committee_size;
         let coordinator = self.state().await.coordinator;
         signed_payload(
             &coordinator,
-            tie_breakers,
             &self.nodes[node].identity(),
             &self.nodes[node].p2p,
             FRAUD_PAYLOAD,

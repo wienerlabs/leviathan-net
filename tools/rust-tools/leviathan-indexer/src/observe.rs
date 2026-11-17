@@ -134,16 +134,18 @@ pub struct CommitteeView {
 }
 
 /// The committee of the round under way, sized over the roster the round was
-/// drawn over (`round.clients_len`), as the treasurer sizes it. With none
-/// standing over the roster, in a warmup or once the roster moved under the
-/// draw, the next draw's over the clients still healthy, and between epochs
-/// over the smallest roster an epoch starts with.
+/// drawn over (`round.clients_len`) with the tie-breaker seats the round
+/// reserves, as the treasurer sizes it. With none standing over the roster, in
+/// a warmup or once the roster moved under the draw, the next draw's over the
+/// clients still healthy, and between epochs over the smallest roster an epoch
+/// starts with; the next draw reserves `tie_breakers` seats, the count the
+/// coordinator carries into the rounds it starts.
 pub fn committee(coordinator: &Coordinator, tie_breakers: u16) -> CommitteeView {
     let drawn = is_training(coordinator) && committee_matches_roster(coordinator);
-    let roster = match coordinator.current_round() {
-        Some(round) if drawn => round.clients_len as usize,
-        _ if is_training(coordinator) => healthy_clients(coordinator),
-        _ => coordinator.config.min_clients as usize,
+    let (roster, tie_breakers) = match coordinator.current_round() {
+        Some(round) if drawn => (round.clients_len as usize, round.tie_breaker_tasks),
+        _ if is_training(coordinator) => (healthy_clients(coordinator), tie_breakers),
+        _ => (coordinator.config.min_clients as usize, tie_breakers),
     };
     CommitteeView {
         size: verifier_committee_size(coordinator, roster, tie_breakers),
@@ -164,8 +166,7 @@ pub fn treasurer_security(state: &CoordinatorInstanceState, run: &Run) -> Securi
         state.clients_state.current_epoch_rates,
         state.clients_state.future_epoch_rates,
     );
-    let convicting =
-        committee(coordinator, run.tie_breaker_committee_size).size >= MIN_VERIFIER_COMMITTEE;
+    let convicting = committee(coordinator, state.tie_breaker_nodes).size >= MIN_VERIFIER_COMMITTEE;
     let probability = if convicting {
         audit_probability(coordinator)
     } else {
@@ -219,7 +220,7 @@ fn observe_treasurer(
         state.clients_state.current_epoch_rates,
         state.clients_state.future_epoch_rates,
     );
-    let committee = committee(coordinator, run.tie_breaker_committee_size);
+    let committee = committee(coordinator, state.tie_breaker_nodes);
     let earned: u64 = state
         .clients_state
         .clients

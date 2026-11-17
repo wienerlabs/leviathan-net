@@ -121,7 +121,6 @@ pub fn run_submit_audit_verdict_processor(
     params: RunSubmitAuditVerdictParams,
 ) -> Result<()> {
     let verifier_key = context.accounts.verifier.key();
-    let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
     let (
         current_epoch,
@@ -162,9 +161,11 @@ pub fn run_submit_audit_verdict_processor(
             .position(|client| *client.id.signer() == verifier_key.to_bytes())
             .ok_or_else(|| error!(ProgramError::VerifierNotInEpoch))?;
 
-        let selection =
-            CommitteeSelection::from_coordinator_with_tie_breakers(coordinator, 0, tie_breaker_size)
-                .map_err(|_| error!(ProgramError::VerifierNotAssigned))?;
+        // The round's own draw, with the tie-breaker seats it reserves, which
+        // is the committee its clients train under and the audit lottery
+        // assigns from (wienerlabs/leviathan#15, finding 4).
+        let selection = CommitteeSelection::from_coordinator(coordinator, 0)
+            .map_err(|_| error!(ProgramError::VerifierNotAssigned))?;
         if selection.get_committee(verifier_index as u64).committee != Committee::Verifier {
             return err!(ProgramError::VerifierNotAssigned);
         }
