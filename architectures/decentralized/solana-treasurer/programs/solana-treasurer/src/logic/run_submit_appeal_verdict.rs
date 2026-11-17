@@ -83,7 +83,6 @@ pub fn run_submit_appeal_verdict_processor(
     params: RunSubmitAppealVerdictParams,
 ) -> Result<()> {
     let appellate_key = context.accounts.appellate.key();
-    let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
 
     let (quorum, landing, ejection) = {
         let account = context.accounts.coordinator_account.load()?;
@@ -115,9 +114,11 @@ pub fn run_submit_appeal_verdict_processor(
             .position(|client| *client.id.signer() == appellate_key.to_bytes())
             .ok_or_else(|| error!(ProgramError::VerifierNotInEpoch))?;
 
-        let selection =
-            CommitteeSelection::from_coordinator_with_tie_breakers(coordinator, 0, tie_breaker_size)
-                .map_err(|_| error!(ProgramError::NotTieBreaker))?;
+        // The round's own draw, with the tie-breaker seats it reserves, which
+        // is the committee its clients train under and the audit lottery
+        // assigns from (wienerlabs/leviathan#15, finding 4).
+        let selection = CommitteeSelection::from_coordinator(coordinator, 0)
+            .map_err(|_| error!(ProgramError::NotTieBreaker))?;
         if selection.get_committee(appellate_index as u64).committee != Committee::TieBreaker {
             return err!(ProgramError::NotTieBreaker);
         }

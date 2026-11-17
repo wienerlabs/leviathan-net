@@ -26,7 +26,6 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::ensure_coordinator_version;
 use psyche_solana_tooling::get_accounts::get_participant;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::verdict_votes::process_treasurer_run_slash_losing_verifier;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_tooling::signed_commitment::payload_dump_digest;
@@ -361,12 +360,9 @@ async fn run() -> Result<()> {
         .await
         .unwrap()
         .unwrap();
-    let selection = CommitteeSelection::from_coordinator_with_tie_breakers(
-        &state.coordinator,
-        0,
-        TIE_BREAKER_SIZE,
-    )
-    .unwrap();
+    // The round's own draw: the run set its bench before the round started,
+    // so the round reserves those seats, as its clients draw it.
+    let selection = CommitteeSelection::from_coordinator(&state.coordinator, 0).unwrap();
     let verifier_quorum = (2 * selection.get_num_verifier_nodes()).div_ceil(3).max(1);
     let tie_breaker_quorum = (2 * selection.get_num_tie_breaker_nodes()).div_ceil(3).max(1);
 
@@ -433,13 +429,8 @@ async fn run() -> Result<()> {
         .iter()
         .position(|k| k.pubkey() == target_key)
         .ok_or_else(|| anyhow!("target keypair not found"))?;
-    let tie_breaker_committee_size = get_run(&mut endpoint, &run)
-        .await?
-        .ok_or_else(|| anyhow!("run {run} not found"))?
-        .tie_breaker_committee_size;
     let signed = SignedCommitment::for_round(
         &state.coordinator,
-        tie_breaker_committee_size,
         &NodeIdentity::new(
             target_key.to_bytes(),
             p2ps[target_node].pubkey().to_bytes(),

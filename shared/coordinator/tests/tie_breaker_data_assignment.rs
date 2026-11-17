@@ -16,6 +16,7 @@ use psyche_coordinator::ClientState;
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::Coordinator;
 use psyche_coordinator::assign_data_for_state;
+use psyche_coordinator::get_batch_ids_for_round;
 use psyche_core::FixedVec;
 use psyche_core::NodeIdentity;
 
@@ -82,4 +83,53 @@ fn reserving_tie_breaker_seats_just_leaves_them_out_of_the_data() {
         .map(|batch| batch.0.end - batch.0.start + 1)
         .sum();
     assert_eq!(total, 64, "the whole global batch is still assigned");
+}
+
+/// A program running an appeals court seats its bench in each round as the
+/// round starts, and always leaves a seat to train: a bench as large as the
+/// roster would leave no trainer for the round's batch.
+#[test]
+fn a_round_seats_its_tie_breakers_and_keeps_a_trainer() {
+    let mut coordinator = coordinator_with(0);
+    coordinator.seat_tie_breakers(3);
+    assert_eq!(coordinator.current_round().unwrap().tie_breaker_tasks, 3);
+    for bench in [8, 20] {
+        coordinator.seat_tie_breakers(bench);
+        assert_eq!(coordinator.current_round().unwrap().tie_breaker_tasks, 7);
+        let selection = CommitteeSelection::from_coordinator(&coordinator, 0).unwrap();
+        assert_eq!(selection.get_num_trainer_nodes(), 1);
+        let round = coordinator.current_round().unwrap();
+        assert!(!get_batch_ids_for_round(round, &coordinator, 1).is_empty());
+        assert!(!assign_data_for_state(&coordinator, &selection).is_empty());
+    }
+}
+
+/// A round with no trainer, which a run that verifies every seat still
+/// draws, assigns no batch rather than dividing the batch by none.
+#[test]
+fn a_round_with_no_trainer_divides_nothing() {
+    let coordinator = coordinator_with(0);
+    let round = coordinator.current_round().unwrap();
+    assert!(get_batch_ids_for_round(round, &coordinator, 0).is_empty());
+}
+
+/// The audit lottery draws the round the way its clients draw it, with the
+/// seats the round reserves: every audit names a batch its target was
+/// assigned, and no tie-breaker seat audits or is audited.
+#[test]
+fn the_audit_lottery_draws_the_round_its_clients_train() {
+    let mut coordinator = coordinator_with(0);
+    coordinator.config.verification_percent = 50;
+    coordinator.seat_tie_breakers(2);
+    let selection = CommitteeSelection::from_coordinator(&coordinator, 0).unwrap();
+    let trained = assign_data_for_state(&coordinator, &selection);
+    let audits = psyche_coordinator::select_audits_for_current_round(&coordinator).unwrap();
+    assert!(!audits.is_empty());
+    for audit in &audits {
+        assert_eq!(trained.get(&audit.batch_id), Some(&audit.target));
+        assert_eq!(
+            selection.get_committee(audit.verifier_index).committee,
+            psyche_coordinator::Committee::Verifier
+        );
+    }
 }

@@ -404,12 +404,10 @@ pub(super) async fn setup_sized(
             .await
             .unwrap()
             .unwrap();
-    let selection = CommitteeSelection::from_coordinator_with_tie_breakers(
-        &state.coordinator,
-        0,
-        TIE_BREAKER_SIZE,
-    )
-    .unwrap();
+    // The round's own draw: the run set its bench size before the round
+    // started, so the round reserves those seats for everyone.
+    let selection =
+        CommitteeSelection::from_coordinator(&state.coordinator, 0).unwrap();
     let verifier_quorum =
         (2 * selection.get_num_verifier_nodes()).div_ceil(3).max(1);
     let tie_breaker_quorum = (2 * selection.get_num_tie_breaker_nodes())
@@ -451,7 +449,6 @@ pub(super) async fn setup_sized(
         target.expect("no trainer target found");
     let target_commitment = signed_payload(
         &state.coordinator,
-        TIE_BREAKER_SIZE,
         &identity(&clients[target_client_idx], &p2ps[target_client_idx]),
         &p2ps[target_client_idx],
         FRAUD_PAYLOAD,
@@ -929,18 +926,10 @@ impl AppealsHarness {
         .await
         .unwrap()
         .unwrap();
-        // The tie-breaker count is the run's, as the treasurer reads it.
-        let tie_breakers = get_run(&mut self.endpoint, &self.run)
-            .await
-            .unwrap()
-            .unwrap()
-            .tie_breaker_committee_size;
-        let selection = CommitteeSelection::from_coordinator_with_tie_breakers(
-            &state.coordinator,
-            0,
-            tie_breakers,
-        )
-        .unwrap();
+        // The round's own draw, as its clients, the audit lottery and the
+        // treasurer all draw it.
+        let selection =
+            CommitteeSelection::from_coordinator(&state.coordinator, 0).unwrap();
         let mut committee = CommitteeNow {
             verifiers: vec![],
             tie_breakers: vec![],
@@ -1033,14 +1022,8 @@ impl AppealsHarness {
         .await
         .unwrap()
         .unwrap();
-        let tie_breakers = get_run(&mut self.endpoint, &self.run)
-            .await
-            .unwrap()
-            .unwrap()
-            .tie_breaker_committee_size;
         signed_payload(
             &state.coordinator,
-            tie_breakers,
             &identity(&self.clients[client_idx], &self.p2ps[client_idx]),
             &self.p2ps[client_idx],
             FRAUD_PAYLOAD,

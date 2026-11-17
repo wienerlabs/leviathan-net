@@ -48,13 +48,21 @@ strictly more expensive than buying the original committee. This is the appeals
 court a court system already uses: you can appeal once, to a bigger bench.
 
 Cost as built: this was the largest change, but smaller than feared. It delays
-finalisation and adds a second-level quorum, but it did not touch the coordinator.
-The `TieBreaker` committee is already a first-class arm of the coordinator's
-`CommitteeSelection` lottery; only `start_round_train` never populated a non-zero
-count. Rather than migrate the coordinator's zero-copy state, the treasurer draws
-its own selection with `from_coordinator_with_tie_breakers`, overriding the
-tie-breaker count from a per-run config (`tie_breaker_committee_size`). One
-selection partitions a round into disjoint tie-breaker / verifier / trainer sets.
+finalisation and adds a second-level quorum. The `TieBreaker` committee is
+already a first-class arm of the coordinator's `CommitteeSelection` lottery; only
+`start_round_train` never populated a non-zero count. The treasurer first drew
+its own selection with the per-run count (`tie_breaker_committee_size`) and left
+the coordinator's rounds at zero. The clients, though, train what the round's
+own draw assigns them, so the treasurer's verifiers were not the clients', and
+every audit the lottery handed out named a batch its target never trained
+(wienerlabs/leviathan#15, finding 4). Now `run_set_challenge_config` carries
+the count into the coordinator (`set_tie_breaker_nodes`), which seats it in
+every round it starts (`Round::tie_breaker_tasks`), and everyone draws the
+round as it is: the clients, the audit lottery and the treasurer. The count
+sits in what was alignment padding in the coordinator's account, so no field
+moved. It is refused while a round's seed is committed, since the count moves
+the verifier seats and the committed slot's hash is about to be known. One
+selection partitions each round into disjoint tie-breaker / verifier / trainer sets.
 An appeal is judged over many rounds, each drawn afresh, so disjointness within
 one draw is not enough: the treasurer also refuses an appeal vote from a verifier
 who voted on the verdict (`AppellateVotedOnVerdict`) and from the target itself

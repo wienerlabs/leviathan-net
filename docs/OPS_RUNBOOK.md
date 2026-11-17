@@ -240,6 +240,18 @@ An older, shorter account does not deserialize with the new layout, so the treas
   - `run-manager bond-withdraw-finalize` does both for every seat the wallet is owed before it withdraws, whether or not the wallet still has a vote open.
 - **A slash no verdict accounts for.** A `run_slash`, or an equivocation, still pays its bounty to a reporter that the withdrawal names. `bond-withdraw-finalize` asks for it with `--reporter <WALLET>` when the settlement owes one, and refuses to send without it.
 
+The appeals bench size now reaches the coordinator (wienerlabs/leviathan#15,
+finding 4). `run_set_challenge_config` names the coordinator's accounts and
+calls its new `set_tie_breaker_nodes`, which reserves the seats in every round
+from the next one to start. Upgrade the coordinator program before the
+treasurer: a treasurer on the new build cannot set a bench on a coordinator
+without the instruction. Neither account changes size or moves a field (the
+count sits in what was padding before `seed_commit_slot`, and an older account
+reads zero there), so both upgrade in place. A run that already has a bench has
+to send `run_set_challenge_config` once more after the upgrade, or its rounds
+keep reserving none. The call is refused while a round's seed is committed
+(`RoundSeedCommitted`); send it again a slot later.
+
 ## Going to mainnet
 
 Mainnet arrives in two stages, because the audit gates money and nothing else.

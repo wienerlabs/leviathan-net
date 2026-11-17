@@ -470,6 +470,31 @@ fn the_committee_is_the_one_the_round_drew_and_the_next_draw_without_one() {
     );
 }
 
+/// A drawn round is sized with the tie-breaker seats it reserves, whatever
+/// the next draw will reserve; the next draw is sized with the count the
+/// coordinator carries into it.
+#[test]
+fn the_committee_counts_the_tie_breaker_seats_of_its_own_draw() {
+    use leviathan_indexer::observe::committee;
+    let state = state();
+    let head = state.coordinator.epoch_state.rounds_head as usize;
+    let drawn = committee(&state.coordinator, 0).size;
+    let mut reserving = state.coordinator;
+    reserving.epoch_state.rounds[head].tie_breaker_tasks = 2;
+    assert!(
+        committee(&reserving, 0).size < drawn,
+        "the round's own tie-breaker seats come out of the verifiers"
+    );
+    assert_eq!(
+        committee(&state.coordinator, 2).size,
+        drawn,
+        "the next draw's count does not change a round already drawn"
+    );
+    let mut warmup = state.coordinator;
+    warmup.run_state = RunState::Warmup;
+    assert!(committee(&warmup, 2).size < committee(&warmup, 0).size);
+}
+
 #[test]
 fn a_committee_too_small_to_convict_audits_nobody() {
     let mut state = state();

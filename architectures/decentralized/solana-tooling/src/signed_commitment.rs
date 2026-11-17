@@ -96,11 +96,11 @@ pub struct PayloadHeader {
 
 /// Which work a payload of `node` from the round the coordinator is in is:
 /// the epoch and the step trained there, the trainer's nonce, and the batch
-/// the coordinator assigned `node` in that round. The committee is drawn with
-/// the run's `tie_breaker_committee_size`, as the treasurer draws it.
+/// the coordinator assigned `node` in that round. The committee is the
+/// round's own draw, with the tie-breaker seats it reserves, as the clients
+/// and the treasurer draw it.
 pub fn payload_header(
     coordinator: &Coordinator,
-    tie_breaker_committee_size: u16,
     node: &NodeIdentity,
 ) -> Result<PayloadHeader> {
     // Batches are assigned by the committee drawn for the round, over the
@@ -112,12 +112,8 @@ pub fn payload_header(
             coordinator.run_state
         ));
     }
-    let selection = CommitteeSelection::from_coordinator_with_tie_breakers(
-        coordinator,
-        0,
-        tie_breaker_committee_size,
-    )
-    .map_err(|err| anyhow!("the round has no committee: {err:?}"))?;
+    let selection = CommitteeSelection::from_coordinator(coordinator, 0)
+        .map_err(|err| anyhow!("the round has no committee: {err:?}"))?;
     let batch = assign_data_for_state(coordinator, &selection)
         .into_iter()
         .find_map(|(batch, trainer)| (trainer == *node).then_some(batch))
@@ -182,7 +178,6 @@ impl SignedCommitment {
     /// `results_digest`.
     pub fn for_round(
         coordinator: &Coordinator,
-        tie_breaker_committee_size: u16,
         node: &NodeIdentity,
         p2p: &Keypair,
         results_digest: [u8; 32],
@@ -190,8 +185,7 @@ impl SignedCommitment {
         if node.p2p_identity() != &p2p.pubkey().to_bytes() {
             return Err(anyhow!("{node} did not join with this p2p key"));
         }
-        let header =
-            payload_header(coordinator, tie_breaker_committee_size, node)?;
+        let header = payload_header(coordinator, node)?;
         Ok(SignedCommitment::sign(
             p2p,
             commitment_run(coordinator),

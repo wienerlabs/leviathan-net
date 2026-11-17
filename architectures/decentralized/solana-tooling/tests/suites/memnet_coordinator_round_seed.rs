@@ -42,6 +42,7 @@ use psyche_solana_tooling::process_coordinator_instructions::process_coordinator
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_init;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_set_paused;
+use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_set_tie_breaker_nodes;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_tick;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_warmup_witness;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
@@ -768,4 +769,57 @@ pub async fn a_pause_cannot_cancel_a_round_whose_seed_is_committed() {
     let state = chain.state(&run).await;
     assert!(state.coordinator.pending_pause.is_true());
     assert!(!state.seed_committed());
+}
+
+/// The tie-breaker count moves the window of verifier seats, so once the next
+/// round's seed is committed, and its hash about to be knowable, the count is
+/// closed: set afterwards, it would choose who verifies. Set before, it seats
+/// the round that starts next, and the round carries it.
+#[tokio::test]
+pub async fn the_tie_breaker_count_is_closed_once_the_seed_is_committed() {
+    let mut chain = Chain::new().await;
+    let run = chain.warming_up("Leviathan seats closed").await;
+    let main_authority = run.main_authority.insecure_clone();
+    process_coordinator_set_tie_breaker_nodes(
+        &mut chain.endpoint,
+        &chain.payer,
+        &main_authority,
+        &run.coordinator_instance,
+        &run.coordinator_account,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(chain.state(&run).await.tie_breaker_nodes, 1);
+
+    chain
+        .endpoint
+        .forward_clock_unix_timestamp(WARMUP_TIME)
+        .await
+        .unwrap();
+    chain.commit(&run).await;
+    let refused = process_coordinator_set_tie_breaker_nodes(
+        &mut chain.endpoint,
+        &chain.payer,
+        &main_authority,
+        &run.coordinator_instance,
+        &run.coordinator_account,
+        0,
+    )
+    .await;
+    assert_eq!(
+        refusal_code(refused),
+        u32::from(ProgramError::RoundSeedCommitted)
+    );
+
+    chain.endpoint.forward_clock_slot(1).await.unwrap();
+    chain.tick(&run).await;
+    let state = chain.state(&run).await;
+    assert_eq!(state.coordinator.run_state, RunState::RoundTrain);
+    assert_eq!(state.tie_breaker_nodes, 1, "the refused change left the count");
+    // The run's one client is its one trainer, so the round leaves it free
+    // and seats no tie-breaker (`Coordinator::seat_tie_breakers`).
+    let round = state.coordinator.current_round().unwrap();
+    assert_eq!(round.clients_len, 1);
+    assert_eq!(round.tie_breaker_tasks, 0);
 }

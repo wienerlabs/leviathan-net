@@ -25,7 +25,6 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
 use psyche_solana_tooling::get_accounts::ensure_coordinator_version;
 use psyche_solana_tooling::get_accounts::get_participant;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::payload_dump_digest;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
@@ -403,13 +402,8 @@ async fn run() -> Result<()> {
         .iter()
         .position(|k| k.pubkey() == target_key)
         .ok_or_else(|| anyhow!("target keypair not found"))?;
-    let tie_breaker_committee_size = get_run(&mut endpoint, &run)
-        .await?
-        .ok_or_else(|| anyhow!("run {run} not found"))?
-        .tie_breaker_committee_size;
     let signed = SignedCommitment::for_round(
         &state.coordinator,
-        tie_breaker_committee_size,
         &NodeIdentity::new(
             target_key.to_bytes(),
             p2ps[target_node].pubkey().to_bytes(),

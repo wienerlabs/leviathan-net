@@ -34,6 +34,7 @@ mod memnet_treasurer_full_epoch;
 mod memnet_treasurer_join_gate;
 mod memnet_treasurer_slash_accounting_order;
 mod memnet_treasurer_slash_settle;
+mod memnet_treasurer_tie_breaker_seats;
 mod memnet_treasurer_verifier_liability;
 mod memnet_treasurer_withdraw_hold;
 mod refusal;
