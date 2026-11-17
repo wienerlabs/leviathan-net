@@ -12,6 +12,7 @@ use leviathan_verifier::judge_payload;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
+use leviathan_verifier::ReplayWork;
 use leviathan_verifier::VerifiedCommitment;
 use psyche_coordinator::select_audits_for_current_round;
 use psyche_coordinator::ClientState;
@@ -227,7 +228,7 @@ pub async fn audit_pass(
     coordinator_account: &Pubkey,
     run: &Pubkey,
     config: &AuditConfig,
-    replay: Option<&(dyn psyche_verifier::ReplayEngine + Sync)>,
+    replay: Option<&(dyn ReplayWork + Sync)>,
     // What this session has settled: convicted committers by signer, and
     // contributions by file key once judged for good (within band, convicted,
     // withheld, already on chain, or malformed), so a long-running daemon
@@ -434,7 +435,13 @@ pub async fn audit_pass(
                 if !coordinator.is_replayable(record.epoch_start, record.step) {
                     continue;
                 }
-                match engine.replay(index as u64) {
+                // The replay of the work this payload is signed for, found by
+                // that work. The roster index is this pass's view of where the
+                // committer sits, and only names it to the chain: the engine
+                // was built from an earlier read, and anyone leaving the epoch
+                // in between moves the committer to a seat whose batch is
+                // someone else's.
+                match engine.replay_work(&dump) {
                     Ok(delta) => delta,
                     Err(err) => {
                         println!(

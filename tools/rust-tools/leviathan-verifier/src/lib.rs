@@ -36,6 +36,7 @@ pub use replay::replay_epoch;
 pub use replay::DumpKey;
 pub use replay::ReplayAssignment;
 pub use replay::ReplayTrainerConfig;
+pub use replay::ReplayWork;
 pub use replay::TrainerReplayEngine;
 
 /// The epoch, step and batch part of a dump named
@@ -551,7 +552,11 @@ fn outcome(
     })
 }
 
-pub fn audit_with_replay<E: psyche_verifier::ReplayEngine>(
+/// Audits every dump in `submitted` against `engine`'s replay of the work the
+/// dump names. A dump is judged against the replay of its own epoch, step and
+/// batch, looked up by those, so what else is in the directory, or lands in it
+/// while the engine is built, cannot pair it with another dump's replay.
+pub fn audit_with_replay<E: ReplayWork + ?Sized>(
     submitted: &Path,
     engine: &E,
     band: f32,
@@ -560,8 +565,13 @@ pub fn audit_with_replay<E: psyche_verifier::ReplayEngine>(
     let submitted_index = index_dir(submitted)?;
     let mut outcomes = Vec::new();
     for (target_index, (key, submitted_path)) in submitted_index.iter().enumerate() {
+        // Offline there is no roster, so the proof's index is the dump's place
+        // in this listing: a label for the report, never what is replayed.
         let target_index = target_index as u64;
-        let reference_delta = match engine.replay(target_index) {
+        let replayed = parse_assignment_key(key)
+            .ok_or_else(|| anyhow!("{key} names no epoch, step and batch"))
+            .and_then(|work| engine.replay_work(&work).map_err(|e| anyhow!(e)));
+        let reference_delta = match replayed {
             Ok(delta) => delta,
             Err(_) => {
                 outcomes.push(ContributionOutcome::NoReference { key: key.clone() });

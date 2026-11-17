@@ -20,6 +20,7 @@ use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
+use leviathan_verifier::ReplayWork;
 use leviathan_verifier::TrainerReplayEngine;
 use prometheus_client::registry::Registry;
 use psyche_coordinator::model::HubRepo;
@@ -232,21 +233,19 @@ impl Replayer {
             if !coordinator.is_replayable(epoch_start, step) {
                 continue;
             }
+            // Only a payload someone in the epoch signed is worth the data.
+            // The dump names carry the full base58 signer (finding 20), so the
+            // roster is matched on the same. Where it sits there is not kept:
+            // the replay is of the work, and the pass that judges the payload
+            // finds the work in the payload's own name.
             let Some(committer) = parse_committer(&path) else {
                 continue;
             };
-            // The dump names carry the full base58 signer (finding 20), so
-            // the roster is matched on the same, never on the
-            // eight-character `Display` that made every real contribution
-            // unmatchable.
-            let Some(index) =
-                coordinator.epoch_state.clients.iter().position(|client| {
-                    bs58::encode(client.id.signer()).into_string()
-                        == committer
-                })
-            else {
+            if !coordinator.epoch_state.clients.iter().any(|client| {
+                bs58::encode(client.id.signer()).into_string() == committer
+            }) {
                 continue;
-            };
+            }
             let data: Vec<BatchDataCPU> = loaded
                 .provider
                 .get_samples(batch_id)
@@ -260,7 +259,7 @@ impl Replayer {
                 })
                 .collect();
             assignments.push(ReplayAssignment {
-                target_index: index as u64,
+                epoch_start,
                 step,
                 warmup_lr_between: coordinator
                     .get_cold_start_warmup_bounds(),
@@ -413,7 +412,7 @@ async fn main() -> Result<()> {
             &coordinator_account,
             &run,
             &config,
-            engine.as_ref().map(|e| e as &(dyn psyche_verifier::ReplayEngine + Sync)),
+            engine.as_ref().map(|e| e as &(dyn ReplayWork + Sync)),
             &mut judged,
         )
         .await;
