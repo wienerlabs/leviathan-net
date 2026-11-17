@@ -16,6 +16,7 @@ use crate::state::transaction_proves_signature;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
+use crate::state::VoteEvidence;
 use crate::state::MAX_VERDICT_VOTERS;
 use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
@@ -121,6 +122,13 @@ pub fn run_submit_audit_verdict_processor(
     params: RunSubmitAuditVerdictParams,
 ) -> Result<()> {
     let verifier_key = context.accounts.verifier.key();
+
+    // A later round can draw the target onto the committee judging it. Its
+    // vote is no verdict on itself: seated first, it fixed the evidence the
+    // rest of the round had to agree with.
+    if verifier_key == params.target {
+        return err!(ProgramError::VerifierIsTarget);
+    }
 
     let (
         current_epoch,
@@ -245,6 +253,7 @@ pub fn run_submit_audit_verdict_processor(
     }
 
     let should_slash;
+    let replayed_hash;
     {
         let verdict = &mut context.accounts.audit_verdict;
         let fresh_account = verdict.run == Pubkey::default();
@@ -276,32 +285,25 @@ pub fn run_submit_audit_verdict_processor(
             return err!(ProgramError::VerdictVotersFull);
         }
 
-        // The evidence is written once, by whoever votes first, and every later
-        // vote has to agree with it. Letting each vote overwrite it meant the
-        // verifier who completed the quorum decided what the on-chain record
-        // said, which is the only thing an appeal bench or an observer can check
-        // (finding 9). Two verifiers who disagree about what they replayed is
-        // information, and it belongs in a rejected transaction rather than
-        // silently in the last writer's favour.
-        if verdict.voters.is_empty() {
-            verdict.committed_hash = committed_hash;
-            verdict.evidence = params.evidence;
-            verdict.replayed_hash = params.replayed_hash;
-            verdict.target_index = params.target_index;
-            verdict.batch_start = params.batch_start;
-            verdict.batch_end = params.batch_end;
-        } else if verdict.committed_hash != committed_hash
-            || verdict.evidence != params.evidence
-            || verdict.replayed_hash != params.replayed_hash
-            || verdict.target_index != params.target_index
-            || verdict.batch_start != params.batch_start
-            || verdict.batch_end != params.batch_end
-        {
-            return err!(ProgramError::EvidenceMismatch);
-        }
-
-        verdict.voters.push(verifier_key);
-        verdict.verdict_count += 1;
+        // Votes are counted per payload the target signed, and a quorum is two
+        // thirds of the committee agreeing on one. The first vote used to fix
+        // the evidence every later vote had to match, the replayed hash
+        // included: one seat citing another of the target's payloads, all of
+        // which are broadcast, vetoed the round, and honest verifiers whose
+        // replays differ in the last bits never reached a quorum at all. The
+        // verdict records the evidence most votes are for, so the record a
+        // quorum leaves is still the one its votes agreed on (finding 9).
+        let agreeing = verdict.cast_vote(
+            verifier_key,
+            VoteEvidence {
+                committed_hash,
+                evidence: params.evidence,
+                target_index: params.target_index,
+                batch_start: params.batch_start,
+                batch_end: params.batch_end,
+                replayed_hash: params.replayed_hash,
+            },
+        );
         context.accounts.verifier_participant.open_verdict_vote()?;
 
         msg!(
@@ -309,11 +311,12 @@ pub fn run_submit_audit_verdict_processor(
             params.target_index,
             current_epoch,
             current_round,
-            verdict.verdict_count,
+            agreeing,
             quorum
         );
 
-        let quorum_reached = (verdict.verdict_count as u64) >= quorum;
+        replayed_hash = verdict.replayed_hash;
+        let quorum_reached = (agreeing as u64) >= quorum;
         if quorum_reached {
             if context.accounts.run.challenge_window_seconds > 0 {
                 verdict.status = VerdictStatus::SlashPending;
@@ -367,7 +370,7 @@ pub fn run_submit_audit_verdict_processor(
                 batch_start: params.batch_start,
                 batch_end: params.batch_end,
                 committed_hash,
-                replayed_hash: params.replayed_hash,
+                replayed_hash,
             },
         )?;
     }

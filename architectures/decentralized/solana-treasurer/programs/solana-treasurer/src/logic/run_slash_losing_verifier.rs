@@ -96,6 +96,24 @@ pub fn run_slash_losing_verifier_processor(
         position
     };
 
+    // A vote for other evidence than the overturned conviction was not part of
+    // its quorum, so the overturn costs it nothing. It is passed, and its hold
+    // on the voter's bond closed unless a release already closed it.
+    if context.accounts.audit_verdict.dissents(position) {
+        if !context.accounts.audit_verdict.vote_released(position) {
+            context.accounts.loser_participant.close_verdict_vote()?;
+        }
+        context
+            .accounts
+            .audit_verdict
+            .settle_dissenting_vote(position);
+        msg!(
+            "slash_losing_verifier: voter={} voted for other evidence, not charged",
+            params.loser
+        );
+        return Ok(());
+    }
+
     let (slashed_points, slashing_rate) = {
         let account = context.accounts.coordinator_account.load()?;
         (

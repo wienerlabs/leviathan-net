@@ -26,6 +26,7 @@ mod memnet_treasurer_bounty_recipient;
 mod memnet_treasurer_committee_slash;
 mod memnet_treasurer_conviction_bounty;
 mod memnet_treasurer_cross_round_quorum;
+mod memnet_treasurer_dissenting_vote;
 mod memnet_treasurer_create_claim;
 mod memnet_treasurer_create_update;
 mod memnet_treasurer_equivocation;

@@ -370,6 +370,7 @@ mod tests {
             appeal_upheld: false,
             voters: voters.to_vec(),
             appeal_voters: vec![Pubkey::new_unique()],
+            vote_commitments: vec![[0u8; 32]; voters.len()],
         }
     }
 
@@ -424,6 +425,43 @@ mod tests {
         let user = Pubkey::new_unique();
         let other = verdict(VerdictStatus::Upheld, &[Pubkey::new_unique()], 0);
         assert!(plan(&[other], &coordinator_in_round(0), 0, &user, false).is_empty());
+    }
+
+    /// A vote for another payload than the one the quorum convicted on was not
+    /// part of it, so the wallet releases it at once, inside the challenge
+    /// window or the appeal, or after an overturn, where a vote that convicted
+    /// is held.
+    #[test]
+    fn a_dissenting_vote_is_released_at_once() {
+        let user = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        for status in [
+            VerdictStatus::SlashPending,
+            VerdictStatus::Challenged,
+            VerdictStatus::Overturned,
+        ] {
+            let mut dissented = verdict(status, &[user, other], 0);
+            dissented.vote_commitments[0] = [9u8; 32];
+            let convicted = verdict(status, &[user, other], 0);
+            let steps = plan(
+                &[dissented.clone(), convicted.clone()],
+                &coordinator_in_round(0),
+                0,
+                &user,
+                false,
+            );
+            assert_eq!(
+                steps[0],
+                VoteStep::Release {
+                    target: dissented.target
+                },
+                "{status:?}"
+            );
+            assert!(
+                !matches!(steps[1], VoteStep::Release { .. }),
+                "{status:?}: a vote that convicted is not released yet"
+            );
+        }
     }
 
     #[test]

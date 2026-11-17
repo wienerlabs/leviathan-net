@@ -207,6 +207,7 @@ mod tests {
             appeal_upheld: false,
             voters: vec![],
             appeal_voters: vec![],
+            vote_commitments: vec![],
         };
         verdict.land_ejection(EjectionCharge {
             epoch_start: 1_000,
