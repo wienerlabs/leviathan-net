@@ -1035,6 +1035,9 @@ pub async fn a_target_drawn_onto_its_own_bench_cannot_judge_its_appeal() {
     )
     .await
     .unwrap();
+    // The round under way keeps the bench its clients drew; the next one
+    // seats the new count.
+    h.advance_to_next_round_across_epochs().await;
 
     let committee = h.committee_now().await;
     assert_eq!(committee.tie_breaker_quorum, 1);
