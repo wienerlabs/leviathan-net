@@ -227,6 +227,9 @@ pub enum CoordinatorError {
     InvalidCommitteeProof,
     InvalidSlash,
     SlashOutsideEpoch,
+    /// A client has left the roster since the round a proof names was drawn,
+    /// so its seats no longer hold the clients the draw put there.
+    RosterMoved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +388,9 @@ impl std::fmt::Display for CoordinatorError {
             CoordinatorError::InvalidSlash => write!(f, "Invalid slash"),
             CoordinatorError::SlashOutsideEpoch => {
                 write!(f, "Slash outside an epoch that will be charged")
+            }
+            CoordinatorError::RosterMoved => {
+                write!(f, "The roster moved since the round was drawn")
             }
         }
     }
@@ -780,6 +786,17 @@ impl Coordinator {
         let round = self
             .previous_round()
             .ok_or(CoordinatorError::NoActiveRound)?;
+        // The proof is read off the previous round's draw, by seat. Every
+        // round starts by compacting the roster, so once a client has left
+        // since that draw, every seat after its own holds the client that sat
+        // one further along. Judged by the seat's old role, an honest verifier
+        // moved onto a trainer's seat read as a trainer that trained nothing,
+        // and was dropped. Upstream every seat trained, so no role moved; with
+        // verification on, a roster that moved is not judged at all until a
+        // round is drawn over it.
+        if round.clients_len as usize != self.epoch_state.clients.len() {
+            return Err(CoordinatorError::RosterMoved);
+        }
         let index = proof.index;
         if index < round.clients_len as u64 {
             let client = self

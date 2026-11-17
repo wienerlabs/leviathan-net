@@ -89,6 +89,9 @@ pub enum ProgramError {
 
     #[msg("The SlotHashes sysvar could not be read")]
     SlotHashesUnreadable,
+
+    #[msg("Coordinator error: the roster moved since the round was drawn")]
+    CoordinatorErrorRosterMoved,
 }
 
 impl From<CoordinatorError> for ProgramError {
@@ -130,6 +133,9 @@ impl From<CoordinatorError> for ProgramError {
             },
             CoordinatorError::SlashOutsideEpoch => {
                 ProgramError::CoordinatorErrorSlashOutsideEpoch
+            },
+            CoordinatorError::RosterMoved => {
+                ProgramError::CoordinatorErrorRosterMoved
             },
         }
     }
