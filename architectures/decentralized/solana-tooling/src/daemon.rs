@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -260,11 +261,6 @@ pub async fn audit_pass(
         Some(dir) => Some(index_dir(dir)?),
         None => None,
     };
-    if reference.is_none() && replay.is_none() {
-        return Err(anyhow!(
-            "the daemon needs either a reference directory or a replay engine to audit against"
-        ));
-    }
     let device = Device::Cpu;
     let mut report = PassReport::default();
 
@@ -284,7 +280,20 @@ pub async fn audit_pass(
     .convict_all(&submitted)
     .await;
 
-    for (key, submitted_path) in &submitted {
+    // A daemon that replays has nothing to judge a payload against past the
+    // run's first epoch, where no step can be replayed
+    // (wienerlabs/leviathan-net#48), nor in a pass whose replay could not be
+    // prepared. Equivocation is the fraud still provable then, and it has
+    // just been judged. The rest of the pass still runs: the sweep of the
+    // run's open disputes below is what finalises and pays the convictions
+    // this daemon voted on before.
+    let nothing_to_judge_against = BTreeMap::new();
+    let to_judge = match (&reference, replay) {
+        (None, None) => &nothing_to_judge_against,
+        _ => &submitted,
+    };
+
+    for (key, submitted_path) in to_judge {
         let Some(committer) = parse_committer(submitted_path) else {
             continue;
         };

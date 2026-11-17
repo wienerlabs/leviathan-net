@@ -15,6 +15,7 @@ use psyche_solana_tooling::daemon::AuditConfig;
 use psyche_solana_tooling::daemon_equivocation::equivocation_key;
 use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::signed_commitment::PayloadHeader;
+use psyche_solana_treasurer::state::VerdictStatus;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
@@ -362,3 +363,85 @@ pub async fn an_equivocation_ahead_of_the_daemons_view_is_looked_at_again() {
         assert!(!judged.contains(&equivocation_key(&key)));
     }
 }
+
+/// A daemon that replays instead of reading reference dumps has nothing to
+/// judge a payload against once the run is past its first epoch, nor while
+/// its replay cannot be prepared: no step there can be replayed
+/// (wienerlabs/leviathan-net#48). An equivocation needs neither, and it is
+/// the one fraud still provable then, so the pass convicts it anyway.
+#[tokio::test]
+pub async fn an_equivocation_is_convicted_with_nothing_to_replay_against() {
+    let mut h = setup("Leviathan equiv no replay", 170).await;
+    let p2p = h.p2ps[h.target_client_idx].insecure_clone();
+    let (dir, key) = kept_payloads(&mut h, "no-replay", &p2p).await;
+    let target_key = h.target_key;
+    let daemon = funded_daemon(&mut h).await;
+    let replaying = AuditConfig {
+        reference_dir: None,
+        ..config(&h, dir, "no-replay", false)
+    };
+
+    let mut judged = HashSet::new();
+    let report = audit_pass(
+        &mut h.endpoint,
+        &daemon,
+        &h.coordinator_account,
+        &h.run,
+        &replaying,
+        None,
+        &mut judged,
+    )
+    .await
+    .expect("a pass with no replay still judges equivocations");
+    assert_eq!(
+        report,
+        PassReport {
+            equivocations: 1,
+            submitted: 1,
+            ..PassReport::default()
+        }
+    );
+    assert_eq!(
+        h.client_state(&target_key).await,
+        Some(ClientState::Ejected)
+    );
+    assert!(judged.contains(&equivocation_key(&key)));
+}
+
+/// A pass with nothing to replay against still sweeps the run's open
+/// disputes, as every pass of a voting daemon does: a conviction whose
+/// challenge window closed is finalised, though no payload is judged.
+#[tokio::test]
+pub async fn a_pass_with_nothing_to_replay_against_still_settles_open_disputes() {
+    let mut h = setup("Leviathan sweep no replay", 173).await;
+    h.reach_verifier_quorum().await;
+    assert_eq!(h.verdict_status().await, VerdictStatus::SlashPending);
+    h.endpoint
+        .forward_clock_unix_timestamp((CHALLENGE_WINDOW + 5) as u64)
+        .await
+        .unwrap();
+
+    let daemon = funded_daemon(&mut h).await;
+    let replaying = AuditConfig {
+        reference_dir: None,
+        ..config(&h, scratch("sweep-submitted"), "sweep", false)
+    };
+    let report = audit_pass(
+        &mut h.endpoint,
+        &daemon,
+        &h.coordinator_account,
+        &h.run,
+        &replaying,
+        None,
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report, PassReport::default(), "no payload was judged");
+    assert_eq!(
+        h.verdict_status().await,
+        VerdictStatus::Upheld,
+        "the conviction whose window closed was not finalised"
+    );
+}
+
