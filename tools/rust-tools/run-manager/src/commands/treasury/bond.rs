@@ -87,7 +87,14 @@ async fn report_bond_standing(
         .await?;
     let own_verdict = backend.get_own_audit_verdict(run_address, user).await?;
     let slashed_points = coordinator_slashed_points(&coordinator_account, user);
-    let unledgered = unledgered_conviction_charge(&coordinator_account, own_verdict.as_ref());
+    let now = backend.get_clock().await?.unix_timestamp;
+    let unledgered = unledgered_conviction_charge(
+        run_state,
+        &coordinator_account,
+        user,
+        own_verdict.as_ref(),
+        now,
+    );
     let unforfeited = participant.unforfeited_bond_owing(slashed_points, unledgered);
     let committed = participant.committed_bond_owing(slashed_points, unledgered);
     println!(
@@ -95,7 +102,7 @@ async fn report_bond_standing(
         participant.unsettled_slashed_points(slashed_points)
     );
     println!(
-        "Conviction not yet charged to the ledger: {}",
+        "Ejection or conviction not yet charged to the ledger: {}",
         native_amount_to_ui_amount(unledgered, decimals)
     );
     println!(

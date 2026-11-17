@@ -1,17 +1,20 @@
-//! A conviction that stands but has not reached the ledger still owes its
-//! charge. A `Due` conviction is charged at the slashing rate once it lands,
-//! in an epoch that charges it or at the target's withdrawal, and until then
-//! the coordinator's ledger knows nothing of it. The bond checks read only the
-//! ledger, so a target convicted this way joined, claimed and voted on a bond
-//! its own conviction was about to take from. A bond posted at the run's
-//! minimum backs a seat or a vote; one that its conviction leaves short of
-//! the minimum does not.
+//! A slash that has not reached the ledger yet still owes its charge. An
+//! ejection is charged only when its epoch ends. A conviction that can no
+//! longer be overturned but has not landed is charged at the slashing rate
+//! once it lands, in an epoch that charges it or at the target's withdrawal:
+//! one recorded as `Due`, or one whose challenge window has closed. Until
+//! then the coordinator's ledger knows nothing of either. The bond checks
+//! read only the ledger, so a target slashed this way joined, claimed and
+//! voted on a bond it was about to lose. A bond posted at the run's minimum
+//! backs a seat or a vote; one that its slash leaves short of the minimum
+//! does not.
 
 use psyche_coordinator::Committee;
 use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::RunState;
 use psyche_solana_coordinator::CoordinatorInstanceState;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_claim;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_treasurer::find_audit_verdict;
@@ -20,6 +23,9 @@ use psyche_solana_treasurer::state::VerdictStatus;
 use psyche_solana_treasurer::ProgramError;
 use solana_sdk::signer::Signer;
 
+use super::appeals_harness::setup;
+use super::appeals_harness::AppealsHarness;
+use super::appeals_harness::CHALLENGE_WINDOW;
 use super::bonded_run::Harness;
 use super::bonded_run::JoinGate;
 use super::bonded_run::SLASHING_RATE;
@@ -225,5 +231,79 @@ pub async fn a_due_conviction_counts_against_a_vote() {
         verdict_of(&mut harness, target).await.status,
         VerdictStatus::Due,
         "nobody landed the conviction"
+    );
+}
+
+/// The run authority ejects a trainer mid-epoch. The ledger charges the
+/// ejection only when the epoch ends, but the target is not to claim on the
+/// bond it is about to lose in the meantime.
+#[tokio::test]
+pub async fn an_ejection_counts_against_claiming_before_its_epoch_ends() {
+    let mut harness = committee_run(448, "Leviathan ejection claim").await;
+    let (_, trainers) = committee(&mut harness).await;
+    let target = trainers[0];
+    harness.claim(target, 0).await.unwrap();
+
+    let commitment = harness.signed_payload(target).await;
+    harness.try_convict_on(target, &commitment).await.unwrap();
+    assert_eq!(
+        harness.ledger(target).await.1,
+        0,
+        "the ledger charges the ejection when the epoch ends"
+    );
+    // New slots, so no claim here is the same transaction as another.
+    harness.endpoint.forward_clock_slot(1).await.unwrap();
+    assert_eq!(
+        refusal_code(harness.claim(target, 0).await),
+        treasurer_refusal(ProgramError::BondBelowMinimum),
+    );
+
+    harness.deposit(target, SLASHING_RATE).await.unwrap();
+    harness.endpoint.forward_clock_slot(1).await.unwrap();
+    harness.claim(target, 0).await.unwrap();
+}
+
+async fn claim_nothing(
+    h: &mut AppealsHarness,
+    client: usize,
+) -> anyhow::Result<()> {
+    process_treasurer_participant_claim(
+        &mut h.endpoint,
+        &h.payer,
+        &h.clients[client],
+        &h.clients_collateral[client],
+        &h.collateral_mint,
+        &h.run,
+        &h.coordinator_account,
+        0,
+    )
+    .await
+}
+
+/// A conviction inside its challenge window may yet be overturned, so it
+/// does not hold the bond. Once the window closes nobody can challenge it any
+/// more and it only waits to be finalised, so it is owed, and the target
+/// cannot claim on the bond it will take.
+#[tokio::test]
+pub async fn a_conviction_past_its_challenge_window_counts_against_claiming() {
+    let mut h = setup("Leviathan closed window claim", 449).await;
+    h.reach_verifier_quorum().await;
+    assert_eq!(h.verdict_status().await, VerdictStatus::SlashPending);
+    let target = h.target_client_idx;
+    claim_nothing(&mut h, target).await.unwrap();
+
+    h.endpoint
+        .forward_clock_unix_timestamp(CHALLENGE_WINDOW as u64 + 1)
+        .await
+        .unwrap();
+    h.endpoint.forward_clock_slot(1).await.unwrap();
+    assert_eq!(
+        refusal_code(claim_nothing(&mut h, target).await),
+        treasurer_refusal(ProgramError::BondBelowMinimum),
+    );
+    assert_eq!(
+        h.verdict_status().await,
+        VerdictStatus::SlashPending,
+        "nobody finalised the conviction"
     );
 }

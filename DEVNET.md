@@ -135,8 +135,8 @@ A run that gates admission on the bond is one whose join authority is its own
 treasurer run. The client recognises it from chain state and joins it through
 the treasurer's `participant_join_run` every epoch, so no `--authorizer` is
 needed. That instruction checks the committed bond (posted, less convictions not
-yet settled, a conviction of the node's own that stands but has not reached the
-ledger yet, and withdrawals already requested) on each join, and the coordinator
+yet settled, slashes that have not reached the ledger yet, and withdrawals
+already requested) on each join, and the coordinator
 refuses a direct join. `run-manager can-join` and `bond-status` report that
 committed bond, and whether joins, votes and claims are open to it.
 

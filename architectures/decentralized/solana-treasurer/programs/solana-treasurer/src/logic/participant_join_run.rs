@@ -134,11 +134,18 @@ pub fn participant_join_run_processor(
     let user_key = context.accounts.user.key();
     let own_verdict =
         read_own_verdict(&context.accounts.own_verdict.to_account_info())?;
+    let now = Clock::get()?.unix_timestamp;
     let (slashed_points, unledgered_conviction) = {
         let account = context.accounts.coordinator_account.load()?;
         (
             coordinator_slashed_points(&account, &user_key),
-            unledgered_conviction_charge(&account, own_verdict.as_ref()),
+            unledgered_conviction_charge(
+                &context.accounts.run,
+                &account,
+                &user_key,
+                own_verdict.as_ref(),
+                now,
+            ),
         )
     };
     let committed_bond = context

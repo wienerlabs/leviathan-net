@@ -170,7 +170,13 @@ pub fn run_submit_audit_verdict_processor(
         // before the overturn reaches it (wienerlabs/leviathan-net#34).
         if context.accounts.verifier_participant.committed_bond_owing(
             coordinator_slashed_points(&account, &verifier_key),
-            unledgered_conviction_charge(&account, verifier_verdict.as_ref()),
+            unledgered_conviction_charge(
+                &context.accounts.run,
+                &account,
+                &verifier_key,
+                verifier_verdict.as_ref(),
+                Clock::get()?.unix_timestamp,
+            ),
         ) < context.accounts.run.bond_minimum_amount
         {
             return err!(ProgramError::BondBelowMinimum);

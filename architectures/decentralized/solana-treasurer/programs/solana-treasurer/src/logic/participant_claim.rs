@@ -105,8 +105,11 @@ pub fn participant_claim_processor(
             earned,
             coordinator_slashed_points(&coordinator_account, &user_key),
             unledgered_conviction_charge(
+                &context.accounts.run,
                 &coordinator_account,
+                &user_key,
                 own_verdict.as_ref(),
+                Clock::get()?.unix_timestamp,
             ),
         )
     };

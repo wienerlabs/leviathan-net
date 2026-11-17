@@ -65,11 +65,17 @@ impl Command for CommandCanJoin {
                 .get_own_audit_verdict(&join_authority, &address)
                 .await?;
             let slashed_points = coordinator_slashed_points(&coordinator_account, &address);
-            let unledgered =
-                unledgered_conviction_charge(&coordinator_account, own_verdict.as_ref());
+            let now = backend.get_clock().await?.unix_timestamp;
+            let unledgered = unledgered_conviction_charge(
+                &run,
+                &coordinator_account,
+                &address,
+                own_verdict.as_ref(),
+                now,
+            );
             let committed = participant.committed_bond_owing(slashed_points, unledgered);
             println!(
-                "Bond-gated run: bond {}, unsettled slashed points {}, conviction not yet charged {}, withdrawal pending {}, committed {}, minimum {}",
+                "Bond-gated run: bond {}, unsettled slashed points {}, ejection or conviction not yet charged {}, withdrawal pending {}, committed {}, minimum {}",
                 participant.bond_amount,
                 participant.unsettled_slashed_points(slashed_points),
                 unledgered,

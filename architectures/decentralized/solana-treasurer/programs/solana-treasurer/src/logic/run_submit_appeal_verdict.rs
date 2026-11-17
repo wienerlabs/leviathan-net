@@ -115,7 +115,13 @@ pub fn run_submit_appeal_verdict_processor(
         // reached the ledger yet included.
         if context.accounts.appellate_participant.committed_bond_owing(
             coordinator_slashed_points(&account, &appellate_key),
-            unledgered_conviction_charge(&account, appellate_verdict.as_ref()),
+            unledgered_conviction_charge(
+                &context.accounts.run,
+                &account,
+                &appellate_key,
+                appellate_verdict.as_ref(),
+                Clock::get()?.unix_timestamp,
+            ),
         ) < context.accounts.run.bond_minimum_amount
         {
             return err!(ProgramError::BondBelowMinimum);
