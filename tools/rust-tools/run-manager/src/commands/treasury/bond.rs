@@ -9,22 +9,24 @@ use crate::{SolanaBackend, instructions};
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use psyche_solana_rpc::utils::native_amount_to_ui_amount;
 use anchor_client::solana_sdk::instruction::AccountMeta;
+use psyche_solana_treasurer::logic::bounty_amount;
 use psyche_solana_treasurer::state::{
-    AuditVerdict, Participant, Run, VerdictStatus, WithdrawalHold, WithdrawalStanding,
-    coordinator_slashed_points, withdrawal_standing,
+    AuditVerdict, Participant, Run, WithdrawalHold, WithdrawalStanding, coordinator_slashed_points,
+    unattributed_ledger_forfeit, withdrawal_standing,
 };
 
 /// How `user`'s withdrawal stands, read from chain exactly the way the
 /// treasurer reads it at finalize: the run, its coordinator, `user`'s
 /// participant account and own audit verdict, and the cluster clock
-/// (wienerlabs/leviathan-net#36, #39). Also returns the verdict, which names
-/// the bounty recipients a settlement pays.
+/// (wienerlabs/leviathan-net#36, #39). Also returns what the settlement would
+/// forfeit to points no verdict accounts for, whose bounty is paid to a
+/// reporter the withdrawal names (wienerlabs/leviathan-net#64).
 async fn current_withdrawal_standing(
     backend: &SolanaBackend,
     run_address: &Pubkey,
     run_state: &Run,
     user: &Pubkey,
-) -> Result<(WithdrawalStanding, Option<AuditVerdict>)> {
+) -> Result<(WithdrawalStanding, u64)> {
     let coordinator_account = backend
         .get_coordinator_account(&run_state.coordinator_account)
         .await?;
@@ -49,7 +51,12 @@ async fn current_withdrawal_standing(
         user,
         now,
     );
-    Ok((standing, own_verdict))
+    let unattributed = unattributed_ledger_forfeit(
+        &participant,
+        coordinator_slashed_points(&coordinator_account, user),
+        own_verdict.as_ref(),
+    );
+    Ok((standing, unattributed))
 }
 
 fn describe_withdrawal_hold(hold: WithdrawalHold) -> &'static str {
@@ -358,6 +365,12 @@ pub struct CommandBondWithdrawFinalize {
     /// way. They stop counting toward a conviction.
     #[clap(long)]
     pub withdraw_live_votes: bool,
+    /// The wallet that reported a slash no verdict accounts for, such as one
+    /// the run authority made. A withdrawal that settles one pays its bounty
+    /// to this wallet's collateral account, and is refused without it. It
+    /// cannot be this wallet.
+    #[clap(long)]
+    pub reporter: Option<Pubkey>,
 }
 
 #[async_trait]
@@ -367,6 +380,7 @@ impl Command for CommandBondWithdrawFinalize {
             run_id,
             treasurer_index,
             withdraw_live_votes,
+            reporter,
         } = self;
 
         let treasurer_index = backend
@@ -383,29 +397,47 @@ impl Command for CommandBondWithdrawFinalize {
 
         // Votes this wallet cast hold the bond until each can no longer cost
         // it, so the ones that can be freed are freed first
-        // (wienerlabs/leviathan-net#39).
+        // (wienerlabs/leviathan-net#39). Every share of a bounty the wallet is
+        // owed is credited to its bond too, as a voter, a tie-breaker or
+        // either; that holds whether or not it still has a vote open, since a
+        // tie-breaker's never counts, and anyone may have released a voter's
+        // (wienerlabs/leviathan-net#64).
+        //
+        // Finding them reads every verdict in the run, which a public RPC may
+        // refuse. A wallet with a vote open cannot withdraw without them, so
+        // that fails the command; any other wallet is warned that a share it
+        // may be owed was not credited, and withdraws all the same.
         let participant_address = psyche_solana_treasurer::find_participant(&run_address, &user);
-        if backend
+        let open_votes = backend
             .get_treasurer_participant(&participant_address)
             .await?
-            .open_verdict_votes
-            > 0
+            .open_verdict_votes;
+        match free_wallet_votes(
+            &backend,
+            treasurer_index,
+            &run_address,
+            &run_state,
+            &user,
+            withdraw_live_votes,
+        )
+        .await
         {
-            let held = free_wallet_votes(
-                &backend,
-                treasurer_index,
-                &run_address,
-                &run_state,
-                &user,
-                withdraw_live_votes,
-            )
-            .await?;
-            for (target, reason) in &held {
-                println!("A vote on the verdict against {target} still holds the bond: {reason}");
+            Ok(held) => {
+                for (target, reason) in &held {
+                    println!(
+                        "A vote on the verdict against {target} still holds the bond: {reason}"
+                    );
+                }
             }
+            Err(error) if open_votes == 0 => {
+                println!(
+                    "Could not read the run's verdicts to credit any bounty share this wallet is owed; withdrawing without it: {error:#}"
+                );
+            }
+            Err(error) => return Err(error),
         }
 
-        let (standing, own_verdict) =
+        let (standing, unattributed_forfeit) =
             current_withdrawal_standing(&backend, &run_address, &run_state, &user).await?;
         let settle_conviction = match standing {
             WithdrawalStanding::Held(hold) => {
@@ -423,25 +455,33 @@ impl Command for CommandBondWithdrawFinalize {
             &run_state.coordinator_account,
             &user,
         );
-        // A settlement that forfeits anything pays the bounty to the voters the
-        // verdict names, each through its own collateral account, in the
-        // verdict's order. Settling a conviction here marks it upheld first, so
-        // its recipients are read as upheld.
-        if run_state.slash_bounty_bps > 0 {
-            if let Some(mut verdict) = own_verdict {
-                if settle_conviction {
-                    verdict.status = VerdictStatus::Upheld;
-                }
-                for recipient in verdict.bounty_recipients() {
-                    instruction.accounts.push(AccountMeta::new(
-                        associated_token::get_associated_token_address(
-                            recipient,
-                            &run_state.collateral_mint,
-                        ),
-                        false,
-                    ));
-                }
+        // A conviction's bounty is recorded on its verdict and credited to
+        // each recipient's bond by anyone, never paid here. What the ledger
+        // charged that no verdict accounts for pays its bounty to a reporter
+        // this withdrawal names (wienerlabs/leviathan-net#64).
+        let reporter_bounty = bounty_amount(&run_state, unattributed_forfeit);
+        if reporter_bounty > 0 {
+            let reporter = reporter.ok_or_else(|| {
+                anyhow!(
+                    "This withdrawal settles {} of slashes no verdict accounts for, which owes a reporter {}; pass --reporter <WALLET>",
+                    native_amount_to_ui_amount(unattributed_forfeit, decimals),
+                    native_amount_to_ui_amount(reporter_bounty, decimals),
+                )
+            })?;
+            if reporter == user {
+                return Err(anyhow!(
+                    "The reporter cannot be the wallet whose bond is slashed"
+                ));
             }
+            instruction.accounts.push(AccountMeta::new(
+                associated_token::get_associated_token_address(
+                    &reporter,
+                    &run_state.collateral_mint,
+                ),
+                false,
+            ));
+        } else if reporter.is_some() {
+            println!("No slash this withdrawal settles owes a reporter; --reporter is not used");
         }
         if settle_conviction {
             println!("Settling this wallet's conviction against its bond as part of the withdrawal");

@@ -216,13 +216,26 @@ wienerlabs/leviathan-net#67 is a flag day.
 - **How.** Bring a run up on the new build from its start. Do not upgrade it
   mid-run.
 
-The treasurer's own accounts grow the same way. `Participant` gained
-`open_verdict_votes` (69 bytes) and `AuditVerdict` gained `released_voters`,
-`bench_bounty_owed` and `bench_paid` (4392 bytes) in
-wienerlabs/leviathan-net#39, and its evidence the epoch it was trained in
-(4400 bytes) in wienerlabs/leviathan-net#67. An older, shorter account does not deserialize
-with the new layout, so the treasurer that carries them deploys under a new id
-too.
+The treasurer's own accounts grow the same way:
+
+| Change | Account | Size (bytes) |
+|---|---|---|
+| wienerlabs/leviathan-net#39: gained `open_verdict_votes` | `Participant` | 69 |
+| wienerlabs/leviathan-net#39: gained `released_voters`, `bench_bounty_owed` and `bench_paid` | `AuditVerdict` | 4392 |
+| wienerlabs/leviathan-net#67: evidence gained the epoch it was trained in | `AuditVerdict` | 4400 |
+| wienerlabs/leviathan-net#64: bounty fields renamed `bounty_owed` and `bounty_paid`; gained `charge`, `charge_epoch_start`, `charge_rate` and `appeal_upheld` | `AuditVerdict` | 4418 |
+
+An older, shorter account does not deserialize with the new layout, so the treasurer that carries them deploys under a new id too.
+
+#64 also changes what a withdrawal pays.
+
+- **A conviction's bounty.**
+  - It is no longer paid at the convicted target's withdrawal. It is recorded on the verdict when the target's bond is charged.
+  - That charge is made either by `run_charge_conviction` once the epoch has been charged, or by the withdrawal itself.
+  - Each recipient's bond is then credited through `run_pay_verdict_bounty`.
+  - The verifier daemon does both, for every open dispute in the run, at the end of each pass, after its own judging, so a backlog never costs it a vote. A daemon in dry-run mode sends nothing.
+  - `run-manager bond-withdraw-finalize` does both for every seat the wallet is owed before it withdraws, whether or not the wallet still has a vote open.
+- **A slash no verdict accounts for.** A `run_slash`, or an equivocation, still pays its bounty to a reporter that the withdrawal names. `bond-withdraw-finalize` asks for it with `--reporter <WALLET>` when the settlement owes one, and refuses to send without it.
 
 ## Going to mainnet
 

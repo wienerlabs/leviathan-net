@@ -167,11 +167,18 @@ pub mod psyche_solana_treasurer {
         run_slash_losing_verifier_processor(context, params)
     }
 
-    pub fn run_pay_bench_bounty(
-        context: Context<RunPayBenchBountyAccounts>,
-        params: RunPayBenchBountyParams,
+    pub fn run_pay_verdict_bounty(
+        context: Context<RunPayVerdictBountyAccounts>,
+        params: RunPayVerdictBountyParams,
     ) -> Result<()> {
-        run_pay_bench_bounty_processor(context, params)
+        run_pay_verdict_bounty_processor(context, params)
+    }
+
+    pub fn run_charge_conviction(
+        context: Context<RunChargeConvictionAccounts>,
+        params: RunChargeConvictionParams,
+    ) -> Result<()> {
+        run_charge_conviction_processor(context, params)
     }
 
     pub fn run_slash_equivocation(
@@ -230,6 +237,9 @@ pub enum ProgramError {
     #[msg("The verdict voter set is full")]
     VerdictVotersFull,
 
+    /// No longer raised: recipients are credited by seat, never paid through a
+    /// token account (wienerlabs/leviathan-net#64). Kept so that every later
+    /// error keeps its code.
     #[msg("A bounty recipient does not match the corresponding verdict voter")]
     BountyRecipientMismatch,
 
@@ -328,15 +338,27 @@ pub enum ProgramError {
     #[msg("The bench is paid once every losing verifier has been charged")]
     LosersNotAllSettled,
 
-    #[msg("This tie-breaker's share has already been paid")]
-    BenchSeatPaid,
+    #[msg("This recipient's share has already been paid")]
+    BountySeatPaid,
 
-    #[msg("The losing verifiers' forfeits owe the bench nothing")]
-    NothingOwedToBench,
+    #[msg("The losing side's forfeit owes the recipients nothing")]
+    NothingOwedToSeats,
 
     #[msg("The two commitments are not two different commitments to the same step and batch")]
     EquivocationNotProven,
 
     #[msg("The target cannot be ejected into an epoch that will charge it now: it is off the roster, already ejected or withdrawn, or no ejection here would be charged")]
     EquivocationNotLandable,
+
+    #[msg("The verdict holds no conviction that ejected its target and waits to be charged")]
+    ConvictionNotChargeable,
+
+    #[msg("The epoch the conviction ejected its target in has not been charged yet")]
+    EjectionNotCharged,
+
+    #[msg("The conviction's recipients are paid once the target's bond has paid for it")]
+    ConvictionNotCharged,
+
+    #[msg("The dispute is still open, so it owes nobody a bounty yet")]
+    VerdictOwesNoBounty,
 }

@@ -87,26 +87,76 @@ out of reach for good (wienerlabs/leviathan-net#39). Two rules now close that:
   over for a new dispute only once every vote on the old one is released or
   charged, so a reset never strands a count. Before it votes, the verifier
   daemon settles the last dispute against the target in everything that needs
-  nobody's consent: it finalises a conviction whose windows have closed,
-  releases and withdraws votes, charges an overturn's losers and credits the
-  bench. `run-manager bond-withdraw-finalize` does the same for a wallet's own
-  votes and bench seats before it withdraws.
+  nobody's consent. It:
+  - finalises a conviction whose windows have closed;
+  - charges a conviction whose ejection the ledger has charged;
+  - releases and withdraws votes;
+  - charges an overturn's losers;
+  - credits every recipient its share.
+
+  `run-manager bond-withdraw-finalize` does the same for a wallet's own votes
+  and seats before it withdraws.
 - **The crank charges a loser's bond directly; the bench is credited seat by
   seat.** `run_slash_losing_verifier` no longer ejects. It forfeits the epoch's
   slashing rate from the loser's bond, out of what convictions on the ledger do
   not already claim, the way an unlanded conviction is settled at a target's
   withdrawal. It closes the loser's vote and adds what the forfeit owes the
-  bench to the verdict (`bench_bounty_owed`). It settles every loser wherever it
+  bench to the verdict (`bounty_owed`). It settles every loser wherever it
   is, so nothing waits for an epoch, and it depends on no other account, so no
   payout and no size of bench can stop it. The loser keeps its seat. If the
   forfeit leaves its bond below the run minimum, it cannot vote, join or claim
   again, starting at once rather than at the next epoch's charge. Once every
-  loser is charged, `run_pay_bench_bounty` credits each tie-breaker's bond with
-  its even share, one seat per transaction, marked in `bench_paid`. Anyone may
-  send it. The share never leaves the vault and no token account is involved,
-  so nothing a tie-breaker or a mint does can stop it. An overturn is settled,
-  and its account free for a new dispute, once every loser is charged and every
-  seat credited.
+  loser is charged, `run_pay_verdict_bounty` credits each tie-breaker's bond
+  with its even share, one seat per transaction, marked in `bounty_paid`. Anyone
+  may send it. The share never leaves the vault and no token account is
+  involved, so nothing a tie-breaker or a mint does can stop it. An overturn is
+  settled, and its account free for a new dispute, once every loser is charged
+  and every seat credited.
+- **A conviction that stands pays its recipients the same way.** The target's
+  forfeit used to pay its bounty at the target's own withdrawal, to whoever the
+  verdict account named at that moment, with every recipient's token account
+  in the one transaction (wienerlabs/leviathan-net#64). That broke three ways:
+  - a later dispute could take the account over first, and receive the bounty;
+  - an overturned verdict named its losers, so a cleared target paid them the
+    bounty of an unrelated `run_slash`;
+  - a committee larger than one transaction holds, or a recipient with a closed
+    or frozen token account, left the target unable to withdraw.
+
+  Now each conviction owes exactly its own charge. The ledger charges a client
+  at most once per epoch, so the charge for the epoch a conviction ejected the
+  target in is that conviction's. The verdict records it when it lands:
+  - `charge` becomes `Ejected`;
+  - `charge_epoch_start` records the start of that epoch, which unlike the
+    epoch number no authority can rewrite;
+  - `charge_rate` records the slashing rate the epoch's end charges.
+
+  Once that epoch has been charged, anyone may send `run_charge_conviction`. It
+  takes the charge from the target's bond as settled points, records what the
+  forfeit owes on the verdict (`bounty_owed`), and marks it `Charged`. A target
+  that never created a participant account, which a run with its own join
+  authority admits, has no bond and is charged nothing, so its verdict still
+  settles. The target's own withdrawal does the same first if nobody has. A conviction that
+  never reached the ledger is charged at the withdrawal as before, and recorded
+  the same way. `run_pay_verdict_bounty` then credits each recipient's bond
+  with its share, one seat per transaction:
+  - the voters whose quorum convicted the target;
+  - or, if the bench reached its quorum to uphold it (`appeal_upheld`), the
+    bench. An appeal that ran out its window was finalised as the verifiers
+    reached it, so its bounty is theirs: a tie-breaker that voted before the
+    deadline used to take it from them.
+
+  A conviction that stands is settled, and its account free for a new dispute,
+  only once it is charged and every recipient credited. The target cannot hold
+  an ejected conviction open, because its charge needs nothing of it. A `Due`
+  conviction still waits, as it always has, for the target to come back into
+  a charging epoch or to withdraw (wienerlabs/leviathan-net#74). Nor does a voter have to
+  wait for someone to dispute the target again: the verifier daemon settles
+  every open dispute in the run, as far as nobody's consent is needed, at the
+  end of each pass, after its own judging, and `bond-withdraw-finalize`
+  credits every seat a wallet is owed before it withdraws. Points the ledger charged
+  that no verdict accounts for, a `run_slash` or an equivocation, are the only
+  bounty a withdrawal still pays itself: to the reporter it names, never to the
+  participant (wienerlabs/leviathan-net#72).
 - **Switching appeals off ends the appeals in flight.** A run with appeals on
   always has an appeal deadline, so a zero window means the run turned appeals
   off. A challenge still open then has no deadline left to wait for, and
@@ -185,13 +235,12 @@ the tie-breakers on both outcomes, each funded by the side that lost: an overtur
 pays them out of the convicting verifiers' forfeited bonds, an upheld appeal pays
 them out of the target's forfeited bond. Because a tie-breaker earns either way,
 the bounty does not push its vote in either direction, so it votes its honest read
-and the Schelling point stays put. It reuses the existing `slash_bounty_bps` knob
-and the same split-and-verify settlement the target-cheater path already used: the
-forfeited bond's bounty share is split among the recorded appeal voters, each
-recipient's token account owner checked against a recorded voter, and the tokens
-come from the vault where the forfeited bond already sits. An overturn's share is
-credited to each tie-breaker's bond once the crank has charged every loser; an
-upheld appeal pays it at the target's settlement. memnet
+and the Schelling point stays put. It reuses the existing `slash_bounty_bps` knob:
+the forfeited bond's bounty share is split evenly among the recorded appeal
+voters, and each one's share is credited to its bond, out of the vault where the
+forfeit already sits, by seat. An overturn's shares are credited once the crank
+has charged every loser; an upheld appeal's once the target's forfeit is charged
+(wienerlabs/leviathan-net#39, #64). memnet
 confirms both directions: a tie-breaker earns its share whether the verdict is
 overturned or upheld, while a cleared target still recovers its full bond and a
 convicted one still forfeits.
@@ -226,9 +275,9 @@ step from being skipped:
   ejection is certain to be charged. A target that walked away (its epoch
   ended, the run halted, or it simply never came back) would otherwise hold its
   bond forever with nothing able to finalise against it. Its withdrawal charges
-  the conviction directly, at the run's slashing rate at that time, pays the
-  bounty to whoever ruled it, and records the verdict as upheld, so it is
-  charged exactly once. For the same reason a run with a challenge window must
+  the conviction directly, at the run's slashing rate at that time, records
+  what that owes whoever ruled it, who are credited by seat, and records the
+  verdict as upheld, so it is charged exactly once. For the same reason a run with a challenge window must
   give appeals a deadline (`appeal_window_seconds > 0`). The windows are read
   from the run as they stand, so the run authority changing them moves the
   deadlines of disputes in flight, as it always has. The run authority's

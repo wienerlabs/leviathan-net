@@ -126,3 +126,164 @@ pub fn withdrawal_standing(
         settle_conviction: false,
     }
 }
+
+/// What a withdrawal settled now forfeits to points the ledger charged that no
+/// verdict accounts for, such as a `run_slash` or an equivocation: the forfeit
+/// whose bounty goes to the reporter the withdrawal names.
+///
+/// Settlement first takes the participant's own conviction's charge, if a
+/// conviction ejected it and is not charged yet, out of the same points and
+/// the same bond; what the ledger charged beyond that, up to what the bond
+/// still holds, is this (wienerlabs/leviathan-net#64). A client reads it to
+/// know whether the withdrawal needs a reporter account.
+pub fn unattributed_ledger_forfeit(
+    participant: &Participant,
+    coordinator_slashed_points: u64,
+    own_verdict: Option<&AuditVerdict>,
+) -> u64 {
+    let conviction = own_verdict
+        .filter(|verdict| verdict.awaits_charge())
+        .map(|verdict| {
+            participant.ejected_conviction_forfeit(
+                coordinator_slashed_points,
+                verdict.charge_rate,
+            )
+        })
+        .unwrap_or(0);
+    participant
+        .unsettled_slashed_points(coordinator_slashed_points)
+        .saturating_sub(conviction)
+        .min(participant.bond_amount - conviction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::CommitmentEvidence;
+    use crate::state::ConvictionCharge;
+    use crate::state::EjectionCharge;
+
+    fn participant(bond: u64, settled_points: u64) -> Participant {
+        Participant {
+            bump: 0,
+            claimed_collateral_amount: 0,
+            claimed_earned_points: 0,
+            bond_amount: bond,
+            bond_withdraw_pending_amount: bond,
+            bond_withdraw_requested_at: 0,
+            bond_settled_slashed_points: settled_points,
+            bond_withdraw_delay_snapshot: 0,
+            open_verdict_votes: 0,
+        }
+    }
+
+    fn verdict(charge: ConvictionCharge, rate: u64) -> AuditVerdict {
+        let mut verdict = AuditVerdict {
+            bump: 0,
+            run: Pubkey::new_unique(),
+            target: Pubkey::new_unique(),
+            epoch: 0,
+            round_height: 0,
+            status: VerdictStatus::Voting,
+            verdict_count: 0,
+            committed_hash: [0; 32],
+            replayed_hash: [0; 32],
+            target_index: 0,
+            batch_start: 0,
+            batch_end: 0,
+            evidence: CommitmentEvidence::default(),
+            pending_since_unix: 0,
+            challenged_since_unix: 0,
+            challenger: Pubkey::default(),
+            overturn_count: 0,
+            uphold_count: 0,
+            settled_count: 0,
+            released_voters: 0,
+            bounty_owed: 0,
+            bounty_paid: 0,
+            charge: ConvictionCharge::Unlanded,
+            charge_epoch_start: 0,
+            charge_rate: 0,
+            appeal_upheld: false,
+            voters: vec![],
+            appeal_voters: vec![],
+        };
+        verdict.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate,
+        });
+        if charge == ConvictionCharge::Charged {
+            verdict.record_charge(0);
+        }
+        verdict
+    }
+
+    /// What settlement itself does: the conviction's charge, then the rest of
+    /// the ledger.
+    fn settle(
+        mut participant: Participant,
+        slashed: u64,
+        verdict: Option<&AuditVerdict>,
+    ) -> u64 {
+        if let Some(verdict) = verdict.filter(|verdict| verdict.awaits_charge())
+        {
+            let forfeit = participant
+                .ejected_conviction_forfeit(slashed, verdict.charge_rate);
+            participant.settle_ledger_points(forfeit);
+        }
+        participant
+            .unsettled_slashed_points(slashed)
+            .min(participant.bond_amount)
+    }
+
+    #[test]
+    fn a_slash_with_no_verdict_is_unattributed() {
+        let p = participant(500, 0);
+        assert_eq!(unattributed_ledger_forfeit(&p, 200, None), 200);
+        assert_eq!(settle(p, 200, None), 200);
+    }
+
+    #[test]
+    fn an_ejected_conviction_owes_its_own_charge_to_its_voters() {
+        let ejected = verdict(ConvictionCharge::Ejected, 200);
+        // The conviction is the only charge: nothing is left for a reporter.
+        let p = participant(500, 0);
+        assert_eq!(unattributed_ledger_forfeit(&p, 200, Some(&ejected)), 0);
+        // A `run_slash` in another epoch is still unattributed.
+        assert_eq!(unattributed_ledger_forfeit(&p, 400, Some(&ejected)), 200);
+        // A bond short of both pays the conviction first.
+        let short = participant(300, 0);
+        assert_eq!(
+            unattributed_ledger_forfeit(&short, 400, Some(&ejected)),
+            100
+        );
+        for (p, slashed) in [
+            (participant(500, 0), 200),
+            (participant(500, 0), 400),
+            (participant(300, 0), 400),
+        ] {
+            assert_eq!(
+                unattributed_ledger_forfeit(&p, slashed, Some(&ejected)),
+                settle(p, slashed, Some(&ejected)),
+            );
+        }
+    }
+
+    #[test]
+    fn a_charged_or_cleared_verdict_accounts_for_nothing_more() {
+        // Already charged: its points are settled, and anything new the
+        // ledger charged is someone else's.
+        let charged = verdict(ConvictionCharge::Charged, 200);
+        let p = participant(300, 200);
+        assert_eq!(unattributed_ledger_forfeit(&p, 400, Some(&charged)), 200);
+        // Overturned: the target was cleared, so every point is unattributed.
+        let mut overturned = verdict(ConvictionCharge::Unlanded, 0);
+        overturned.status = VerdictStatus::Overturned;
+        overturned.charge = ConvictionCharge::Unlanded;
+        let p = participant(500, 0);
+        assert_eq!(
+            unattributed_ledger_forfeit(&p, 200, Some(&overturned)),
+            200
+        );
+    }
+}

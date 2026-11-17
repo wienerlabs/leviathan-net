@@ -8,7 +8,10 @@
 //! - an overturned verdict's losers are charged up to and including this
 //!   wallet.
 //!
-//! A tie-breaker's share of an overturn's forfeits is credited to its bond.
+//! A share the wallet is owed out of a verdict's losing side is credited to its
+//! bond: a tie-breaker's share of an overturn's forfeits, or a voter's, or an
+//! upholding tie-breaker's, share of a convicted target's forfeit, charging
+//! the target first if nobody has (wienerlabs/leviathan-net#64).
 
 use anchor_client::solana_sdk::instruction::Instruction;
 use anchor_client::solana_sdk::pubkey::Pubkey;
@@ -18,12 +21,13 @@ use psyche_solana_treasurer::state::{appeal_window_open, AuditVerdict, Run, Verd
 
 use crate::{instructions, SolanaBackend};
 
-/// Planning runs twice: a finalized conviction's votes, and a bench share
-/// owed once the losers are charged, are only freeable after the first pass.
+/// Planning runs twice: a finalized conviction's votes, and a share owed once
+/// the losers or the target are charged, are only reachable after the first
+/// pass.
 const PASSES: usize = 2;
 
 /// What to do about one verdict that holds this wallet's bond or owes it a
-/// bench share.
+/// share of a bounty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoteStep {
     /// Release or withdraw the wallet's vote now.
@@ -38,8 +42,11 @@ pub enum VoteStep {
         from_position: u16,
         through_position: u16,
     },
-    /// Credit the wallet's bench seat its share of the losers' forfeits.
-    CreditBenchSeat { target: Pubkey, seat: u16 },
+    /// Charge the convicted target's bond for the conviction that ejected it,
+    /// now that the ledger has charged the ejection, so its bounty is owed.
+    ChargeConviction { target: Pubkey },
+    /// Credit the wallet's seat its share of the verdict's bounty.
+    CreditSeat { target: Pubkey, seat: u16 },
     /// The vote can still cost this wallet and nothing can be done yet.
     Held {
         target: Pubkey,
@@ -126,27 +133,35 @@ fn vote_step(
     }
 }
 
-/// What an overturn owes `user`, the tie-breaker at `seat`.
-fn bench_step(verdict: &AuditVerdict, seat: usize) -> Option<VoteStep> {
-    if verdict.status != VerdictStatus::Overturned || verdict.bench_seat_paid(seat) {
+/// What a verdict owes `user`, the recipient at `seat`: the losers charged or
+/// the target charged first, if that is what stands between it and its
+/// share, and then the share. Nothing while the ejection that would be charged
+/// waits for its epoch to end; that never holds the wallet's bond.
+fn seat_step(verdict: &AuditVerdict, seat: usize, context: &PlanContext) -> Option<VoteStep> {
+    if verdict.bounty_seat_paid(seat) {
         return None;
     }
     let target = verdict.target;
-    if !verdict.all_losers_settled() {
+    if verdict.status == VerdictStatus::Overturned && !verdict.all_losers_settled() {
         return Some(VoteStep::SettleLosers {
             target,
             from_position: verdict.settled_count,
             through_position: verdict.voters.len().saturating_sub(1) as u16,
         });
     }
-    (verdict.bench_share() > 0).then_some(VoteStep::CreditBenchSeat {
+    if verdict.awaits_charge() {
+        return verdict
+            .ejection_charged(context.coordinator)
+            .then_some(VoteStep::ChargeConviction { target });
+    }
+    (verdict.bounty_final().is_ok() && verdict.bounty_share() > 0).then_some(VoteStep::CreditSeat {
         target,
         seat: seat as u16,
     })
 }
 
 /// What each verdict in `verdicts` calls for: one holding an open vote of
-/// `user`'s, or one owing `user` a bench share.
+/// `user`'s, or one owing `user` a share of its bounty.
 ///
 /// A vote on a verdict still `Voting` is withdrawn only once its round is over,
 /// unless `withdraw_live_votes`: the wallet then signs its own withdrawal.
@@ -169,8 +184,12 @@ pub fn plan_vote_steps(
                 ));
             }
         }
-        if let Some(seat) = verdict.appeal_voters.iter().position(|voter| voter == user) {
-            if let Some(step) = bench_step(verdict, seat) {
+        if let Some(seat) = verdict
+            .bounty_recipients()
+            .iter()
+            .position(|recipient| recipient == user)
+        {
+            if let Some(step) = seat_step(verdict, seat, context) {
                 if !steps.contains(&step) {
                     steps.push(step);
                 }
@@ -231,8 +250,16 @@ fn step_instructions(
                 })
                 .collect()
         }
-        VoteStep::CreditBenchSeat { target, seat } => {
-            vec![instructions::treasurer_run_pay_bench_bounty(
+        VoteStep::ChargeConviction { target } => {
+            vec![instructions::treasurer_run_charge_conviction(
+                treasurer_index,
+                &run_state.coordinator_account,
+                user,
+                target,
+            )]
+        }
+        VoteStep::CreditSeat { target, seat } => {
+            vec![instructions::treasurer_run_pay_verdict_bounty(
                 treasurer_index,
                 user,
                 target,
@@ -244,7 +271,7 @@ fn step_instructions(
     }
 }
 
-/// Frees what it can of `user`'s open votes in the run, and credits the bench
+/// Frees what it can of `user`'s open votes in the run, and credits the bounty
 /// shares it is owed. Returns the votes that still hold its bond, with why.
 ///
 /// Each instruction goes on its own, so one that fails, for instance because
@@ -310,7 +337,8 @@ pub async fn free_wallet_votes(
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
-    use psyche_solana_treasurer::state::CommitmentEvidence;
+    use psyche_coordinator::RunState;
+    use psyche_solana_treasurer::state::{CommitmentEvidence, EjectionCharge};
 
     fn verdict(status: VerdictStatus, voters: &[Pubkey], round_height: u32) -> AuditVerdict {
         AuditVerdict {
@@ -334,8 +362,12 @@ mod tests {
             uphold_count: 0,
             settled_count: 0,
             released_voters: 0,
-            bench_bounty_owed: 0,
-            bench_paid: 0,
+            bounty_owed: 0,
+            bounty_paid: 0,
+            charge: Default::default(),
+            charge_epoch_start: 0,
+            charge_rate: 0,
+            appeal_upheld: false,
             voters: voters.to_vec(),
             appeal_voters: vec![Pubkey::new_unique()],
         }
@@ -548,7 +580,7 @@ mod tests {
         );
         overturned.settled_count = 2;
         overturned.released_voters = 0b11;
-        overturned.bench_bounty_owed = 100;
+        overturned.bounty_owed = 100;
         let steps = plan(
             std::slice::from_ref(&overturned),
             &coordinator,
@@ -558,13 +590,13 @@ mod tests {
         );
         assert_eq!(
             steps,
-            vec![VoteStep::CreditBenchSeat {
+            vec![VoteStep::CreditSeat {
                 target: overturned.target,
                 seat: 1,
             }]
         );
         // Credited already, or owed nothing: no step.
-        overturned.bench_paid = 0b10;
+        overturned.bounty_paid = 0b10;
         assert!(plan(
             std::slice::from_ref(&overturned),
             &coordinator,
@@ -573,11 +605,149 @@ mod tests {
             false
         )
         .is_empty());
-        overturned.bench_paid = 0;
-        overturned.bench_bounty_owed = 1;
+        overturned.bounty_paid = 0;
+        overturned.bounty_owed = 1;
         assert!(plan(
             std::slice::from_ref(&overturned),
             &coordinator,
+            0,
+            &user,
+            false
+        )
+        .is_empty());
+    }
+
+    /// An upheld conviction, reached by `voters` with no appeal, that ejected
+    /// its target in the epoch that started at 1000.
+    fn ejected(voters: &[Pubkey]) -> AuditVerdict {
+        let mut upheld = verdict(VerdictStatus::Voting, voters, 0);
+        upheld.appeal_voters = vec![];
+        upheld.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate: 200,
+        });
+        upheld
+    }
+
+    #[test]
+    fn a_voter_charges_the_target_once_its_epoch_is_charged_and_is_credited() {
+        let user = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let mut upheld = ejected(&[other, user]);
+        upheld.released_voters = 0b11;
+        // The epoch it was ejected in is still running: nothing to do yet,
+        // and nothing holds the bond.
+        let mut running = coordinator_in_round(0);
+        running.run_state = RunState::RoundTrain;
+        running.epoch_state.start_timestamp = 1_000;
+        assert!(plan(std::slice::from_ref(&upheld), &running, 0, &user, false).is_empty());
+        // Charged: the target is charged first.
+        let ended = coordinator_in_round(0);
+        assert_eq!(
+            plan(std::slice::from_ref(&upheld), &ended, 0, &user, false),
+            vec![VoteStep::ChargeConviction {
+                target: upheld.target
+            }]
+        );
+        // Then the wallet's seat, the second voter, is credited.
+        upheld.record_charge(100);
+        assert_eq!(
+            plan(std::slice::from_ref(&upheld), &ended, 0, &user, false),
+            vec![VoteStep::CreditSeat {
+                target: upheld.target,
+                seat: 1,
+            }]
+        );
+        upheld.bounty_paid = 0b10;
+        assert!(plan(std::slice::from_ref(&upheld), &ended, 0, &user, false).is_empty());
+    }
+
+    #[test]
+    fn a_voter_whose_vote_is_open_is_released_and_charges_the_target() {
+        let user = Pubkey::new_unique();
+        let upheld = ejected(&[user]);
+        assert_eq!(
+            plan(
+                std::slice::from_ref(&upheld),
+                &coordinator_in_round(0),
+                0,
+                &user,
+                false
+            ),
+            vec![
+                VoteStep::Release {
+                    target: upheld.target
+                },
+                VoteStep::ChargeConviction {
+                    target: upheld.target
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_upheld_appeal_credits_its_bench_and_not_the_verifiers() {
+        let user = Pubkey::new_unique();
+        let verifier = Pubkey::new_unique();
+        let mut upheld = ejected(&[verifier]);
+        upheld.appeal_voters = vec![user];
+        upheld.appeal_upheld = true;
+        upheld.released_voters = 1;
+        upheld.record_charge(100);
+        let coordinator = coordinator_in_round(0);
+        assert_eq!(
+            plan(std::slice::from_ref(&upheld), &coordinator, 0, &user, false),
+            vec![VoteStep::CreditSeat {
+                target: upheld.target,
+                seat: 0,
+            }]
+        );
+        assert!(plan(
+            std::slice::from_ref(&upheld),
+            &coordinator,
+            0,
+            &verifier,
+            false
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_appeal_that_ran_out_its_window_credits_the_verifiers() {
+        let user = Pubkey::new_unique();
+        let tie_breaker = Pubkey::new_unique();
+        let mut upheld = ejected(&[user]);
+        upheld.appeal_voters = vec![tie_breaker];
+        upheld.released_voters = 1;
+        upheld.record_charge(100);
+        let coordinator = coordinator_in_round(0);
+        assert_eq!(
+            plan(std::slice::from_ref(&upheld), &coordinator, 0, &user, false),
+            vec![VoteStep::CreditSeat {
+                target: upheld.target,
+                seat: 0,
+            }]
+        );
+        assert!(plan(
+            std::slice::from_ref(&upheld),
+            &coordinator,
+            0,
+            &tie_breaker,
+            false
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_loser_of_an_overturn_is_never_credited() {
+        let user = Pubkey::new_unique();
+        let mut overturned = verdict(VerdictStatus::Overturned, &[user], 0);
+        overturned.settled_count = 1;
+        overturned.released_voters = 1;
+        overturned.bounty_owed = 100;
+        assert!(plan(
+            std::slice::from_ref(&overturned),
+            &coordinator_in_round(0),
             0,
             &user,
             false

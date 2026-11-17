@@ -34,6 +34,7 @@ use crate::get_accounts::get_coordinator_account_state;
 use crate::get_accounts::get_run;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
+use crate::verdict_votes::settle_open_disputes;
 use crate::verdict_votes::settle_previous_dispute;
 use crate::verdict_votes::DisputeSettlement;
 use crate::signed_commitment::SignedCommitment;
@@ -509,7 +510,7 @@ pub async fn audit_pass(
         if config.verdict_mode {
             // The target's verdict account holds one dispute at a time, and it
             // is taken over only once the last one holds nobody's bond and
-            // owes the bench nothing. What nobody's consent is needed for is
+            // owes nobody a bounty. What nobody's consent is needed for is
             // settled first, so a lapsed, standing or overturned dispute does
             // not refuse this one (wienerlabs/leviathan-net#39). Anything still
             // at stake stays, and the vote below is refused as before.
@@ -524,11 +525,12 @@ pub async fn audit_pass(
             {
                 Ok(settled) if settled == DisputeSettlement::default() => {},
                 Ok(settled) => println!(
-                    "  settled the last dispute against {committer}: conviction finalised {}, {} vote(s) freed, {} loser(s) charged, {} tie-breaker(s) credited",
+                    "  settled the last dispute against {committer}: conviction finalised {}, conviction charged {}, {} vote(s) freed, {} loser(s) charged, {} recipient(s) credited",
                     settled.conviction_finalized,
+                    settled.conviction_charged,
                     settled.votes_freed,
                     settled.losers_charged,
-                    settled.bench_paid
+                    settled.seats_credited
                 ),
                 Err(err) => println!(
                     "  could not settle the last dispute against {committer}: {err:#}"
@@ -603,6 +605,34 @@ pub async fn audit_pass(
                     },
                 }
             }
+        }
+    }
+
+    // Then every dispute in the run is settled as far as nobody's consent is
+    // needed: a conviction's bounty is credited to its voters only once the
+    // target is charged and each seat paid, and a target nobody disputes again
+    // would otherwise leave them unpaid (wienerlabs/leviathan-net#64). It runs
+    // after this verifier's own judging, so a backlog never costs it a vote in
+    // the round under way. Only a daemon that votes on verdicts sweeps them,
+    // and a dry run sends nothing.
+    if config.verdict_mode && !config.dry_run {
+        match settle_open_disputes(endpoint, authority, run, coordinator_account).await {
+            Ok(sweep) if sweep.is_quiet() => {},
+            Ok(sweep) => {
+                println!(
+                    "[verifier-daemon] settled open disputes: {} open, {} conviction(s) finalised, {} charged, {} vote(s) freed, {} loser(s) charged, {} recipient(s) credited",
+                    sweep.open,
+                    sweep.convictions_finalized,
+                    sweep.convictions_charged,
+                    sweep.votes_freed,
+                    sweep.losers_charged,
+                    sweep.seats_credited
+                );
+                for (target, err) in &sweep.failures {
+                    println!("[verifier-daemon] could not settle the dispute against {target}: {err:#}");
+                }
+            },
+            Err(err) => println!("[verifier-daemon] could not look up the run's open disputes: {err:#}"),
         }
     }
 

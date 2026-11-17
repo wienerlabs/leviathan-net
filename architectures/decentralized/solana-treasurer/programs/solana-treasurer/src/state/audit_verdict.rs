@@ -8,8 +8,8 @@ use crate::ProgramError;
 pub const MAX_VERDICT_VOTERS: usize = 64;
 pub const MAX_APPEAL_VOTERS: usize = 64;
 
-// `released_voters` keeps one bit per voter, and `bench_paid` one per
-// appeal voter.
+// `released_voters` keeps one bit per voter, and `bounty_paid` one per
+// bounty recipient: the voters or the appeal voters.
 const _: () = assert!(MAX_VERDICT_VOTERS <= u64::BITS as usize);
 const _: () = assert!(MAX_APPEAL_VOTERS <= u64::BITS as usize);
 
@@ -40,6 +40,52 @@ pub enum VerdictStatus {
     /// `run_finalize_slash` once the target is in such an epoch, or is charged
     /// against the bond when the target withdraws (wienerlabs/leviathan-net#36).
     Due,
+}
+
+/// How far a conviction has reached the target's bond.
+///
+/// A conviction is paid for out of the target's forfeit, and its bounty out of
+/// that. The bounty used to be paid at the target's own withdrawal, to whoever
+/// the verdict account named at that moment: by then a later dispute could
+/// have taken the account over, and an overturned verdict named its losers.
+/// Now the conviction's own charge is taken from the bond as soon as the
+/// ledger has made it, and its bounty recorded here, so the record it is paid
+/// from never outlives the conviction (wienerlabs/leviathan-net#64).
+#[derive(
+    AnchorSerialize,
+    AnchorDeserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Debug,
+    Default,
+)]
+pub enum ConvictionCharge {
+    /// The conviction has not reached the ledger or the bond, or there is none.
+    #[default]
+    Unlanded,
+    /// The conviction ejected the target in the epoch that started at
+    /// `charge_epoch_start`, whose end charges `charge_rate` to the target's
+    /// ledger. Once it has, `run_charge_conviction` takes it from the bond.
+    Ejected,
+    /// The target's bond has paid for the conviction, and `bounty_owed` holds
+    /// what that owes its recipients.
+    Charged,
+}
+
+/// What the ledger charges an ejection landed now: the epoch it lands in, by
+/// the time it started, and that epoch's slashing rate.
+///
+/// The epoch is named by its start rather than its number: the run authority
+/// can rewrite `progress` while the run is halted, but no two epochs start in
+/// the same second (wienerlabs/leviathan-net#67). The rate is the one the epoch
+/// charges at its end, because the coordinator only promotes new rates when an
+/// epoch starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EjectionCharge {
+    pub epoch_start: u64,
+    pub rate: u64,
 }
 
 #[account]
@@ -83,15 +129,30 @@ pub struct AuditVerdict {
     /// its voter's `Participant` until then, so the bit is what stops a vote
     /// being closed twice (wienerlabs/leviathan-net#39).
     pub released_voters: u64,
-    /// What the losing verifiers' forfeits owe the bench, in total, added to
-    /// as the crank charges each loser. Once every loser is charged, each
-    /// appeal voter's even share is credited to its bond through
-    /// `run_pay_bench_bounty`, so charging a loser never waits on a payout
-    /// (wienerlabs/leviathan-net#39).
-    pub bench_bounty_owed: u64,
-    /// One bit per entry of `appeal_voters`: set once that seat was credited
-    /// its share of `bench_bounty_owed`.
-    pub bench_paid: u64,
+    /// What the losing side's forfeit owes the winning side's seats, the
+    /// `bounty_recipients`. An overturn owes the bench out of the losing
+    /// verifiers' forfeits, added to as the crank charges each one
+    /// (wienerlabs/leviathan-net#39). A conviction that stands owes its voters,
+    /// or the bench that upheld it, out of the target's forfeit, recorded when
+    /// that is charged (wienerlabs/leviathan-net#64). Each seat's even share is
+    /// credited to its bond through `run_pay_verdict_bounty`, so no charge ever
+    /// waits on a payout.
+    pub bounty_owed: u64,
+    /// One bit per entry of `bounty_recipients`: set once that seat was
+    /// credited its share of `bounty_owed`.
+    pub bounty_paid: u64,
+    /// How far a conviction that stands has reached the target's bond.
+    pub charge: ConvictionCharge,
+    /// With `charge` `Ejected`: the start of the epoch whose end charges it.
+    pub charge_epoch_start: u64,
+    /// With `charge` `Ejected`: what that epoch charges the target's ledger.
+    pub charge_rate: u64,
+    /// Whether the bench reached its quorum to uphold the conviction. Only
+    /// then did it rule, and only then is the conviction's bounty its. An
+    /// appeal that ran out its window is finalised as the verifiers reached it,
+    /// so its bounty is theirs, however many tie-breakers voted before the
+    /// deadline (wienerlabs/leviathan-net#64).
+    pub appeal_upheld: bool,
     pub voters: Vec<Pubkey>,
     pub appeal_voters: Vec<Pubkey>,
 }
@@ -99,16 +160,29 @@ pub struct AuditVerdict {
 impl AuditVerdict {
     pub const SEEDS_PREFIX: &'static [u8] = b"AuditVerdict";
 
-    /// Who shares the bounty out of the target's forfeited bond: the
-    /// tie-breakers when an appeal upheld the conviction, otherwise the
-    /// verifiers whose quorum convicted it.
+    /// Who shares `bounty_owed`, by seat:
+    ///
+    /// - an overturn pays the bench out of the losing verifiers' forfeits;
+    /// - a conviction that stands pays the bench that upheld it, if the bench
+    ///   reached its quorum to uphold, and otherwise the verifiers whose quorum
+    ///   convicted the target, out of the target's forfeit;
+    /// - a dispute still open owes nobody anything.
+    ///
+    /// An overturned verdict used to name its losers here, so a target cleared
+    /// on appeal paid them the bounty of any other conviction it carried
+    /// (wienerlabs/leviathan-net#64).
     pub fn bounty_recipients(&self) -> &[Pubkey] {
-        let stands =
-            matches!(self.status, VerdictStatus::Upheld | VerdictStatus::Due);
-        if stands && !self.appeal_voters.is_empty() {
-            &self.appeal_voters
-        } else {
-            &self.voters
+        match self.status {
+            VerdictStatus::Overturned => &self.appeal_voters,
+            VerdictStatus::Upheld | VerdictStatus::Due
+                if self.appeal_upheld =>
+            {
+                &self.appeal_voters
+            },
+            VerdictStatus::Upheld | VerdictStatus::Due => &self.voters,
+            VerdictStatus::Voting
+            | VerdictStatus::SlashPending
+            | VerdictStatus::Challenged => &[],
         }
     }
 
@@ -146,8 +220,12 @@ impl AuditVerdict {
             + 2 // uphold_count
             + 2 // settled_count
             + 8 // released_voters
-            + 8 // bench_bounty_owed
-            + 8 // bench_paid
+            + 8 // bounty_owed
+            + 8 // bounty_paid
+            + 1 // charge
+            + 8 // charge_epoch_start
+            + 8 // charge_rate
+            + 1 // appeal_upheld
             + 4 + MAX_VERDICT_VOTERS * 32 // voters
             + 4 + MAX_APPEAL_VOTERS * 32 // appeal_voters
     }
@@ -172,12 +250,22 @@ impl AuditVerdict {
     /// voter's bond for good. A lapsed dispute's votes are withdrawn, and a
     /// standing conviction's released, first; both may be done by anyone
     /// (wienerlabs/leviathan-net#39).
+    ///
+    /// Nor a conviction whose bounty is still owed: the reset erases who it is
+    /// owed to. A conviction that stands is charged, and every seat credited,
+    /// first, all of which anyone may do once the ledger has charged it, so a
+    /// later dispute can never redirect the bounty and the target can never
+    /// hold its verdict open (wienerlabs/leviathan-net#64).
     pub fn is_settled(&self) -> bool {
         match self.status {
             VerdictStatus::Voting => self.voters.is_empty(),
-            VerdictStatus::Upheld => self.all_votes_released(),
+            VerdictStatus::Upheld => {
+                self.all_votes_released()
+                    && self.charge == ConvictionCharge::Charged
+                    && self.bounty_settled()
+            },
             VerdictStatus::Overturned => {
-                self.all_votes_released() && self.bench_settled()
+                self.all_votes_released() && self.bounty_settled()
             },
             VerdictStatus::SlashPending
             | VerdictStatus::Challenged
@@ -296,7 +384,48 @@ impl AuditVerdict {
     pub fn settle_losing_vote(&mut self, position: usize, bench_bounty: u64) {
         self.released_voters |= Self::voter_bit(position);
         self.settled_count += 1;
-        self.bench_bounty_owed += bench_bounty;
+        self.bounty_owed += bench_bounty;
+    }
+
+    /// Records that the conviction stands and ejected the target where the
+    /// ledger will charge it as `ejection` says.
+    pub fn land_ejection(&mut self, ejection: EjectionCharge) {
+        self.status = VerdictStatus::Upheld;
+        self.charge = ConvictionCharge::Ejected;
+        self.charge_epoch_start = ejection.epoch_start;
+        self.charge_rate = ejection.rate;
+    }
+
+    /// Whether this is a conviction that stands, ejected its target, and has
+    /// not been charged against the target's bond yet.
+    pub fn awaits_charge(&self) -> bool {
+        self.status == VerdictStatus::Upheld
+            && self.charge == ConvictionCharge::Ejected
+    }
+
+    /// Whether the ledger has charged the ejection this conviction landed:
+    /// the epoch it landed in is over. Every way out of an epoch that can
+    /// eject passes through its charge (`Coordinator::ejections_charged`), so
+    /// an epoch that no longer has charges pending, or a later one, has made
+    /// it.
+    pub fn ejection_charged(&self, coordinator: &Coordinator) -> bool {
+        !(coordinator.charges_pending()
+            && coordinator.epoch_state.start_timestamp
+                == self.charge_epoch_start)
+    }
+
+    /// Records that the target's bond paid for the conviction, and what that
+    /// forfeit owes the conviction's recipients.
+    pub fn record_charge(&mut self, bounty: u64) {
+        self.charge = ConvictionCharge::Charged;
+        self.bounty_owed = bounty;
+    }
+
+    /// Records a conviction that never reached the ledger as upheld, charged
+    /// at the target's withdrawal, owing `bounty` (wienerlabs/leviathan-net#36).
+    pub fn settle_unlanded(&mut self, bounty: u64) {
+        self.status = VerdictStatus::Upheld;
+        self.record_charge(bounty);
     }
 
     /// Whether the crank has charged every losing vote, so what the bench is
@@ -305,48 +434,68 @@ impl AuditVerdict {
         self.settled_count as usize >= self.voters.len()
     }
 
-    /// What each appeal voter is owed out of the losers' forfeits. What does
-    /// not divide evenly stays in the vault.
-    pub fn bench_share(&self) -> u64 {
-        match self.appeal_voters.len() {
+    /// Whether `bounty_owed` is final, so its seats can be paid: an overturn
+    /// once every loser is charged, a conviction that stands once the target
+    /// is.
+    pub fn bounty_final(&self) -> Result<()> {
+        match self.status {
+            VerdictStatus::Overturned if self.all_losers_settled() => Ok(()),
+            VerdictStatus::Overturned => {
+                err!(ProgramError::LosersNotAllSettled)
+            },
+            VerdictStatus::Upheld
+                if self.charge == ConvictionCharge::Charged =>
+            {
+                Ok(())
+            },
+            VerdictStatus::Upheld | VerdictStatus::Due => {
+                err!(ProgramError::ConvictionNotCharged)
+            },
+            VerdictStatus::Voting
+            | VerdictStatus::SlashPending
+            | VerdictStatus::Challenged => {
+                err!(ProgramError::VerdictOwesNoBounty)
+            },
+        }
+    }
+
+    /// What each recipient is owed out of `bounty_owed`. What does not divide
+    /// evenly stays in the vault.
+    pub fn bounty_share(&self) -> u64 {
+        match self.bounty_recipients().len() {
             0 => 0,
-            seats => self.bench_bounty_owed / seats as u64,
+            seats => self.bounty_owed / seats as u64,
         }
     }
 
-    /// Whether the seat at `seat` in `appeal_voters` was paid its share.
-    pub fn bench_seat_paid(&self, seat: usize) -> bool {
-        self.bench_paid & Self::voter_bit(seat) != 0
+    /// Whether the seat at `seat` in `bounty_recipients` was paid its share.
+    pub fn bounty_seat_paid(&self, seat: usize) -> bool {
+        self.bounty_paid & Self::voter_bit(seat) != 0
     }
 
-    /// Whether nothing is owed to the bench any more: no share to pay, or
+    /// Whether nothing is owed to any seat any more: no share to pay, or
     /// every seat paid.
-    pub fn bench_settled(&self) -> bool {
-        self.bench_share() == 0
-            || (0..self.appeal_voters.len())
-                .all(|seat| self.bench_seat_paid(seat))
+    pub fn bounty_settled(&self) -> bool {
+        self.bounty_share() == 0
+            || (0..self.bounty_recipients().len())
+                .all(|seat| self.bounty_seat_paid(seat))
     }
 
-    /// Marks the seat at `seat` paid and returns its share, if the overturn is
-    /// fully charged and the seat is owed one.
-    pub fn pay_bench_seat(&mut self, seat: usize) -> Result<u64> {
-        if self.status != VerdictStatus::Overturned {
-            return err!(ProgramError::VerdictNotOverturned);
-        }
-        if !self.all_losers_settled() {
-            return err!(ProgramError::LosersNotAllSettled);
-        }
-        if seat >= self.appeal_voters.len() {
+    /// Marks the seat at `seat` paid and returns its share, if what the verdict
+    /// owes is final and the seat is owed one.
+    pub fn pay_bounty_seat(&mut self, seat: usize) -> Result<u64> {
+        self.bounty_final()?;
+        if seat >= self.bounty_recipients().len() {
             return err!(ProgramError::InvalidParameter);
         }
-        if self.bench_seat_paid(seat) {
-            return err!(ProgramError::BenchSeatPaid);
+        if self.bounty_seat_paid(seat) {
+            return err!(ProgramError::BountySeatPaid);
         }
-        let share = self.bench_share();
+        let share = self.bounty_share();
         if share == 0 {
-            return err!(ProgramError::NothingOwedToBench);
+            return err!(ProgramError::NothingOwedToSeats);
         }
-        self.bench_paid |= Self::voter_bit(seat);
+        self.bounty_paid |= Self::voter_bit(seat);
         Ok(share)
     }
 
@@ -371,8 +520,12 @@ impl AuditVerdict {
         self.uphold_count = 0;
         self.settled_count = 0;
         self.released_voters = 0;
-        self.bench_bounty_owed = 0;
-        self.bench_paid = 0;
+        self.bounty_owed = 0;
+        self.bounty_paid = 0;
+        self.charge = ConvictionCharge::Unlanded;
+        self.charge_epoch_start = 0;
+        self.charge_rate = 0;
+        self.appeal_upheld = false;
         self.voters.clear();
         self.appeal_voters.clear();
     }
@@ -404,11 +557,23 @@ mod tests {
             uphold_count: 0,
             settled_count: 0,
             released_voters: 0,
-            bench_bounty_owed: 0,
-            bench_paid: 0,
+            bounty_owed: 0,
+            bounty_paid: 0,
+            charge: ConvictionCharge::Unlanded,
+            charge_epoch_start: 0,
+            charge_rate: 0,
+            appeal_upheld: false,
             voters: voters.to_vec(),
             appeal_voters: vec![],
         }
+    }
+
+    /// A conviction that stands and whose charge the target's bond paid,
+    /// owing `bounty` to its recipients.
+    fn charged(voters: &[Pubkey], bounty: u64) -> AuditVerdict {
+        let mut v = verdict(VerdictStatus::Upheld, voters);
+        v.record_charge(bounty);
+        v
     }
 
     fn voters(count: usize) -> Vec<Pubkey> {
@@ -534,7 +699,7 @@ mod tests {
         lapsed.release_vote(&cast[1], false, true).unwrap();
         assert!(lapsed.is_settled());
 
-        let mut upheld = verdict(VerdictStatus::Upheld, &cast);
+        let mut upheld = charged(&cast, 0);
         assert!(!upheld.is_settled());
         upheld.release_vote(&cast[0], false, false).unwrap();
         assert!(!upheld.is_settled());
@@ -567,27 +732,27 @@ mod tests {
         v.appeal_voters = bench.clone();
         v.settle_losing_vote(0, 50);
         assert_eq!(
-            v.pay_bench_seat(0).unwrap_err(),
+            v.pay_bounty_seat(0).unwrap_err(),
             error!(ProgramError::LosersNotAllSettled),
         );
         v.settle_losing_vote(1, 50);
-        assert_eq!(v.bench_bounty_owed, 100);
+        assert_eq!(v.bounty_owed, 100);
         // 100 does not divide by three: each seat is owed 33.
-        assert_eq!(v.bench_share(), 33);
+        assert_eq!(v.bounty_share(), 33);
         assert!(!v.is_settled(), "the bench is still owed");
-        assert_eq!(v.pay_bench_seat(1).unwrap(), 33);
+        assert_eq!(v.pay_bounty_seat(1).unwrap(), 33);
         assert_eq!(
-            v.pay_bench_seat(1).unwrap_err(),
-            error!(ProgramError::BenchSeatPaid),
+            v.pay_bounty_seat(1).unwrap_err(),
+            error!(ProgramError::BountySeatPaid),
         );
         assert_eq!(
-            v.pay_bench_seat(3).unwrap_err(),
+            v.pay_bounty_seat(3).unwrap_err(),
             error!(ProgramError::InvalidParameter),
         );
-        v.pay_bench_seat(0).unwrap();
+        v.pay_bounty_seat(0).unwrap();
         assert!(!v.is_settled());
-        v.pay_bench_seat(2).unwrap();
-        assert!(v.bench_settled());
+        v.pay_bounty_seat(2).unwrap();
+        assert!(v.bounty_settled());
         assert!(v.is_settled());
     }
 
@@ -597,37 +762,163 @@ mod tests {
         let mut v = verdict(VerdictStatus::Overturned, &losers);
         v.appeal_voters = voters(2);
         v.settle_losing_vote(0, 1);
-        assert_eq!(v.bench_share(), 0);
+        assert_eq!(v.bounty_share(), 0);
         assert!(v.is_settled());
         assert_eq!(
-            v.pay_bench_seat(0).unwrap_err(),
-            error!(ProgramError::NothingOwedToBench),
+            v.pay_bounty_seat(0).unwrap_err(),
+            error!(ProgramError::NothingOwedToSeats),
         );
     }
 
     #[test]
-    fn only_an_overturn_pays_the_bench() {
+    fn an_overturn_names_its_bench_and_never_its_losers() {
+        let losers = voters(2);
+        let bench = voters(3);
+        let mut v = verdict(VerdictStatus::Overturned, &losers);
+        v.appeal_voters = bench.clone();
+        assert_eq!(v.bounty_recipients(), bench.as_slice());
+        for loser in &losers {
+            assert!(!v.bounty_recipients().contains(loser));
+        }
+    }
+
+    #[test]
+    fn a_dispute_still_open_owes_nobody() {
         for status in [
             VerdictStatus::Voting,
             VerdictStatus::SlashPending,
             VerdictStatus::Challenged,
-            VerdictStatus::Upheld,
-            VerdictStatus::Due,
         ] {
-            let mut v = verdict(status, &[]);
+            let mut v = verdict(status, &voters(2));
             v.appeal_voters = voters(1);
-            v.bench_bounty_owed = 10;
+            v.bounty_owed = 10;
+            assert!(v.bounty_recipients().is_empty());
+            assert_eq!(v.bounty_share(), 0);
             assert_eq!(
-                v.pay_bench_seat(0).unwrap_err(),
-                error!(ProgramError::VerdictNotOverturned),
+                v.pay_bounty_seat(0).unwrap_err(),
+                error!(ProgramError::VerdictOwesNoBounty),
             );
         }
     }
 
     #[test]
+    fn a_conviction_pays_nobody_before_the_target_is_charged() {
+        let cast = voters(2);
+        let mut ejected = verdict(VerdictStatus::Voting, &cast);
+        ejected.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate: 200,
+        });
+        let due = verdict(VerdictStatus::Due, &cast);
+        for mut v in [ejected, due] {
+            v.bounty_owed = 10;
+            assert_eq!(v.bounty_recipients(), cast.as_slice());
+            assert_eq!(
+                v.pay_bounty_seat(0).unwrap_err(),
+                error!(ProgramError::ConvictionNotCharged),
+            );
+        }
+    }
+
+    #[test]
+    fn a_charged_conviction_pays_its_voters_once_per_seat() {
+        let cast = voters(3);
+        let mut v = charged(&cast, 100);
+        assert_eq!(v.bounty_recipients(), cast.as_slice());
+        assert_eq!(v.bounty_share(), 33);
+        assert_eq!(v.pay_bounty_seat(2).unwrap(), 33);
+        assert_eq!(
+            v.pay_bounty_seat(2).unwrap_err(),
+            error!(ProgramError::BountySeatPaid),
+        );
+        assert_eq!(
+            v.pay_bounty_seat(3).unwrap_err(),
+            error!(ProgramError::InvalidParameter),
+        );
+        v.pay_bounty_seat(0).unwrap();
+        v.pay_bounty_seat(1).unwrap();
+        assert!(v.bounty_settled());
+    }
+
+    #[test]
+    fn an_upheld_appeal_pays_its_bench_out_of_the_target() {
+        let cast = voters(2);
+        let bench = voters(4);
+        let mut v = charged(&cast, 100);
+        v.appeal_voters = bench.clone();
+        v.appeal_upheld = true;
+        assert_eq!(v.bounty_recipients(), bench.as_slice());
+        assert_eq!(v.bounty_share(), 25);
+        for seat in 0..bench.len() {
+            assert_eq!(v.pay_bounty_seat(seat).unwrap(), 25);
+        }
+        assert!(v.bounty_settled());
+    }
+
+    #[test]
+    fn an_appeal_that_ran_out_its_window_pays_the_verifiers() {
+        // Two tie-breakers voted before the deadline, short of a quorum: the
+        // bench never ruled, and the verifiers' conviction stands as theirs.
+        let cast = voters(2);
+        let mut v = charged(&cast, 100);
+        v.appeal_voters = voters(2);
+        v.overturn_count = 1;
+        v.uphold_count = 1;
+        assert_eq!(v.bounty_recipients(), cast.as_slice());
+        assert_eq!(v.pay_bounty_seat(0).unwrap(), 50);
+        // Due, the same.
+        let mut due = verdict(VerdictStatus::Due, &cast);
+        due.appeal_voters = voters(1);
+        assert_eq!(due.bounty_recipients(), cast.as_slice());
+    }
+
+    #[test]
+    fn a_standing_conviction_is_settled_once_charged_and_credited() {
+        let cast = voters(2);
+        let mut v = verdict(VerdictStatus::Voting, &cast);
+        v.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate: 200,
+        });
+        assert_eq!(v.status, VerdictStatus::Upheld);
+        assert_eq!(v.charge, ConvictionCharge::Ejected);
+        assert_eq!((v.charge_epoch_start, v.charge_rate), (1_000, 200));
+        v.release_vote(&cast[0], false, false).unwrap();
+        v.release_vote(&cast[1], false, false).unwrap();
+        assert!(!v.is_settled(), "the target has not been charged yet");
+        v.record_charge(100);
+        assert!(!v.is_settled(), "the voters have not been credited yet");
+        v.pay_bounty_seat(0).unwrap();
+        assert!(!v.is_settled());
+        v.pay_bounty_seat(1).unwrap();
+        assert!(v.is_settled());
+    }
+
+    #[test]
+    fn a_conviction_owing_nothing_is_settled_once_charged() {
+        let cast = voters(2);
+        let mut v = charged(&cast, 1);
+        v.release_vote(&cast[0], false, false).unwrap();
+        v.release_vote(&cast[1], false, false).unwrap();
+        assert_eq!(v.bounty_share(), 0);
+        assert!(v.is_settled());
+    }
+
+    #[test]
+    fn an_unlanded_conviction_settled_at_withdrawal_is_upheld_and_owed() {
+        let cast = voters(2);
+        let mut v = verdict(VerdictStatus::Due, &cast);
+        v.settle_unlanded(80);
+        assert_eq!(v.status, VerdictStatus::Upheld);
+        assert_eq!(v.charge, ConvictionCharge::Charged);
+        assert_eq!(v.bounty_owed, 80);
+        assert_eq!(v.pay_bounty_seat(0).unwrap(), 40);
+    }
+
+    #[test]
     fn a_full_voter_list_has_a_bit_for_every_vote() {
         let cast = voters(MAX_VERDICT_VOTERS);
-        let mut v = verdict(VerdictStatus::Upheld, &cast);
+        let mut v = charged(&cast, 0);
         for voter in &cast {
             assert!(!v.is_settled());
             v.release_vote(voter, false, false).unwrap();
@@ -684,16 +975,86 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_clears_the_released_votes() {
+    fn an_ejection_is_charged_once_its_epoch_has_none_pending() {
+        use psyche_coordinator::RunState;
+
+        let mut v = verdict(VerdictStatus::Voting, &voters(2));
+        v.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate: 200,
+        });
+        let at = |run_state: RunState, start: u64| {
+            let mut coordinator =
+                Box::new(<Coordinator as bytemuck::Zeroable>::zeroed());
+            coordinator.run_state = run_state;
+            coordinator.epoch_state.start_timestamp = start;
+            coordinator
+        };
+        // Its own epoch, still running or cooling down: not charged yet.
+        for state in [
+            RunState::RoundTrain,
+            RunState::RoundWitness,
+            RunState::Cooldown,
+        ] {
+            assert!(!v.ejection_charged(&at(state, 1_000)), "{state}");
+        }
+        // Its epoch ended, through the charge, into any state that does not
+        // charge: its roster is still on the account, but charged.
+        for state in [
+            RunState::WaitingForMembers,
+            RunState::Paused,
+            RunState::Finished,
+            RunState::Uninitialized,
+        ] {
+            assert!(v.ejection_charged(&at(state, 1_000)), "{state}");
+        }
+        // A later epoch, from its warmup on.
+        for state in [
+            RunState::Warmup,
+            RunState::RoundTrain,
+            RunState::RoundWitness,
+            RunState::Cooldown,
+        ] {
+            assert!(v.ejection_charged(&at(state, 1_100)), "{state}");
+        }
+    }
+
+    #[test]
+    fn a_full_verdict_fills_its_account_exactly() {
+        let mut v = charged(&voters(MAX_VERDICT_VOTERS), u64::MAX);
+        v.appeal_voters = voters(MAX_APPEAL_VOTERS);
+        v.appeal_upheld = true;
+        v.charge_epoch_start = u64::MAX;
+        v.charge_rate = u64::MAX;
+        let mut data = vec![];
+        v.try_serialize(&mut data).unwrap();
+        assert_eq!(data.len(), AuditVerdict::space_with_discriminator());
+        let back = AuditVerdict::try_deserialize(&mut &data[..]).unwrap();
+        assert_eq!(back.charge, ConvictionCharge::Charged);
+        assert_eq!(back.bounty_owed, u64::MAX);
+        assert_eq!(back.voters, v.voters);
+        assert_eq!(back.appeal_voters, v.appeal_voters);
+    }
+
+    #[test]
+    fn a_reset_clears_the_released_votes_and_the_charge() {
         let cast = voters(2);
-        let mut v = verdict(VerdictStatus::Upheld, &cast);
+        let mut v = verdict(VerdictStatus::Voting, &cast);
+        v.land_ejection(EjectionCharge {
+            epoch_start: 1_000,
+            rate: 200,
+        });
         v.release_vote(&cast[0], false, false).unwrap();
         v.release_vote(&cast[1], false, false).unwrap();
-        v.bench_bounty_owed = 7;
-        v.bench_paid = 1;
+        v.record_charge(7);
+        v.bounty_paid = 1;
+        v.appeal_upheld = true;
         v.reset_for_round(2, 0);
         assert_eq!(v.released_voters, 0);
-        assert_eq!((v.bench_bounty_owed, v.bench_paid), (0, 0));
+        assert_eq!((v.bounty_owed, v.bounty_paid), (0, 0));
+        assert_eq!(v.charge, ConvictionCharge::Unlanded);
+        assert_eq!((v.charge_epoch_start, v.charge_rate), (0, 0));
+        assert!(!v.appeal_upheld);
         assert!(v.voters.is_empty());
         assert_eq!(v.status, VerdictStatus::Voting);
     }

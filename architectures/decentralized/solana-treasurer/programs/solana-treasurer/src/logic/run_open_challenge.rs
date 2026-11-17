@@ -94,6 +94,7 @@ pub fn run_open_challenge_processor(
     verdict.challenger = context.accounts.challenger.key();
     verdict.overturn_count = 0;
     verdict.uphold_count = 0;
+    verdict.appeal_upheld = false;
     verdict.appeal_voters.clear();
 
     msg!(

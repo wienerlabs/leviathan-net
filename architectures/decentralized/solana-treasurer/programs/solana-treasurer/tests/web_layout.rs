@@ -29,7 +29,7 @@ fn participant_is_the_length_the_web_decoder_expects() {
 }
 
 /// Mirrors `VERDICT_LAYOUT_BY_SIZE` in the same file, which stops at 4328
-/// (`appealsWithDeadline`). Three generations followed it:
+/// (`appealsWithDeadline`). Four generations followed it:
 ///
 /// - 4368 records the payload the target signed: `evidence` (step u32,
 ///   trainer nonce u32, results digest 32 bytes) sits between `batch_end` and
@@ -39,13 +39,20 @@ fn participant_is_the_length_the_web_decoder_expects() {
 ///   `bench_bounty_owed` and `bench_paid` (one bit per appeal voter). Read
 ///   with the 4368 layout, they land in the voter list's length and every
 ///   voter after it is misread.
-/// - 4400, this one, puts the epoch the payload was trained in (`epoch_start`,
-///   u64) at the head of `evidence`, before the step
-///   (wienerlabs/leviathan-net#67). Every field after it moves 8 bytes.
+/// - 4400 puts the epoch the payload was trained in (`epoch_start`, u64) at
+///   the head of `evidence`, before the step (wienerlabs/leviathan-net#67).
+///   Every field after it moves 8 bytes.
+/// - 4418, this one, records how far a conviction has reached the target's
+///   bond, and whether the bench upheld it (wienerlabs/leviathan-net#64). The
+///   two bounty fields keep their place under new names, `bounty_owed` and
+///   `bounty_paid`, and are followed by `charge` (one byte: 0 unlanded,
+///   1 ejected, 2 charged), `charge_epoch_start` (u64), `charge_rate` (u64)
+///   and `appeal_upheld` (one byte), before `voters`. The voter lists move 18
+///   bytes.
 ///
-/// A decoder has to learn 4400 before it reads accounts from the deployment
+/// A decoder has to learn 4418 before it reads accounts from the deployment
 /// carrying it.
 #[test]
 fn audit_verdict_is_the_length_the_web_decoder_expects() {
-    assert_eq!(AuditVerdict::space_with_discriminator(), 4400);
+    assert_eq!(AuditVerdict::space_with_discriminator(), 4418);
 }

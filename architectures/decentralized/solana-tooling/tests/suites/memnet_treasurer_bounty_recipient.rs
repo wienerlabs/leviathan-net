@@ -1,12 +1,15 @@
 //! Reproduces the unvalidated bounty recipient found in the internal review of
 //! the on-chain programs (wienerlabs/leviathan#15).
 //!
-//! `participant_bond_finalize_withdraw` splits the slash bounty two ways. When
-//! the verdict names voters, each recipient is unpacked as a `TokenAccount` and
-//! checked against both the recorded voter and the collateral mint. When it
-//! names none, the bounty goes to `remaining_accounts[0]` - an account the
-//! withdrawing participant supplies, and the withdrawing participant is the one
-//! being slashed.
+//! `participant_bond_finalize_withdraw` used to split the slash bounty two
+//! ways. When the verdict named voters, each recipient was unpacked as a
+//! `TokenAccount` and checked against both the recorded voter and the
+//! collateral mint. When it named none, the bounty went to
+//! `remaining_accounts[0]` - an account the withdrawing participant supplies,
+//! and the withdrawing participant is the one being slashed. Since
+//! wienerlabs/leviathan-net#64 a conviction's bounty is credited to its voters
+//! by seat and never paid at the withdrawal; the reporter branch remains for a
+//! slash no verdict accounts for, which is what this test convicts through.
 //!
 //! That branch used to check nothing at all, so naming your own token account
 //! handed you back the bounty half of your own forfeiture. It was reachable
