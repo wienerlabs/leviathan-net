@@ -35,6 +35,7 @@ use std::future::Future;
 use std::{cmp::min, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc},
+    task::{JoinError, JoinSet},
     time::timeout,
 };
 use tracing::{error, info, trace, warn};
@@ -58,6 +59,14 @@ pub struct SolanaBackendRunner {
     account: Pubkey,
     updates: broadcast::Receiver<Coordinator>,
     init: Option<Coordinator>,
+    /// The checkpoint sends this runner started whose outcome it has not read
+    /// yet. They used to be detached, so a client that exited right after its
+    /// last checkpoint dropped the send with the process
+    /// (wienerlabs/leviathan-net#85).
+    checkpoints: JoinSet<Result<()>>,
+    /// The first checkpoint send read to have failed, kept until a flush
+    /// reports it.
+    failed_checkpoint: Option<anyhow::Error>,
 }
 
 async fn subscribe_to_account(
@@ -270,6 +279,8 @@ impl SolanaBackend {
             instance: coordinator_instance,
             account: coordinator_account,
             init: Some(init),
+            checkpoints: JoinSet::new(),
+            failed_checkpoint: None,
         })
     }
 
@@ -400,12 +411,16 @@ impl SolanaBackend {
         );
     }
 
+    /// Records `repo` as the run's checkpoint, retried as every scheduled send
+    /// is. Unlike the others it is not spawned here: the returned future is the
+    /// send, and the caller keeps it, so that a client about to exit can wait
+    /// for its last checkpoint to land (wienerlabs/leviathan-net#85).
     pub fn send_checkpoint(
         &self,
         coordinator_instance: Pubkey,
         coordinator_account: Pubkey,
         repo: Checkpoint,
-    ) {
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
         let user = self.get_payer();
         let instruction = instructions::coordinator_checkpoint(
             &coordinator_instance,
@@ -413,7 +428,7 @@ impl SolanaBackend {
             &user,
             repo,
         );
-        self.spawn_scheduled_send("Checkpoint", &[instruction], &[], RpcCallType::Checkpoint);
+        self.scheduled_send("Checkpoint", &[instruction], &[], RpcCallType::Checkpoint)
     }
 
     /// Whether `join_authority`, holding `join_authority_account`, is a
@@ -793,11 +808,24 @@ impl SolanaBackend {
         signers: &[Arc<Keypair>],
         call_type: RpcCallType,
     ) {
+        tokio::task::spawn(self.scheduled_send(name, instructions, signers, call_type));
+    }
+
+    /// Sends `instructions` with retries, recording the call and its outcome,
+    /// and logging a failure. Returns the outcome, so a caller that keeps the
+    /// send can report it.
+    fn scheduled_send(
+        &self,
+        name: &str,
+        instructions: &[Instruction],
+        signers: &[Arc<Keypair>],
+        call_type: RpcCallType,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
         let backend = self.clone();
         let name = name.to_string();
         let instructions = instructions.to_vec();
         let signers = signers.to_vec();
-        tokio::task::spawn(async move {
+        async move {
             event!(coordinator::RpcCallSubmitted { call_type });
             match backend.send_and_retry(&name, &instructions, &signers).await {
                 Ok(_) => {
@@ -805,6 +833,7 @@ impl SolanaBackend {
                         call_type,
                         result: Ok(())
                     });
+                    Ok(())
                 }
                 Err(err) => {
                     event!(coordinator::RpcCallResult {
@@ -815,9 +844,10 @@ impl SolanaBackend {
                         "Failed to send {} transaction after all retries: {}",
                         name, err
                     );
+                    Err(err.context(format!("{name} transaction failed after all retries")))
                 }
             }
-        });
+        }
     }
 
     /// Tries the operation against each RPC in order, with max retries per RPC.
@@ -899,13 +929,49 @@ impl WatcherBackend for SolanaBackendRunner {
     }
 
     async fn send_checkpoint(&mut self, checkpoint: model::Checkpoint) -> Result<()> {
-        self.backend
-            .send_checkpoint(self.instance, self.account, checkpoint);
+        self.reap_checkpoints();
+        self.checkpoints.spawn(self.backend.send_checkpoint(
+            self.instance,
+            self.account,
+            checkpoint,
+        ));
         Ok(())
+    }
+
+    /// Waits for every checkpoint send still under way, and returns the first
+    /// that failed, whenever it failed. A checkpoint that could not be
+    /// recorded is the run's model missing from chain, so it fails the
+    /// client's shutdown (wienerlabs/leviathan-net#85).
+    async fn flush_checkpoints(&mut self) -> Result<()> {
+        while let Some(joined) = self.checkpoints.join_next().await {
+            self.note_checkpoint(joined);
+        }
+        match self.failed_checkpoint.take() {
+            Some(failed) => Err(failed),
+            None => Ok(()),
+        }
     }
 }
 
 impl SolanaBackendRunner {
+    /// Reads the outcome of every checkpoint send that has finished, so the
+    /// set holds only those under way.
+    fn reap_checkpoints(&mut self) {
+        while let Some(joined) = self.checkpoints.try_join_next() {
+            self.note_checkpoint(joined);
+        }
+    }
+
+    /// Keeps the first failure among the checkpoint sends read so far.
+    fn note_checkpoint(&mut self, joined: std::result::Result<Result<()>, JoinError>) {
+        let outcome = joined
+            .map_err(|error| anyhow!("the checkpoint send did not finish: {error}"))
+            .and_then(|sent| sent);
+        if let Err(error) = outcome {
+            self.failed_checkpoint.get_or_insert(error);
+        }
+    }
+
     pub fn updates(&self) -> broadcast::Receiver<Coordinator> {
         self.updates.resubscribe()
     }

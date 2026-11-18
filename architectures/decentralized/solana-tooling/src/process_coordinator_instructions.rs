@@ -4,6 +4,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::CoordinatorProgress;
+use psyche_coordinator::model::Checkpoint;
 use psyche_coordinator::model::Model;
 use psyche_core::NodeIdentity;
 use psyche_solana_coordinator::RunMetadata;
@@ -14,6 +15,7 @@ use psyche_solana_coordinator::accounts::OwnerCoordinatorAccounts;
 use psyche_solana_coordinator::accounts::PermissionlessCoordinatorAccounts;
 use psyche_solana_coordinator::coordinator_account_from_bytes;
 use psyche_solana_coordinator::find_coordinator_instance;
+use psyche_solana_coordinator::instruction::Checkpoint as CheckpointInstruction;
 use psyche_solana_coordinator::instruction::FreeCoordinator;
 use psyche_solana_coordinator::instruction::InitCoordinator;
 use psyche_solana_coordinator::instruction::JoinRun;
@@ -352,6 +354,33 @@ pub async fn process_coordinator_witness(
     let instruction = Instruction {
         accounts: accounts.to_account_metas(None),
         data: witness.data(),
+        program_id: psyche_solana_coordinator::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[user])
+        .await?;
+    Ok(())
+}
+
+/// `user`, a client on the run's roster, records `repo` as the run's
+/// checkpoint.
+pub async fn process_coordinator_checkpoint(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    user: &Keypair,
+    coordinator_instance: &Pubkey,
+    coordinator_account: &Pubkey,
+    repo: Checkpoint,
+) -> Result<()> {
+    let accounts = PermissionlessCoordinatorAccounts {
+        user: user.pubkey(),
+        coordinator_instance: *coordinator_instance,
+        coordinator_account: *coordinator_account,
+        slot_hashes: solana_sdk::sysvar::slot_hashes::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: CheckpointInstruction { repo }.data(),
         program_id: psyche_solana_coordinator::ID,
     };
     endpoint

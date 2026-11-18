@@ -85,6 +85,11 @@ impl psyche_watcher::Backend for ChannelCoordinatorBackend {
     async fn send_checkpoint(&mut self, _checkpoint: model::Checkpoint) -> Result<()> {
         bail!("Server does not send checkpoints");
     }
+
+    /// The server sends no checkpoints, so none is ever pending.
+    async fn flush_checkpoints(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 type DataServer = DataProviderTcpServer<LocalDataProvider, ChannelCoordinatorBackend>;
