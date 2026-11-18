@@ -12,6 +12,7 @@ use anyhow::Result;
 use psyche_solana_coordinator::coordinator_account_from_bytes;
 use psyche_solana_treasurer::accounts::ParticipantReleaseVerdictVoteAccounts;
 use psyche_solana_treasurer::accounts::RunChargeConvictionAccounts;
+use psyche_solana_treasurer::accounts::RunChargeDueConvictionAccounts;
 use psyche_solana_treasurer::accounts::RunFinalizeSlashAccounts;
 use psyche_solana_treasurer::accounts::RunPayVerdictBountyAccounts;
 use psyche_solana_treasurer::accounts::RunSlashLosingVerifierAccounts;
@@ -19,16 +20,19 @@ use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::instruction::ParticipantReleaseVerdictVote;
 use psyche_solana_treasurer::instruction::RunChargeConviction;
+use psyche_solana_treasurer::instruction::RunChargeDueConviction;
 use psyche_solana_treasurer::instruction::RunFinalizeSlash;
 use psyche_solana_treasurer::instruction::RunPayVerdictBounty;
 use psyche_solana_treasurer::instruction::RunSlashLosingVerifier;
 use psyche_solana_treasurer::logic::ParticipantReleaseVerdictVoteParams;
 use psyche_solana_treasurer::logic::RunChargeConvictionParams;
+use psyche_solana_treasurer::logic::RunChargeDueConvictionParams;
 use psyche_solana_treasurer::logic::RunFinalizeSlashParams;
 use psyche_solana_treasurer::logic::RunPayVerdictBountyParams;
 use psyche_solana_treasurer::logic::RunSlashLosingVerifierParams;
 use psyche_solana_treasurer::state::appeal_window_open;
 use psyche_solana_treasurer::state::conviction_landing;
+use psyche_solana_treasurer::state::on_charging_roster;
 use psyche_solana_treasurer::state::AuditVerdict;
 use psyche_solana_treasurer::state::Landing;
 use psyche_solana_treasurer::state::ConvictionCharge;
@@ -118,7 +122,8 @@ pub struct DisputeSettlement {
     /// A conviction whose windows had closed, or that was due, finalised.
     pub conviction_finalized: bool,
     /// A conviction that ejected the target charged against its bond, now
-    /// that the ledger has charged the ejection.
+    /// that the ledger has charged the ejection, or a due one charged against
+    /// it because the target is on no roster an epoch will still charge.
     pub conviction_charged: bool,
     /// Votes released from a standing conviction, or withdrawn from a dispute
     /// whose round is over.
@@ -179,7 +184,8 @@ pub struct DisputeSweep {
     pub open: usize,
     /// Convictions whose windows had closed, or that were due, finalised.
     pub convictions_finalized: usize,
-    /// Convictions that ejected their target charged against its bond.
+    /// Convictions charged against their target's bond: one that ejected it,
+    /// or a due one whose target is on no roster an epoch will still charge.
     pub convictions_charged: usize,
     /// Votes released or withdrawn.
     pub votes_freed: usize,
@@ -259,7 +265,9 @@ const SETTLEMENT_ATTEMPTS: usize = 3;
 /// - it finalises a conviction whose windows have closed, or a due one that
 ///   can land now;
 /// - it charges the target's bond for a conviction that ejected it, once the
-///   epoch it was ejected in has been charged;
+///   epoch it was ejected in has been charged, or for a due one whose target
+///   is on no roster an epoch will still charge, which it could otherwise
+///   never land on (wienerlabs/leviathan-net#74);
 /// - it frees the votes of a conviction that stands, or of a dispute whose
 ///   round is over;
 /// - it charges an overturn's losing verifiers;
@@ -313,6 +321,18 @@ pub async fn settle_previous_dispute(
         Ok(charged) => settlement.conviction_charged = charged,
         Err(error) => note(error),
     }
+    match charge_due_conviction(
+        endpoint,
+        payer,
+        run,
+        coordinator_account,
+        target,
+    )
+    .await
+    {
+        Ok(charged) => settlement.conviction_charged |= charged,
+        Err(error) => note(error),
+    }
     match free_settled_votes(endpoint, payer, run, coordinator_account, target)
         .await
     {
@@ -349,6 +369,10 @@ struct CoordinatorView {
     /// Whether the ledger has charged the ejection the verdict's conviction
     /// landed, if it landed one.
     ejection_charged: bool,
+    /// Whether the target is on the roster of an epoch the ledger will still
+    /// charge, as `on_charging_roster` decides on chain. A due conviction is
+    /// charged against the bond directly only when it is not.
+    on_charging_roster: bool,
 }
 
 async fn coordinator_view(
@@ -386,6 +410,7 @@ async fn coordinator_view(
         target_index,
         lands_now,
         ejection_charged: verdict.ejection_charged(coordinator),
+        on_charging_roster: on_charging_roster(coordinator, &verdict.target),
     };
     Ok(view)
 }
@@ -495,6 +520,48 @@ async fn charge_ejected_conviction(
             if get_audit_verdict(endpoint, run, target)
                 .await?
                 .is_some_and(|now| now.charge != ConvictionCharge::Ejected) =>
+        {
+            Ok(false)
+        },
+        Err(err) => Err(err),
+    }
+}
+
+/// Charges `target`'s bond for the conviction its verdict records as due, when
+/// the target is on no roster an epoch will still charge: it could otherwise
+/// land only if the target came back, or be charged only at the target's own
+/// withdrawal (wienerlabs/leviathan-net#74). Returns whether it did.
+async fn charge_due_conviction(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+) -> Result<bool> {
+    let Some(verdict) = get_audit_verdict(endpoint, run, target).await? else {
+        return Ok(false);
+    };
+    if verdict.status != VerdictStatus::Due {
+        return Ok(false);
+    }
+    let view =
+        coordinator_view(endpoint, coordinator_account, &verdict).await?;
+    if view.on_charging_roster {
+        return Ok(false);
+    }
+    let instruction = run_charge_due_conviction_instruction(
+        &payer.pubkey(),
+        run,
+        coordinator_account,
+        target,
+    );
+    match endpoint.process_instruction(payer, instruction).await {
+        Ok(_) => Ok(true),
+        // Someone else charged it first, or the target's withdrawal did.
+        Err(_)
+            if get_audit_verdict(endpoint, run, target)
+                .await?
+                .is_some_and(|now| now.status != VerdictStatus::Due) =>
         {
             Ok(false)
         },
@@ -743,6 +810,49 @@ pub async fn process_treasurer_run_charge_conviction(
     target: &Pubkey,
 ) -> Result<()> {
     let instruction = run_charge_conviction_instruction(
+        &payer.pubkey(),
+        run,
+        coordinator_account,
+        target,
+    );
+    endpoint.process_instruction(payer, instruction).await?;
+    Ok(())
+}
+
+/// The instruction charging `target`'s bond for the conviction its verdict
+/// records as due.
+pub fn run_charge_due_conviction_instruction(
+    payer: &Pubkey,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+) -> Instruction {
+    let accounts = RunChargeDueConvictionAccounts {
+        payer: *payer,
+        run: *run,
+        coordinator_account: *coordinator_account,
+        audit_verdict: find_audit_verdict(run, target),
+        target_participant: find_participant(run, target),
+    };
+    Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunChargeDueConviction {
+            params: RunChargeDueConvictionParams { target: *target },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    }
+}
+
+/// Charges `target`'s bond for the conviction its verdict records as due.
+pub async fn process_treasurer_run_charge_due_conviction(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    target: &Pubkey,
+) -> Result<()> {
+    let instruction = run_charge_due_conviction_instruction(
         &payer.pubkey(),
         run,
         coordinator_account,

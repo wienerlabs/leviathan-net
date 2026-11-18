@@ -28,6 +28,23 @@ pub fn ejection_pending_charge(coordinator: &Coordinator, user: &Pubkey) -> bool
             })
 }
 
+/// Whether `user` is on the roster of an epoch the ledger will still charge:
+/// among its clients, or those that left it, while its charge is pending. A
+/// slash it earns there is still to come, and a conviction against it can
+/// still land there as an ejection, through `run_finalize_slash`. Between
+/// epochs the last one has been charged, even though its roster is still on
+/// the account.
+pub fn on_charging_roster(coordinator: &Coordinator, user: &Pubkey) -> bool {
+    let signer = user.to_bytes();
+    coordinator.charges_pending()
+        && coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .chain(coordinator.epoch_state.exited_clients.iter())
+            .any(|client| *client.id.signer() == signer)
+}
+
 /// What `user`'s bond still owes to slashes the ledger in `account` has not
 /// charged yet, at `now` in `run`: an ejection in the epoch under way, and its
 /// own conviction, `own_verdict`, if that cannot be overturned any more but

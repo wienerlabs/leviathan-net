@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use psyche_solana_coordinator::CoordinatorAccount;
 
+use crate::state::on_charging_roster;
 use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
@@ -78,18 +79,10 @@ pub fn withdrawal_standing(
     if participant.open_verdict_votes > 0 {
         return WithdrawalStanding::Held(WithdrawalHold::VotesAtStake);
     }
-    let coordinator = &coordinator_account.state.coordinator;
-    let signer = user.to_bytes();
     // A slash the roster earns is charged when the epoch ends; until then it
-    // is still to come. Between epochs the last one has been charged, even
-    // though its roster is still on the account.
-    let in_charging_epoch = coordinator.charges_pending()
-        && coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .chain(coordinator.epoch_state.exited_clients.iter())
-            .any(|client| *client.id.signer() == signer);
+    // is still to come.
+    let in_charging_epoch =
+        on_charging_roster(&coordinator_account.state.coordinator, user);
 
     let pending = own_verdict.filter(|verdict| {
         matches!(

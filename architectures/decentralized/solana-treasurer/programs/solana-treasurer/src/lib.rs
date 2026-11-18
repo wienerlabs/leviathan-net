@@ -198,6 +198,13 @@ pub mod psyche_solana_treasurer {
         run_charge_conviction_processor(context, params)
     }
 
+    pub fn run_charge_due_conviction(
+        context: Context<RunChargeDueConvictionAccounts>,
+        params: RunChargeDueConvictionParams,
+    ) -> Result<()> {
+        run_charge_due_conviction_processor(context, params)
+    }
+
     pub fn run_slash_equivocation(
         context: Context<RunSlashEquivocationAccounts>,
         params: RunSlashEquivocationParams,
@@ -416,4 +423,10 @@ pub enum ProgramError {
 
     #[msg("This slash names no reporter, so its bounty stays in the vault")]
     SlashReportOwesNoBounty,
+
+    #[msg("The verdict holds no conviction recorded as due")]
+    ConvictionNotDue,
+
+    #[msg("The target is on the roster of an epoch that will be charged; its conviction lands there through run_finalize_slash")]
+    TargetInChargingEpoch,
 }

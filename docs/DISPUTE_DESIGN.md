@@ -158,9 +158,11 @@ out of reach for good (wienerlabs/leviathan-net#39). Two rules now close that:
 
   A conviction that stands is settled, and its account free for a new dispute,
   only once it is charged and every recipient credited. The target cannot hold
-  an ejected conviction open, because its charge needs nothing of it. A `Due`
-  conviction still waits, as it always has, for the target to come back into
-  a charging epoch or to withdraw (wienerlabs/leviathan-net#74). Nor does a voter have to
+  an ejected conviction open, because its charge needs nothing of it. Nor can
+  it hold a `Due` one open by staying away: once the target is on no roster an
+  epoch will still charge, anyone may send `run_charge_due_conviction`, which
+  charges the bond as the withdrawal would and records the bounty the same way
+  (wienerlabs/leviathan-net#74). Nor does a voter have to
   wait for someone to dispute the target again: the verifier daemon settles
   every open dispute in the run, as far as nobody's consent is needed, at the
   end of each pass, after its own judging, and `bond-withdraw-finalize`
@@ -325,7 +327,18 @@ step from being skipped:
   bond forever with nothing able to finalise against it. Its withdrawal charges
   the conviction directly, at the run's slashing rate at that time, records
   what that owes whoever ruled it, who are credited by seat, and records the
-  verdict as upheld, so it is charged exactly once. For the same reason a run with a challenge window must
+  verdict as upheld, so it is charged exactly once. A target that never
+  withdraws would still leave a `Due` conviction, and the bounty its voters
+  are owed, waiting for good. So anyone may charge a `Due` conviction through
+  `run_charge_due_conviction` while the target is on no roster an epoch will
+  still charge: between epochs, or once it has left. It is the withdrawal's
+  charge, made without the target: the slashing rate in force, out of what the
+  ledger does not already claim, not counted as a settled point since the
+  ledger never saw it, and the verdict recorded as upheld and charged. While
+  the target is on such a roster it is refused, since the conviction can still
+  land there as an ejection. A target that comes back afterwards is not
+  charged again: the verdict is no longer due (wienerlabs/leviathan-net#74).
+  For the same reason a run with a challenge window must
   give appeals a deadline (`appeal_window_seconds > 0`). The windows are read
   from the run as they stand, so the run authority changing them moves the
   deadlines of disputes in flight, as it always has. The run authority's

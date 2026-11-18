@@ -645,6 +645,34 @@ pub fn treasurer_run_charge_conviction(
     )
 }
 
+/// Charges `target`'s bond in run `treasurer_index` for the conviction its
+/// verdict records as due, at the slashing rate in force, once `target` is on
+/// no roster an epoch will still charge, and records what that owes the
+/// conviction's recipients. Anyone may send it (wienerlabs/leviathan-net#74).
+pub fn treasurer_run_charge_due_conviction(
+    treasurer_index: u64,
+    coordinator_account: &Pubkey,
+    payer: &Pubkey,
+    target: &Pubkey,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunChargeDueConvictionAccounts {
+            payer: *payer,
+            run,
+            coordinator_account: *coordinator_account,
+            audit_verdict: psyche_solana_treasurer::find_audit_verdict(&run, target),
+            target_participant: psyche_solana_treasurer::find_participant(&run, target),
+        },
+        psyche_solana_treasurer::instruction::RunChargeDueConviction {
+            params: psyche_solana_treasurer::logic::RunChargeDueConvictionParams {
+                target: *target,
+            },
+        },
+    )
+}
+
 /// Charges the slash that ejected `target` in run `treasurer_index`, in the
 /// epoch that started at `charge_epoch_start`, against its bond, once that
 /// epoch has been charged, and records what that owes the slash's reporter
