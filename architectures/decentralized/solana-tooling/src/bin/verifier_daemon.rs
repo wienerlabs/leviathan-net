@@ -15,7 +15,11 @@ use leviathan_verifier::build_replay_trainer;
 use leviathan_verifier::checkpoint_repo_files;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::parse_dtype;
+use leviathan_verifier::payload_band;
+use leviathan_verifier::sends_signs;
 use leviathan_verifier::DumpKey;
+use leviathan_verifier::PayloadBand;
 use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ReplayAssignment;
@@ -34,7 +38,6 @@ use psyche_solana_tooling::daemon::audit_pass;
 use psyche_solana_tooling::daemon::parse_committer;
 use psyche_solana_tooling::daemon::AuditConfig;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
-use psyche_verifier::DEFAULT_BAND;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
@@ -71,8 +74,25 @@ struct Args {
     /// reproduce, the first of a cold-start epoch (wienerlabs/leviathan-net#47).
     #[arg(long)]
     replay_data_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = DEFAULT_BAND)]
-    band: f32,
+    /// The band on a payload's relative L2 distance from the honest result.
+    /// A run that sends 1-bit signs is judged on its churn and flips instead,
+    /// and is refused this band unless the daemon only watches (--dry-run).
+    #[arg(long)]
+    band: Option<f32>,
+    /// For a run that sends 1-bit signs, the share of a payload's coordinates
+    /// a replay may pick differently, and of those both pick, the share it
+    /// may sign differently. Calibrate both with `calibrate-band` for the
+    /// hardware this daemon replays on (`docs/BAND_CALIBRATION.md`,
+    /// wienerlabs/leviathan-net#49).
+    #[arg(long)]
+    churn_band: Option<f32>,
+    #[arg(long)]
+    flip_band: Option<f32>,
+    /// The dtype this daemon replays in. The network trains in bf16; a replay
+    /// in bf16 churns less against it, but runs far slower on a CPU, and its
+    /// band has to be calibrated for it (`docs/BAND_CALIBRATION.md`).
+    #[arg(long, default_value = "fp32")]
+    replay_dtype: String,
     #[arg(long, default_value_t = 8)]
     poll_secs: u64,
     #[arg(long, default_value_t = false)]
@@ -140,13 +160,16 @@ struct Loaded {
 /// daemon runs are judged as they land.
 struct Replayer {
     data_dir: PathBuf,
+    /// The dtype it replays in (`--replay-dtype`).
+    kind: tch::Kind,
     loaded: Option<Loaded>,
 }
 
 impl Replayer {
-    fn new(data_dir: PathBuf) -> Self {
+    fn new(data_dir: PathBuf, kind: tch::Kind) -> Self {
         Self {
             data_dir,
+            kind,
             loaded: None,
         }
     }
@@ -163,13 +186,12 @@ impl Replayer {
                 llm,
                 checkpoint_repo_files(&checkpoint)?,
                 tch::Device::Cpu,
-                // What the daemon has always replayed in. The network trains
-                // in BFloat16 and that gap is the largest source of honest
-                // drift, but narrowing it is a decision for the calibration
-                // harness to inform rather than a side effect of making the
-                // dtype configurable: moving the verifier's dtype moves what
-                // counts as a forgery.
-                tch::Kind::Float,
+                // fp32 unless the operator chose otherwise. The network trains
+                // in BFloat16. A bf16 replay churns less against it, but is
+                // emulated on a CPU and far slower, and moving the dtype moves
+                // what counts as a forgery, so the band has to be calibrated
+                // for the dtype chosen (wienerlabs/leviathan-net#49).
+                self.kind,
             );
             let trainer = build_replay_trainer(&config)?;
             let (token_size, shuffle) = replay_data_layout(llm)?;
@@ -291,6 +313,8 @@ impl Replayer {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let band = payload_band(args.band, args.churn_band, args.flip_band)?;
+    let replay_kind = parse_dtype(&args.replay_dtype)?;
     // Without either, the daemon has nothing to judge a payload against. A
     // pass with neither judges only equivocations, which is what a replaying
     // daemon does once nothing can be replayed, so the mistake is caught here
@@ -327,18 +351,50 @@ async fn main() -> Result<()> {
         None => ToolboxEndpoint::new_devnet().await,
     };
 
+    // A run that sends 1-bit signs is judged on its churn and flips. A band
+    // on their distance either convicts honest replays from other hardware or
+    // lets a cheater turn over a large share of its signs. A band on the
+    // signs cannot see magnitudes, so a run that sends values is judged on
+    // its distance (wienerlabs/leviathan-net#49). A daemon that only watches
+    // may hold either to either.
+    if !args.dry_run {
+        let state =
+            get_coordinator_account_state(&mut endpoint, &coordinator_account)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "coordinator account {} not found",
+                        coordinator_account
+                    )
+                })?;
+        let Model::LLM(llm) = state.coordinator.model;
+        match (sends_signs(&llm.optimizer), band) {
+            (true, PayloadBand::Distance(_)) => {
+                return Err(anyhow!(
+                    "the run sends 1-bit signs: pass --churn-band and --flip-band, calibrated with calibrate-band for this daemon's hardware (docs/BAND_CALIBRATION.md), or watch with --dry-run"
+                ));
+            },
+            (false, PayloadBand::Signs(_)) => {
+                return Err(anyhow!(
+                    "the run sends values, not 1-bit signs, and a band on the signs cannot see their magnitudes: pass --band, or watch with --dry-run"
+                ));
+            },
+            _ => {},
+        }
+    }
+
     let config = AuditConfig {
         run_id: args.run_id.clone(),
         submitted_dir: args.submitted_dir.clone(),
         reference_dir: args.reference_dir.clone(),
-        band: args.band,
+        band,
         audit_assigned: args.audit_assigned,
         dry_run: args.dry_run,
         verdict_mode: args.verdict,
     };
 
     println!(
-        "[verifier-daemon] run_id={} coordinator={} run={} authority={} band={:.4} mode={} dry_run={}",
+        "[verifier-daemon] run_id={} coordinator={} run={} authority={} {} mode={} dry_run={}",
         config.run_id,
         coordinator_account,
         run,
@@ -364,7 +420,10 @@ async fn main() -> Result<()> {
         Some(listen) => Some(Exporter::start(listen).await?),
         None => None,
     };
-    let mut replayer = args.replay_data_dir.clone().map(Replayer::new);
+    let mut replayer = args
+        .replay_data_dir
+        .clone()
+        .map(|dir| Replayer::new(dir, replay_kind));
 
     let mut judged: HashSet<String> = HashSet::new();
     // At least a second between passes: with none the loop would spin, and

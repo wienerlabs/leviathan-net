@@ -15,10 +15,12 @@ use leviathan_verifier::decompress_dump;
 use leviathan_verifier::judge_payload;
 use leviathan_verifier::read_dump;
 use leviathan_verifier::ContributionOutcome;
+use leviathan_verifier::PayloadBand;
 use psyche_modeling::Distro;
 use psyche_modeling::DistroResult;
 use psyche_network::distro_results_to_bytes;
 use psyche_network::SerializedDistroResult;
+use psyche_verifier::SignBand;
 use psyche_verifier::DEFAULT_BAND;
 use tch::Device;
 use tch::Kind;
@@ -96,7 +98,7 @@ fn an_honest_payload_is_judged_by_the_band() {
     let judged = judge_payload(
         &fixture(HONEST),
         &honest_reference(),
-        DEFAULT_BAND,
+        PayloadBand::Distance(DEFAULT_BAND),
         Device::Cpu,
     )
     .unwrap();
@@ -127,8 +129,13 @@ fn a_payload_that_does_not_fit_is_fraud_at_an_infinite_distance() {
         ("values that are not numbers", not_numbers),
         ("a shape no parameter can have", unshaped),
     ] {
-        let judged = judge_payload(&dump(name, &results), &reference, DEFAULT_BAND, Device::Cpu)
-            .unwrap_or_else(|err| panic!("a payload with {name} was not judged: {err:#}"));
+        let judged = judge_payload(
+            &dump(name, &results),
+            &reference,
+            PayloadBand::Distance(DEFAULT_BAND),
+            Device::Cpu,
+        )
+        .unwrap_or_else(|err| panic!("a payload with {name} was not judged: {err:#}"));
         assert!(judged.verdict.fraud, "a payload with {name} was cleared");
         assert!(
             judged.verdict.distance.is_infinite(),
@@ -156,7 +163,7 @@ fn a_payload_claiming_vast_shapes_is_unfit_before_anything_is_allocated() {
     let judged = judge_payload(
         &dump("vast", &results),
         &honest_reference(),
-        DEFAULT_BAND,
+        PayloadBand::Distance(DEFAULT_BAND),
         Device::Cpu,
     )
     .unwrap();
@@ -203,7 +210,7 @@ fn a_payload_laid_out_otherwise_is_left_to_the_band() {
     let judged = judge_payload(
         &dump("relaid", &serialized),
         &honest_reference(),
-        DEFAULT_BAND,
+        PayloadBand::Distance(DEFAULT_BAND),
         Device::Cpu,
     )
     .unwrap();
@@ -223,7 +230,13 @@ fn a_payload_with_trailing_bytes_is_unfit() {
     let mut bytes = fs::read(fixture(HONEST)).unwrap();
     bytes.extend_from_slice(&[0xff; 3]);
     fs::write(&path, bytes).unwrap();
-    let judged = judge_payload(&path, &honest_reference(), DEFAULT_BAND, Device::Cpu).unwrap();
+    let judged = judge_payload(
+        &path,
+        &honest_reference(),
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .unwrap();
     assert!(judged.verdict.fraud && judged.verdict.distance.is_infinite());
     assert!(judged.unfit.is_some());
 }
@@ -242,14 +255,26 @@ fn decompressing_a_payload_that_does_not_hold_together_is_an_error() {
 fn a_reference_that_is_not_finite_is_the_verifiers_problem() {
     let mut reference = honest_reference();
     reference[0] = f32::NAN;
-    assert!(judge_payload(&fixture(HONEST), &reference, DEFAULT_BAND, Device::Cpu).is_err());
+    assert!(judge_payload(
+        &fixture(HONEST),
+        &reference,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu
+    )
+    .is_err());
 }
 
 /// A dump this verifier cannot read is not the signer's fault either.
 #[test]
 fn a_dump_that_cannot_be_read_is_an_error() {
     let missing = scratch("missing").join("payload.vec-postcard");
-    assert!(judge_payload(&missing, &honest_reference(), DEFAULT_BAND, Device::Cpu).is_err());
+    assert!(judge_payload(
+        &missing,
+        &honest_reference(),
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu
+    )
+    .is_err());
 }
 
 /// The offline audit an appeal bench re-checks with reaches the daemon's
@@ -276,7 +301,13 @@ fn the_offline_audit_convicts_a_payload_that_does_not_fit() {
         )
         .unwrap();
     }
-    let summary = audit_dirs(&submitted, &reference, DEFAULT_BAND, Device::Cpu).unwrap();
+    let summary = audit_dirs(
+        &submitted,
+        &reference,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .unwrap();
     assert_eq!(summary.audited(), 2);
     assert_eq!(summary.fraud(), 1);
     assert!(matches!(
@@ -284,4 +315,177 @@ fn the_offline_audit_convicts_a_payload_that_does_not_fit() {
         [ContributionOutcome::Unfit { key, .. }, ContributionOutcome::Ok { distance, .. }]
             if key == "epoch1-step1-batchB0" && *distance == 0.0
     ));
+}
+
+/// The honest payload is a 1-bit one: each result's values are its signs,
+/// packed as booleans, as a node of a run that sends 1-bit signs sends them.
+fn one_bit_payload() -> PathBuf {
+    for result in honest_results() {
+        let result = DistroResult::try_from(&result).unwrap();
+        assert_eq!(
+            result.sparse_val.kind(),
+            Kind::Bool,
+            "the fixture is a 1-bit payload"
+        );
+    }
+    fixture(HONEST)
+}
+
+/// What the 1-bit payload decompresses to: a sign at each coordinate it sent.
+fn one_bit_reference() -> Vec<f32> {
+    decompress_dump(&one_bit_payload(), Device::Cpu).unwrap()
+}
+
+/// The honest signs sent as values instead: each packed sign unpacked to the
+/// -1 or +1 it stands for. They decompress to exactly what the 1-bit payload
+/// does, but they are not how a node of a 1-bit run sends them.
+fn signs_as_values() -> Vec<SerializedDistroResult> {
+    honest_results()
+        .iter()
+        .map(|result| {
+            let mut result = DistroResult::try_from(result).unwrap();
+            result.sparse_val =
+                Distro::unpack_tensor_sign_from_boolean(result.sparse_val, Kind::Float);
+            SerializedDistroResult::try_from(&result).unwrap()
+        })
+        .collect()
+}
+
+/// The 1-bit reference with the sign of its first coordinate turned, so the
+/// payload flips one coordinate against it.
+fn reference_with_a_flip() -> Vec<f32> {
+    let mut reference = one_bit_reference();
+    let first = reference.iter().position(|v| *v != 0.0).unwrap();
+    reference[first] = -reference[first];
+    reference
+}
+
+/// The 1-bit reference with its first coordinate moved to the first one after
+/// it the payload did not send, so the payload sent a coordinate the
+/// reference did not.
+fn reference_with_churn() -> Vec<f32> {
+    let mut reference = one_bit_reference();
+    let sent = reference.iter().position(|v| *v != 0.0).unwrap();
+    let free = sent + reference[sent..].iter().position(|v| *v == 0.0).unwrap();
+    reference[free] = reference[sent];
+    reference[sent] = 0.0;
+    reference
+}
+
+fn signs(churn: f32, flips: f32) -> PayloadBand {
+    PayloadBand::Signs(SignBand { churn, flips })
+}
+
+/// A payload of a run that sends 1-bit signs is judged on its churn and flips
+/// (wienerlabs/leviathan-net#49).
+#[test]
+fn an_honest_one_bit_payload_has_no_churn_and_no_flips() {
+    let reference = one_bit_reference();
+    assert!(reference.iter().all(|v| [-1.0, 0.0, 1.0].contains(v)));
+    let judged =
+        judge_payload(&one_bit_payload(), &reference, signs(0.0, 0.0), Device::Cpu).unwrap();
+    assert!(!judged.verdict.fraud, "{judged:?}");
+    assert_eq!(judged.unfit, None);
+    let drift = judged.signs.expect("judged on its signs");
+    assert_eq!((drift.churn, drift.flips), (0.0, 0.0));
+    assert_eq!(judged.verdict.distance, 0.0);
+}
+
+#[test]
+fn a_flipped_sign_is_held_to_the_flip_band_and_nothing_else() {
+    let reference = reference_with_a_flip();
+    let judged =
+        judge_payload(&one_bit_payload(), &reference, signs(1.0, 0.0), Device::Cpu).unwrap();
+    let drift = judged.signs.unwrap();
+    assert_eq!(drift.churn, 0.0);
+    assert!(drift.flips > 0.0);
+    assert!(judged.verdict.fraud, "no flip allowed: {judged:?}");
+
+    let judged =
+        judge_payload(&one_bit_payload(), &reference, signs(0.0, 1.0), Device::Cpu).unwrap();
+    assert!(!judged.verdict.fraud, "any flip allowed: {judged:?}");
+}
+
+#[test]
+fn a_coordinate_picked_differently_is_held_to_the_churn_band() {
+    let reference = reference_with_churn();
+    let judged =
+        judge_payload(&one_bit_payload(), &reference, signs(0.0, 1.0), Device::Cpu).unwrap();
+    let drift = judged.signs.unwrap();
+    assert!(drift.churn > 0.0);
+    assert_eq!(drift.flips, 0.0);
+    assert!(judged.verdict.fraud, "no churn allowed: {judged:?}");
+
+    let judged = judge_payload(
+        &one_bit_payload(),
+        &reference,
+        signs(drift.churn, 0.0),
+        Device::Cpu,
+    )
+    .unwrap();
+    assert!(!judged.verdict.fraud, "churn at the band: {judged:?}");
+    // The distance it reports is the one its churn and flips make.
+    assert!(
+        (judged.verdict.distance - drift.distance()).abs() < 1e-5,
+        "{judged:?}"
+    );
+}
+
+/// A band on the signs cannot see magnitudes, so in a run that sends 1-bit
+/// signs a payload that carries values is unfit: the honest signs sent as
+/// values as much as the cheater's, whose injected delta leaves every sign and
+/// every coordinate where it was and changes only their magnitudes.
+#[test]
+fn a_payload_carrying_values_is_unfit_under_a_sign_band() {
+    let values = dump("signs-as-values", &signs_as_values());
+    assert_eq!(
+        decompress_dump(&values, Device::Cpu).unwrap(),
+        one_bit_reference()
+    );
+    let fraud = fixture("fraud.vec-postcard");
+    for (name, payload) in [("the signs as values", values), ("injected delta", fraud)] {
+        let judged =
+            judge_payload(&payload, &one_bit_reference(), signs(1.0, 1.0), Device::Cpu).unwrap();
+        let reason = judged
+            .unfit
+            .as_deref()
+            .unwrap_or_else(|| panic!("{name} was judged on its signs: {judged:?}"));
+        assert!(reason.contains("1-bit signs"), "{name}: {reason}");
+        assert!(judged.verdict.fraud, "{name}");
+        assert_eq!(judged.verdict.distance, f32::INFINITY, "{name}");
+        assert_eq!(judged.signs, None, "{name}");
+    }
+}
+
+#[test]
+fn a_payload_that_does_not_fit_is_fraud_under_a_sign_band_too() {
+    let judged = judge_payload(
+        &dump("unfit-signs", &shrunk()),
+        &honest_reference(),
+        signs(1.0, 1.0),
+        Device::Cpu,
+    )
+    .unwrap();
+    assert!(judged.unfit.is_some());
+    assert!(judged.verdict.fraud);
+    assert_eq!(judged.verdict.distance, f32::INFINITY);
+    assert_eq!(judged.signs, None);
+}
+
+#[test]
+fn a_sign_band_that_is_not_one_is_the_verifiers_problem() {
+    assert!(judge_payload(
+        &one_bit_payload(),
+        &one_bit_reference(),
+        signs(1.5, 0.0),
+        Device::Cpu
+    )
+    .is_err());
+    assert!(judge_payload(
+        &one_bit_payload(),
+        &one_bit_reference(),
+        signs(0.0, f32::NAN),
+        Device::Cpu
+    )
+    .is_err());
 }

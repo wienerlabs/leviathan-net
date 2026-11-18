@@ -19,16 +19,23 @@ use psyche_network::EquivocationRecord;
 use psyche_network::PAYLOAD_DUMP_EXTENSION;
 use psyche_network::SerializedDistroResult;
 use psyche_verifier::hash_delta;
+use psyche_verifier::relative_l2_distance;
+use psyche_verifier::verify_signs_within_band;
 use psyche_verifier::verify_within_band;
 use psyche_verifier::BandVerdict;
 use psyche_verifier::FraudProof;
+use psyche_verifier::SignDrift;
+use psyche_verifier::VerifierError;
 
+pub mod band;
 pub mod error_feedback;
 pub mod fidelity;
 pub mod hardware;
 pub mod replay;
 pub mod run_data;
 
+pub use band::payload_band;
+pub use band::PayloadBand;
 pub use hardware::device_label;
 pub use hardware::parse_device;
 pub use hardware::parse_dtype;
@@ -43,6 +50,7 @@ pub use replay::read_run_model;
 pub use replay::replay_data_layout;
 pub use replay::parse_assignment_key;
 pub use replay::replay_epoch;
+pub use replay::sends_signs;
 pub use replay::DumpKey;
 pub use replay::ReplayAssignment;
 pub use replay::ReplayTrainerConfig;
@@ -87,9 +95,14 @@ pub fn decompress_dump(path: &Path, device: tch::Device) -> Result<Vec<f32>> {
 /// What `judge_payload` found of a signed payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PayloadJudgement {
-    /// The payload's distance from the honest result, against the band:
-    /// infinite, and fraud, for one that does not fit.
+    /// The payload's distance from the honest result, and whether it is
+    /// fraud under the band: infinite, and fraud, for one that does not fit.
+    /// Under a band on the signs, `band` is the largest distance that band
+    /// admits, and fraud is decided by the signs.
     pub verdict: BandVerdict,
+    /// How the payload's signs differ from the honest result's, when it is
+    /// held to a band on the signs (wienerlabs/leviathan-net#49).
+    pub signs: Option<SignDrift>,
     /// Why the payload cannot be the honest result whatever it is compared
     /// with, if it cannot.
     pub unfit: Option<String>,
@@ -117,33 +130,70 @@ pub struct PayloadJudgement {
 pub fn judge_payload(
     path: &Path,
     reference: &[f32],
-    band: f32,
+    band: PayloadBand,
     device: tch::Device,
 ) -> Result<PayloadJudgement> {
-    if !band.is_finite() || band < 0.0 {
-        return Err(anyhow!(
-            "the band must be finite and non-negative, it is {band}"
-        ));
+    // A band that is not one is refused before anything is judged, by the
+    // same checks that judge against it.
+    match band {
+        PayloadBand::Distance(band) => {
+            verify_within_band(&[], &[], band)?;
+        }
+        PayloadBand::Signs(band) => {
+            verify_signs_within_band(&[], &[], band)?;
+        }
     }
     if let Some(index) = reference.iter().position(|value| !value.is_finite()) {
         return Err(anyhow!("the reference is not finite at index {index}"));
     }
     let bytes = fs::read(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
-    match fitting_values(&bytes, reference.len(), device)? {
-        Ok(submitted) => Ok(PayloadJudgement {
-            verdict: verify_within_band(&submitted, reference, band)?,
-            unfit: None,
-            submitted_hash: Some(hash_delta(&submitted)),
-        }),
+    let one_bit = matches!(band, PayloadBand::Signs(_));
+    match fitting_values(&bytes, reference.len(), one_bit, device)? {
+        Ok(submitted) => {
+            let (verdict, signs) = judge_values(&submitted, reference, band)?;
+            Ok(PayloadJudgement {
+                verdict,
+                signs,
+                unfit: None,
+                submitted_hash: Some(hash_delta(&submitted)),
+            })
+        }
         Err(reason) => Ok(PayloadJudgement {
             verdict: BandVerdict {
                 distance: f32::INFINITY,
-                band,
+                band: band.distance_bound(),
                 fraud: true,
             },
+            signs: None,
             unfit: Some(reason),
             submitted_hash: None,
         }),
+    }
+}
+
+/// `submitted`, values that fit the model, judged against `reference` under
+/// `band`.
+fn judge_values(
+    submitted: &[f32],
+    reference: &[f32],
+    band: PayloadBand,
+) -> Result<(BandVerdict, Option<SignDrift>)> {
+    match band {
+        PayloadBand::Distance(band) => Ok((verify_within_band(submitted, reference, band)?, None)),
+        PayloadBand::Signs(sign_band) => {
+            let judged = verify_signs_within_band(submitted, reference, sign_band)?;
+            let distance = match relative_l2_distance(submitted, reference) {
+                Ok(distance) => distance,
+                Err(VerifierError::NonFiniteSubmission { .. }) => f32::INFINITY,
+                Err(err) => return Err(err.into()),
+            };
+            let verdict = BandVerdict {
+                distance,
+                band: band.distance_bound(),
+                fraud: judged.fraud,
+            };
+            Ok((verdict, Some(judged.drift)))
+        }
     }
 }
 
@@ -157,6 +207,7 @@ pub fn judge_payload(
 fn fitting_values(
     bytes: &[u8],
     honest_len: usize,
+    one_bit: bool,
     device: tch::Device,
 ) -> Result<std::result::Result<Vec<f32>, String>> {
     let results = match distro_results_from_reader(Cursor::new(bytes))
@@ -173,6 +224,20 @@ fn fitting_values(
         Ok(results) => results,
         Err(err) => return Ok(Err(format!("it does not decode: {err}"))),
     };
+    // A run that sends 1-bit signs packs them as booleans. A payload that
+    // carries values instead is not what an honest node of the run sends, and
+    // its magnitudes are exactly what a band on the signs cannot see: every
+    // node's `Distro::apply` would weigh them (wienerlabs/leviathan-net#49).
+    if one_bit {
+        if let Some(index) = results
+            .iter()
+            .position(|result| result.sparse_val.kind() != tch::Kind::Bool)
+        {
+            return Ok(Err(format!(
+                "result {index} carries values, and the run sends 1-bit signs"
+            )));
+        }
+    }
     // Compared before anything is allocated: a payload of a few bytes can
     // claim shapes of billions of values, every index inside them, and
     // decompressing it as it claims would exhaust the verifier's memory
@@ -474,8 +539,18 @@ pub fn decompress_results(results: &[DistroResult], device: tch::Device) -> Resu
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContributionOutcome {
-    Ok { key: String, distance: f32 },
-    Fraud { key: String, proof: FraudProof },
+    /// Within the band. `signs` is how its signs differed, when it was held
+    /// to a band on the signs.
+    Ok {
+        key: String,
+        distance: f32,
+        signs: Option<SignDrift>,
+    },
+    Fraud {
+        key: String,
+        proof: FraudProof,
+        signs: Option<SignDrift>,
+    },
     /// A payload that cannot be the honest result whatever it is compared
     /// with: fraud, at an infinite distance (`judge_payload`,
     /// wienerlabs/leviathan-net#59).
@@ -538,7 +613,7 @@ fn outcome(
     target_index: u64,
     path: &Path,
     reference: &[f32],
-    band: f32,
+    band: PayloadBand,
     device: tch::Device,
 ) -> Result<ContributionOutcome> {
     let judged = judge_payload(path, reference, band, device)?;
@@ -547,6 +622,7 @@ fn outcome(
         (Some(reason), _) => ContributionOutcome::Unfit { key, reason },
         (None, Some(committed_hash)) if judged.verdict.fraud => ContributionOutcome::Fraud {
             key,
+            signs: judged.signs,
             proof: FraudProof {
                 target_index,
                 committed_hash,
@@ -558,6 +634,7 @@ fn outcome(
         (None, _) => ContributionOutcome::Ok {
             key,
             distance: judged.verdict.distance,
+            signs: judged.signs,
         },
     })
 }
@@ -569,7 +646,7 @@ fn outcome(
 pub fn audit_with_replay<E: ReplayWork + ?Sized>(
     submitted: &Path,
     engine: &E,
-    band: f32,
+    band: PayloadBand,
     device: tch::Device,
 ) -> Result<AuditSummary> {
     let submitted_index = index_dir(submitted)?;
@@ -603,7 +680,7 @@ pub fn audit_with_replay<E: ReplayWork + ?Sized>(
 pub fn audit_dirs(
     submitted: &Path,
     reference: &Path,
-    band: f32,
+    band: PayloadBand,
     device: tch::Device,
 ) -> Result<AuditSummary> {
     let submitted_index = index_dir(submitted)?;

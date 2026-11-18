@@ -9,6 +9,7 @@ use leviathan_telemetry::verifier::PassReport;
 use leviathan_verifier::decompress_dump;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::judge_payload;
+use leviathan_verifier::PayloadBand;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
@@ -47,7 +48,10 @@ pub struct AuditConfig {
     /// audit_pass instead, so this verifier establishes the reference itself
     /// rather than trusting dumps someone else produced.
     pub reference_dir: Option<PathBuf>,
-    pub band: f32,
+    /// What a payload is held to: a band on its distance, or for a run that
+    /// sends 1-bit signs, a band on each of churn and flips
+    /// (wienerlabs/leviathan-net#49).
+    pub band: PayloadBand,
     pub audit_assigned: bool,
     pub dry_run: bool,
     pub verdict_mode: bool,
@@ -470,9 +474,15 @@ pub async fn audit_pass(
         }
         let verdict = judged_payload.verdict;
 
+        let signs = match judged_payload.signs {
+            Some(drift) => {
+                format!(", churn {:.4}, flips {:.6}", drift.churn, drift.flips)
+            },
+            None => String::new(),
+        };
         if !verdict.fraud {
             println!(
-                "[verifier-daemon] ok    {key} committer {committer} distance {:.4} within band {:.4}",
+                "[verifier-daemon] ok    {key} committer {committer} distance {:.4}{signs} within {}",
                 verdict.distance, config.band
             );
             report.cleared += 1;
@@ -483,7 +493,7 @@ pub async fn audit_pass(
         let replayed_hash = hash_delta(&reference_delta);
         report.fraud_found += 1;
         println!(
-            "[verifier-daemon] FRAUD {key} committer {committer} distance {:.4} exceeds band {:.4} (committed {} replayed {})",
+            "[verifier-daemon] FRAUD {key} committer {committer} distance {:.4}{signs} outside {} (committed {} replayed {})",
             verdict.distance,
             config.band,
             hex8(&signed.committed_hash()),

@@ -3,6 +3,7 @@
 //! of their own, and the daemon has to leave them be: nothing can convict on
 //! them now (wienerlabs/leviathan-net#67).
 
+use leviathan_verifier::PayloadBand;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -78,7 +79,7 @@ async fn kept_fraud_naming(
         run_id: harness.run_id.clone(),
         submitted_dir,
         reference_dir: Some(reference_dir),
-        band: 0.05,
+        band: PayloadBand::Distance(0.05),
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,

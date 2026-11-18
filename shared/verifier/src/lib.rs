@@ -1,6 +1,11 @@
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub mod signs;
+pub use signs::{
+    calibrate_sign_band, sign_drift, verify_signs_within_band, SignBand, SignDrift, SignVerdict,
+};
+
 pub const DEFAULT_BAND: f32 = 0.05;
 pub const DEFAULT_SAFETY_FACTOR: f32 = 5.0;
 const NORM_FLOOR: f32 = 1e-12;
@@ -21,6 +26,8 @@ pub enum VerifierError {
     NonFiniteReplay { index: usize },
     #[error("every drift sample was non-finite")]
     NonFiniteCalibration,
+    #[error("a sign band must be between 0 and 1, got {0}")]
+    InvalidSignBand(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

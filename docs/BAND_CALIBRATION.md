@@ -124,14 +124,13 @@ class has to be measured again with `--run-config` before its band is trusted.
 
 A first measurement under the genesis rehearsal shows why. It was taken on a
 CPU, comparing fp32 with bf16 (`--samples 8`). Seven of eight samples drifted
-by exactly 0, and one by 0.2209, where a few borderline indices left the top-k.
-The calibrated band came out at 1.104, against the 0.05 default. Over 1-bit
-signs, honest drift is not small and smooth. It is zero until an index changes,
-and then it jumps. A band wide enough to cover that jump also lets a node turn
-over a share of its signs, about (band/2)² of them, without being caught. The
-band and the distance used for 1-bit payloads need their own design
-(wienerlabs/leviathan-net#49), and until then the daemon runs in `--dry-run`
-against nodes that train in another dtype than it replays in.
+by exactly 0, and one by 0.2209. The calibrated band came out at 1.104, against
+the 0.05 default. Over 1-bit signs, honest drift is not small and smooth. It is
+zero until one coordinate changes, and then it jumps. A band wide enough to
+cover that jump also lets a node turn over a share of its signs, about
+(band/2)² of them, without being caught. The next section measures what the
+jump is made of, and gives 1-bit payloads a band of their own
+(wienerlabs/leviathan-net#49).
 
 Reference config for all rows: `cpu / fp32`, micro batch 1. A node's micro batch
 size and whether it accumulates gradients in fp32 are its own settings, not
@@ -139,6 +138,105 @@ the run's, so they add to the honest drift the band has to cover as well. If the
 replay on a GPU instead, re-run with `--reference-device cuda` and record that
 here — the reference is a policy choice and the band is only meaningful relative
 to it.
+
+## 1-bit payloads: churn and flips (#49)
+
+Over 1-bit payloads a replay can differ from what a node sent in two ways:
+
+- **churn:** it picks other coordinates for its top-k, so a coordinate the node
+  sent is one the replay did not send;
+- **flips:** it picks the same coordinate with the other sign.
+
+The relative L2 distance mixes the two:
+`distance² = 2 · churn + 4 · (1 − churn) · flips`, where churn is a share of
+the coordinates the node sent and flips a share of those both sent. So the
+distance is the square root of the share of coordinates in question. A safety
+factor of k on a band on the distance multiplies by k² the share of its
+coordinates a cheater may then choose. The same factor on a band on churn and
+flips multiplies that share by k.
+
+**The genesis jump, taken apart.** `calibrate-band` now reports churn and flips
+for a 1-bit run. Run again on this repository's M1 CPU, fp32 against bf16, with
+the issue's 8 samples
+(`one-bit/genesis-first-step-cpu-fp32-vs-cpu-bf16.json`):
+
+| Sample | Distance | Churn | Flips |
+|---|---|---|---|
+| 2 | 0.1562 | 0.0122 | 0 |
+| 5 | 0.2209 | 0 | 0.0122 |
+| the other six | 0 | 0 | 0 |
+
+The genesis model sends 82 coordinates, so 0.0122 is one of them:
+- the 0.2209 the issue measured is a single sign that crossed zero;
+- on this machine one further sample churned a single coordinate.
+
+Calibrated with the same factor of 5:
+- the distance band is 1.104, which lets a cheater flip about 30% of its signs;
+- the sign band is 6.1% churn and 6.1% flips.
+
+**Later rounds, from a revealed state.** `measure-error-feedback`'s `reveal`
+mode starts a shadow verifier from node 0's weights and buffer at every round
+of the FineWeb rehearsal, and replays that one round (`docs/ERROR_FEEDBACK.md`).
+This is the check #89 builds. The nodes train on the M1's GPU in bf16. Over
+each run's first 100 training rounds (40 for the CPU-trained nodes, which are
+slow):
+
+| Nodes | Verifier | What differs | Churn mean / max | Flips max | Distance mean / max |
+|---|---|---|---|---|---|
+| GPU bf16 | GPU bf16, same process | nothing | 0 / 0 | 0 | 0 / 0 |
+| GPU bf16 | CPU bf16 | the device | 0.0281 / 0.0378 | 0 | 0.236 / 0.275 |
+| CPU bf16 | CPU fp32 | the dtype, on the CPU | 0.0284 / 0.0386 | 0 | 0.237 / 0.278 |
+| GPU bf16 | GPU fp32 | the dtype, on the GPU | 0.0346 / 0.1183 | 0 | 0.261 / 0.487 |
+| GPU bf16 | CPU fp32 | both | 0.0345 / 0.0834 | 0 | 0.261 / 0.408 |
+
+The data is in `one-bit/` and in `docs/error-feedback/reveal-*.csv`.
+- **In a round's first step, from a zeroed buffer,** each pair churns 1.5–1.7%
+  and flips nothing.
+- **Over longer runs, the fp32 replays' tails grow.** The GPU fp32 verifier
+  reaches 14.3% churn within 300 rounds, with one round of 0.15% flips. The CPU
+  fp32 verifier reaches 8.3% within 600.
+
+What this shows:
+- **Across hardware classes, an honest single-step replay churns and almost
+  never flips.** A band on the flips can be held near zero, and with it the
+  cheapest cheat over signs, turning them over. It cannot be held at zero,
+  because a sign near zero can cross it, as the genesis sample did.
+- **Replaying in the run's dtype narrows the churn.** The bf16 replay's worst
+  churn in 100 rounds was 3.8%, against 8.3% and 11.8% for the fp32 replays.
+  Each is a single run, so the tails are indicative rather than established.
+- **A verifier of the nodes' own class replays exactly**, within one process.
+  Whether another machine of the same GPU class does is #89's to measure. Where
+  it does, both bands can be 0.
+
+**What the verifier does now:**
+- **1-bit runs.** `leviathan-verifier` and the verifier daemon take
+  `--churn-band` and `--flip-band`, and hold a payload to both.
+- **Values under a sign band.** A band on the signs cannot see magnitudes. So
+  under it, a payload that carries values rather than packed signs is unfit,
+  and fraud. The daemon tests' `fraud` fixture is such a payload: it moves no
+  sign and no coordinate, only magnitudes. Nodes still apply such payloads
+  (wienerlabs/leviathan-net#95).
+- **The daemon refuses a mismatched band** unless it only watches
+  (`--dry-run`): a band on the distance for a run that sends 1-bit signs, and a
+  band on the signs for one that sends values.
+- **`--replay-dtype`** chooses the daemon's replay dtype, fp32 by default. A
+  bf16 replay churns less, but is emulated on a CPU and runs several times
+  slower (`measure-error-feedback` took about 45 s a round with a CPU bf16
+  shadow). Its band has to be calibrated for the dtype chosen.
+- **Calibration.** `calibrate-band` reports churn and flips per sample, with
+  the band they call for and the flags to pass. Calibrate per pair of node
+  class and verifier class, with more samples than the 8 above, and use the
+  safety factor knowing it is now linear in the cheater's share.
+
+**What is not settled here:**
+- **The price of a cheat.** Under a band of churn c and flips f, a cheater
+  chooses at most c of the coordinates it sends, signs included, and turns over
+  f of the rest. What that buys against robust aggregation, and so how large a
+  band the audit economics can afford, is the band-sweep damage analysis's to
+  price. It is not in this repository.
+- **The GPU classes nodes rent** (CUDA) are not measured, and only the CPU and
+  the M1's GPU are.
+- **The tails above are one run each.**
 
 ## Notes
 
@@ -153,4 +251,5 @@ to it.
   (`docs/ERROR_FEEDBACK.md`, #48). Across classes such a transition still
   drifts: 0.31 mean and 0.41 max between bf16 on an M1 GPU and fp32 on its CPU,
   all of it top-k churn with no sign wrong. That is far above the default band
-  and the 0.029 above, which is the 1-bit problem of #49.
+  and the 0.029 above, which is why 1-bit payloads are now held to a band on
+  churn and flips instead (the section above).
