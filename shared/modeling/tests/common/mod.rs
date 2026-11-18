@@ -120,6 +120,7 @@ pub fn distro(recipe: &Recipe, model: &dyn CausalLM) -> Distro {
         recipe.compression_topk,
         0.0,
         recipe.robust_aggregation,
+        recipe.quantize_1bit,
     )
 }
 

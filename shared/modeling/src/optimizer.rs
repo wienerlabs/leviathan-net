@@ -58,6 +58,7 @@ impl Optimizer {
                     compression_topk as i64,
                     weight_decay.unwrap_or(0.0) as f64,
                     robust_aggregation,
+                    quantize_1bit,
                 )
                 .into(),
                 clip_grad_norm,

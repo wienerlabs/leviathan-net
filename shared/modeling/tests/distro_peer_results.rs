@@ -162,7 +162,11 @@ fn each_payload_that_does_not_fit_is_named_for_why() {
 /// sign step. It is skipped like any other payload that does not fit.
 #[test]
 fn a_peer_with_non_finite_values_is_skipped() {
-    let recipe = genesis_recipe();
+    // A run that sends values, as this case is about.
+    let recipe = Recipe {
+        quantize_1bit: false,
+        ..genesis_recipe()
+    };
     let honest = peer_results_quantized(&recipe, &batch(&recipe, 3), false);
     let mut poisoned = honest.clone();
     let target = &poisoned[0];
@@ -219,7 +223,11 @@ fn safe_bound(result: &DistroResult) -> f32 {
 /// applied and leaves every parameter finite.
 #[test]
 fn values_beyond_the_safe_range_are_skipped_and_values_within_it_stay_finite() {
-    let recipe = genesis_recipe();
+    // A run that sends values, whose magnitudes this case is about.
+    let recipe = Recipe {
+        quantize_1bit: false,
+        ..genesis_recipe()
+    };
     let honest = peer_results_quantized(&recipe, &batch(&recipe, 3), false);
     let target = &honest[0];
     let bound = safe_bound(target);
@@ -355,4 +363,44 @@ fn results_are_checked_as_encodings_of_their_own_shapes() {
             "a payload with {name} was not refused: {refused:?}"
         );
     }
+}
+
+/// In a run that sends 1-bit signs, a peer's results that carry values are not
+/// the honest encoding, and every node skips them: `apply` would otherwise
+/// weigh their magnitudes (wienerlabs/leviathan-net#95). A run that sends
+/// values refuses packed signs the same way.
+#[test]
+fn a_peer_whose_results_are_not_the_runs_encoding_is_skipped() {
+    let recipe = genesis_recipe();
+    assert!(
+        recipe.quantize_1bit,
+        "the genesis rehearsal sends 1-bit signs"
+    );
+    let tokens = batch(&recipe, 3);
+    let signs = peer_results_quantized(&recipe, &tokens, true);
+    let values = peer_results_quantized(&recipe, &tokens, false);
+
+    let (model, distro) = trained_node(&recipe);
+    assert_eq!(distro.check_results(&*model, &signs), Ok(()));
+    assert!(matches!(
+        distro.check_results(&*model, &values),
+        Err(DistroResultMismatch::Values { .. })
+    ));
+    let baseline = applied(&recipe, std::slice::from_ref(&signs)).unwrap();
+    let after = applied(&recipe, &[signs.clone(), values.clone()]).unwrap();
+    assert!(
+        same(&after, &baseline),
+        "a peer's values were weighed in a 1-bit run"
+    );
+
+    let values_run = Recipe {
+        quantize_1bit: false,
+        ..recipe
+    };
+    let (model, distro) = trained_node(&values_run);
+    assert_eq!(distro.check_results(&*model, &values), Ok(()));
+    assert!(matches!(
+        distro.check_results(&*model, &signs),
+        Err(DistroResultMismatch::Values { .. })
+    ));
 }
