@@ -83,7 +83,7 @@ mod test;
 pub use authenticable_identity::raw_p2p_verify;
 pub use commitment_record::{
     COMMITMENT_RECORD_EXTENSION, CommitmentRecord, CommitmentRecordError, PAYLOAD_DUMP_EXTENSION,
-    commitment_record_path, payload_dump_name,
+    commitment_record_path, payload_dump_name, revealed_state_path,
 };
 pub use connection_monitor::{ConnectionData, ConnectionMonitor, PeerBandwidth};
 pub use equivocation_record::{
@@ -99,7 +99,8 @@ use iroh_relay::{RelayMap, RelayQuicConfig};
 use rustls_pki_types::CertificateDer;
 pub use latency_sorted::LatencySorted;
 pub use round_states::{
-    FetchRoundStateError, ROUND_STATE_ALPN, RoundStates, RoundStatesError, fetch_round_state,
+    FetchRoundStateError, ROUND_STATE_ALPN, RevealError, RoundStates, RoundStatesError,
+    fetch_round_state, reveal_round_state,
 };
 pub use p2p_model_sharing::{
     ALPN, ModelRequestType, SharableModel, SharableModelError, TransmittableModelConfig,

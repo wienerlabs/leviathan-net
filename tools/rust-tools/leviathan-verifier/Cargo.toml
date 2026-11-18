@@ -35,6 +35,10 @@ path = "src/bin/measure_round_state.rs"
 name = "check-round-states"
 path = "src/bin/check_round_states.rs"
 
+[[bin]]
+name = "check-revealed-states"
+path = "src/bin/check_revealed_states.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

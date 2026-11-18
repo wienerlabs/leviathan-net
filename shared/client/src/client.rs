@@ -113,6 +113,7 @@ impl Client {
                     tx_request_download: tx_request_download.clone(),
                     tx_request_model_config,
                     tx_broadcast_finished,
+                    endpoint: p2p.router().endpoint().clone(),
                 });
 
                 let download_scheduler = DownloadSchedulerHandle::new(

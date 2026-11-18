@@ -7,7 +7,7 @@ use psyche_core::{BatchId, NodeIdentity};
 use psyche_modeling::DistroResult;
 use psyche_network::TransmittableDistroResult;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
@@ -32,6 +32,10 @@ pub struct RoundState {
     pub committee_info: Option<(CommitteeProof, WitnessProof, CommitteeSelection)>,
     pub batch_ids_not_yet_trained_on: Arc<Mutex<Option<BatchIdSet>>>,
     pub self_distro_results: Vec<Vec<DistroResult>>,
+    /// The payloads this node is to audit in this round, by committer and
+    /// batch, whose states it fetches from their trainers
+    /// (wienerlabs/leviathan-net#89).
+    pub audits: HashSet<(NodeIdentity, BatchId)>,
 }
 
 impl RoundState {
@@ -51,6 +55,7 @@ impl RoundState {
             committee_info: None,
             batch_ids_not_yet_trained_on: Arc::new(Mutex::new(None)),
             self_distro_results: vec![],
+            audits: HashSet::new(),
         }
     }
 

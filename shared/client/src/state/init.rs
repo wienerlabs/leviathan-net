@@ -19,7 +19,7 @@ use psyche_modeling::{
     DataParallel, DeepseekForCausalLM, Devices, DummyModel, LlamaConfig, LlamaForCausalLM,
     LocalTrainer, ModelLoadError, ParallelModels, PretrainedSource, Trainer, auto_tokenizer,
 };
-use psyche_network::{BlobTicket, RoundStates, SecretKey};
+use psyche_network::{BlobTicket, Endpoint, RoundStates, SecretKey};
 use psyche_watcher::OpportunisticData;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tch::{Kind, Tensor};
@@ -180,6 +180,10 @@ pub struct RunInitConfigAndIO {
     pub tx_request_model_config: UnboundedSender<OneShotModelConfigSender>,
     pub tx_broadcast_finished: UnboundedSender<FinishedBroadcast>,
 
+    /// This node's endpoint, which fetches the state a payload it audits
+    /// commits to (wienerlabs/leviathan-net#89).
+    pub endpoint: Endpoint,
+
     pub metrics: Arc<ClientMetrics>,
 }
 
@@ -198,6 +202,7 @@ impl RunInitConfigAndIO {
             tx_request_download,
             tx_request_model_config,
             tx_broadcast_finished,
+            endpoint,
             metrics,
         } = self;
 
@@ -770,7 +775,7 @@ impl RunInitConfigAndIO {
         let data_provider = data.map_err(InitRunError::DataProviderConnect)?;
         let data_fetcher = DataFetcher::new(data_provider, init_config.data_parallelism * 2);
 
-        let trainers: Vec<Trainer> = match models {
+        let mut trainers: Vec<Trainer> = match models {
             RawLoadedModelType::ParallelNativeModels(models) => {
                 let mut tp_models: Vec<Vec<Box<dyn CausalLM>>> = Vec::new();
                 for model in models {
@@ -882,6 +887,20 @@ impl RunInitConfigAndIO {
             }
         };
 
+        // How long a state of the run's model is as this node trains it: what
+        // a state it fetches to audit a payload has to be
+        // (wienerlabs/leviathan-net#89).
+        let round_state_len = match trainers.first_mut().map(Trainer::round_state_len) {
+            Some(Ok(len)) => len,
+            Some(Err(err)) => {
+                error!(
+                    "Cannot say how long a round's state is, so no state will be fetched to audit: {err}"
+                );
+                None
+            }
+            None => None,
+        };
+
         let wandb_run = wandb_run.map_err(InitRunError::WandbThreadCrashed)??;
 
         let stats_logger = StatsLogger::new(
@@ -901,6 +920,8 @@ impl RunInitConfigAndIO {
             identity: init_config.identity,
             write_gradients_dir: init_config.write_gradients_dir,
             round_states: init_config.round_states,
+            endpoint,
+            round_state_len,
             tx_health_check,
             tx_distro_result,
 
