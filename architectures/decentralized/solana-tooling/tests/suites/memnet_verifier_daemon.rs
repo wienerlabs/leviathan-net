@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use leviathan_verifier::PayloadBand;
 use std::fs;
 use std::path::PathBuf;
 
@@ -278,7 +279,7 @@ pub async fn run() {
         run_id: RUN_ID.to_string(),
         submitted_dir: scratch("warmup-submitted"),
         reference_dir: Some(scratch("warmup-reference")),
-        band: 0.05,
+        band: PayloadBand::Distance(0.05),
         audit_assigned: true,
         dry_run: false,
         verdict_mode: false,
@@ -382,7 +383,7 @@ pub async fn run() {
         run_id: RUN_ID.to_string(),
         submitted_dir,
         reference_dir: Some(reference_dir.clone()),
-        band: 0.05,
+        band: PayloadBand::Distance(0.05),
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,

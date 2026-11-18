@@ -11,6 +11,9 @@ use leviathan_verifier::cold_start_warmup_bounds;
 use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::payload_band;
+use leviathan_verifier::sends_signs;
+use leviathan_verifier::PayloadBand;
 use leviathan_verifier::replay_epoch;
 use leviathan_verifier::DumpKey;
 use leviathan_verifier::read_run_model;
@@ -19,11 +22,11 @@ use leviathan_verifier::ContributionOutcome;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
+use psyche_verifier::SignDrift;
 use psyche_coordinator::CoordinatorProgress;
 use psyche_data_provider::LocalDataProvider;
 use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::BatchDataCPU;
-use psyche_verifier::DEFAULT_BAND;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,12 +70,30 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cold_start_epoch: bool,
 
-    #[arg(long, default_value_t = DEFAULT_BAND)]
-    band: f32,
+    /// The band on a payload's relative L2 distance from the honest result.
+    /// Without it, or the two sign bands, the shipped default.
+    #[arg(long)]
+    band: Option<f32>,
+    /// For a run that sends 1-bit signs, the share of a payload's coordinates
+    /// a replay may pick differently, and of those both pick, the share it
+    /// may sign differently. Calibrate both with `calibrate-band`
+    /// (`docs/BAND_CALIBRATION.md`, wienerlabs/leviathan-net#49).
+    #[arg(long)]
+    churn_band: Option<f32>,
+    #[arg(long)]
+    flip_band: Option<f32>,
     #[arg(long, default_value_t = false)]
     cuda: bool,
     #[arg(long)]
     json_out: Option<PathBuf>,
+}
+
+/// A payload's churn and flips, when it was held to a band on its signs.
+fn describe_signs(signs: &Option<SignDrift>) -> String {
+    match signs {
+        Some(drift) => format!(", churn {:.4}, flips {:.6}", drift.churn, drift.flips),
+        None => String::new(),
+    }
 }
 
 fn hex8(bytes: &[u8; 32]) -> String {
@@ -86,6 +107,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let band = payload_band(args.band, args.churn_band, args.flip_band)?;
     let device = if args.cuda {
         tch::Device::cuda_if_available()
     } else {
@@ -93,7 +115,7 @@ async fn main() -> Result<()> {
     };
 
     let summary = match (&args.reference, &args.run_config) {
-        (Some(reference), None) => audit_dirs(&args.submitted, reference, args.band, device)?,
+        (Some(reference), None) => audit_dirs(&args.submitted, reference, band, device)?,
         (None, Some(run_config)) => {
             let data_dir = args.replay_data_dir.as_ref().ok_or_else(|| {
                 anyhow!("--replay-data-dir is required to recompute a reference")
@@ -102,6 +124,19 @@ async fn main() -> Result<()> {
                 .first_step
                 .unwrap_or(CoordinatorProgress::default().step);
             let llm = read_run_model(run_config)?;
+            // A run that sends 1-bit signs is judged on its churn and flips,
+            // one that sends values on its distance (wienerlabs/leviathan-net#49).
+            match (sends_signs(&llm.optimizer), band) {
+                (true, PayloadBand::Distance(_)) => eprintln!(
+                    "[verifier] warning: the run sends 1-bit signs, and a band on their distance either convicts honest replays from other hardware or lets a cheater turn over a large share of its signs: judge it with --churn-band and --flip-band (docs/BAND_CALIBRATION.md)"
+                ),
+                (false, PayloadBand::Signs(_)) => {
+                    return Err(anyhow!(
+                        "the run sends values, not 1-bit signs, and a band on the signs cannot see their magnitudes: pass --band"
+                    ))
+                }
+                _ => {}
+            }
             let config = ReplayTrainerConfig::for_run(
                 &llm,
                 checkpoint_repo_files(&published_checkpoint(&llm)?)?,
@@ -171,7 +206,7 @@ async fn main() -> Result<()> {
 
             let engine =
                 TrainerReplayEngine::new(trainer, assignments, device, config.quantize_1bit());
-            audit_with_replay(&args.submitted, &engine, args.band, device)?
+            audit_with_replay(&args.submitted, &engine, band, device)?
         }
         (Some(_), Some(_)) => {
             return Err(anyhow!(
@@ -187,13 +222,18 @@ async fn main() -> Result<()> {
 
     for outcome in &summary.outcomes {
         match outcome {
-            ContributionOutcome::Ok { key, distance } => {
-                println!("ok    {key}: distance {distance:.4} within band {:.4}", args.band)
-            }
-            ContributionOutcome::Fraud { key, proof } => println!(
-                "FRAUD {key}: distance {:.4} exceeds band {:.4} (committed {} replayed {})",
+            ContributionOutcome::Ok {
+                key,
+                distance,
+                signs,
+            } => println!(
+                "ok    {key}: distance {distance:.4}{} within {band}",
+                describe_signs(signs)
+            ),
+            ContributionOutcome::Fraud { key, proof, signs } => println!(
+                "FRAUD {key}: distance {:.4}{} outside {band} (committed {} replayed {})",
                 proof.distance,
-                proof.band,
+                describe_signs(signs),
                 hex8(&proof.committed_hash),
                 hex8(&proof.replayed_hash)
             ),
@@ -208,10 +248,9 @@ async fn main() -> Result<()> {
 
     println!();
     println!(
-        "audited {} contributions, {} fraud verdicts, band {:.4}",
+        "audited {} contributions, {} fraud verdicts, {band}",
         summary.audited(),
         summary.fraud(),
-        args.band
     );
 
     if let Some(path) = &args.json_out {

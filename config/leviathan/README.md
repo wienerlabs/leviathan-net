@@ -90,10 +90,13 @@ Stand it up like the genesis rehearsal, with this model's metadata:
 run-manager update-config --run-id leviathan-fineweb --config-path config/leviathan/fineweb-rehearsal.toml --num-parameters 19140864 --vocab-size 32000 ...
 ```
 
-The verifier replays from the same shard on local disk. Calibrate the band for
-this model on the GPU class the nodes rent (see `docs/BAND_CALIBRATION.md`) and
-keep the daemon in `--dry-run` until that band is set, so no honest node is
-slashed against the nano model's band:
+The verifier replays from the same shard on local disk. The run sends 1-bit
+signs, so the daemon holds payloads to a band on their churn and flips, and
+refuses a band on their distance unless it only watches
+(wienerlabs/leviathan-net#49). Calibrate both for this model, on the GPU class
+the nodes rent against the hardware the daemon replays on (see
+`docs/BAND_CALIBRATION.md`). Keep the daemon in `--dry-run` until they are set,
+so no honest node is slashed against another model's band:
 
 ```
 mkdir -p data/fineweb-rehearsal
@@ -102,7 +105,8 @@ curl -L -o data/fineweb-rehearsal/00000_00000_shuffled.ds \
 ./target/debug/calibrate-band --run-config config/leviathan/fineweb-rehearsal.toml \
   --data-dir data/fineweb-rehearsal --samples 32 --class <gpu>
 leviathan-verifier-daemon --run-id leviathan-fineweb ... \
-  --replay-data-dir data/fineweb-rehearsal --band <calibrated> --dry-run
+  --replay-data-dir data/fineweb-rehearsal \
+  --churn-band <calibrated> --flip-band <calibrated> --dry-run
 ```
 
 The daemon reads everything else from the run on chain: the checkpoint and its
@@ -129,6 +133,6 @@ artifacts the run owner provides:
 
 Keep `verification_percent = 10` and the DisTrO block unchanged: those are the
 security and transport parameters, and they do not depend on model size. Calibrate
-the tolerance band per hardware class before mainnet (see the Phase 2 calibration
-harness task); the band is the adversary's undetectable budget and is a published
-dashboard metric.
+the band on churn and flips per pair of node class and verifier class before
+mainnet (`docs/BAND_CALIBRATION.md`); the band is the adversary's undetectable
+budget and is a published dashboard metric.

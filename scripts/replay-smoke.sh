@@ -71,4 +71,29 @@ if [[ $STATUS -ne 2 ]]; then
     exit 1
 fi
 
-echo "[smoke] passed: honest cleared, forged convicted, no reference dumps involved"
+# The run sends 1-bit signs, and the contribution was trained in the
+# verifier's own class (CPU, fp32), so the replay is exact: under a band on its
+# signs, any churn or flip is fraud (wienerlabs/leviathan-net#49).
+echo "[smoke] auditing the honest contribution on its signs, with no churn or flip allowed"
+"$BIN/leviathan-verifier" \
+    --submitted "$WORK/submitted" \
+    --run-config "$RUN_CONFIG" \
+    --replay-data-dir "$WORK/data" \
+    --churn-band 0 --flip-band 0
+
+echo "[smoke] auditing the forged contribution on its signs, expecting a conviction"
+set +e
+"$BIN/leviathan-verifier" \
+    --submitted "$WORK/cheat" \
+    --run-config "$RUN_CONFIG" \
+    --replay-data-dir "$WORK/data" \
+    --churn-band 0 --flip-band 0
+STATUS=$?
+set -e
+
+if [[ $STATUS -ne 2 ]]; then
+    echo "[smoke] FAILED: the forged contribution should have exited 2 on its signs, got $STATUS"
+    exit 1
+fi
+
+echo "[smoke] passed: honest cleared, forged convicted, on its distance and on its signs, no reference dumps involved"

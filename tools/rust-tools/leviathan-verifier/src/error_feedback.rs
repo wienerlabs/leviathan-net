@@ -397,43 +397,14 @@ pub fn check_rounds(rounds: &[Round], node_count: usize) -> Result<()> {
     Ok(())
 }
 
-/// Compares the coordinates node 0 `sent` with the `replayed` ones: the share
-/// of node 0's coordinates the replay did not send at all, and, of those both
-/// sent, the share with the other sign. When node 0 sent nothing, the replay
-/// churned everything it sent, and nothing flipped.
+/// Compares the coordinates node 0 `sent` with the `replayed` ones: their
+/// churn and their flips, as the verifier judges a 1-bit payload
+/// (`psyche_verifier::sign_drift`, wienerlabs/leviathan-net#49), so what is
+/// measured here is what a band is held to.
 pub fn compare_signs(sent: &[f32], replayed: &[f32]) -> Result<(f32, f32)> {
-    if sent.len() != replayed.len() {
-        return Err(anyhow!(
-            "{} sent coordinates against {} replayed",
-            sent.len(),
-            replayed.len()
-        ));
-    }
-    let (held, churned, flipped) = sent
-        .iter()
-        .zip(replayed)
-        .filter(|(sent, _)| **sent != 0.0)
-        .fold(
-            (0u64, 0u64, 0u64),
-            |(held, churned, flipped), (sent, replayed)| match *replayed == 0.0 {
-                true => (held + 1, churned + 1, flipped),
-                false => (
-                    held + 1,
-                    churned,
-                    flipped + u64::from((*sent > 0.0) != (*replayed > 0.0)),
-                ),
-            },
-        );
-    if held == 0 {
-        let replay_sent = replayed.iter().any(|value| *value != 0.0);
-        return Ok((f32::from(u8::from(replay_sent)), 0.0));
-    }
-    let shared = held - churned;
-    let flips = match shared {
-        0 => 0.0,
-        shared => flipped as f32 / shared as f32,
-    };
-    Ok((churned as f32 / held as f32, flips))
+    let drift = psyche_verifier::sign_drift(sent, replayed)
+        .map_err(|error| anyhow!("comparing the signs: {error}"))?;
+    Ok((drift.churn, drift.flips))
 }
 
 /// The nodes' mean training loss at `step`. The trainer reports a loss of 0
@@ -919,11 +890,17 @@ mod tests {
     fn churn_counts_what_the_replay_dropped_and_flips_what_it_turned() {
         let sent = [1.0, -1.0, 0.0, 1.0, 1.0, 0.0];
         assert_eq!(compare_signs(&sent, &sent).unwrap(), (0.0, 0.0));
-        // Of four sent: one dropped, three shared, one of those turned. What
-        // the replay added where node 0 sent nothing does not count.
+        // Of four sent: one dropped, three shared, one of those turned. Churn
+        // is counted from both sides, as the verifier counts it: of the five
+        // the replay sent, two are ones node 0 did not send, which is the
+        // larger share.
         let replayed = [1.0, 1.0, 1.0, 0.0, 1.0, -1.0];
         let (churn, flips) = compare_signs(&sent, &replayed).unwrap();
-        assert!((churn - 0.25).abs() < 1e-6);
+        assert!((churn - 0.4).abs() < 1e-6, "{churn}");
+        // With as many sent on each side, the two shares are one.
+        let swapped = [1.0, -1.0, 1.0, 0.0, 1.0, 0.0];
+        let (churn, _) = compare_signs(&sent, &swapped).unwrap();
+        assert!((churn - 0.25).abs() < 1e-6, "{churn}");
         assert!((flips - 1.0 / 3.0).abs() < 1e-6);
         assert!(compare_signs(&sent, &[1.0]).is_err());
     }

@@ -180,14 +180,21 @@ impl ReplayTrainerConfig {
     /// Whether the run transmits its results as 1-bit signs, which the replay
     /// has to do too before it is compared with what a node sent.
     pub fn quantize_1bit(&self) -> bool {
-        matches!(
-            self.optimizer,
-            OptimizerDefinition::Distro {
-                quantize_1bit: true,
-                ..
-            }
-        )
+        sends_signs(&self.optimizer)
     }
+}
+
+/// Whether a run trained with `optimizer` sends its results as 1-bit signs,
+/// which are judged on their churn and flips rather than their distance
+/// (wienerlabs/leviathan-net#49).
+pub fn sends_signs(optimizer: &OptimizerDefinition) -> bool {
+    matches!(
+        optimizer,
+        OptimizerDefinition::Distro {
+            quantize_1bit: true,
+            ..
+        }
+    )
 }
 
 /// The published checkpoint a cold start trains from: the Hub repository and

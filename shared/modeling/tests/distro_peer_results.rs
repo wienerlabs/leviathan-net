@@ -47,6 +47,24 @@ fn indices_outside(honest: &[DistroResult]) -> Vec<DistroResult> {
     results
 }
 
+/// One variable names its first row's first coordinate a second time, in place
+/// of the second.
+fn index_repeated(honest: &[DistroResult]) -> Vec<DistroResult> {
+    let mut results = honest.to_vec();
+    let target = results
+        .iter()
+        .position(|r| r.totalk < 256 && *r.sparse_idx.size().last().unwrap() > 1)
+        .expect("the model has a variable with 8-bit indices, more than one a row");
+    let result = &results[target];
+    let k = *result.sparse_idx.size().last().unwrap();
+    let rows = result.sparse_idx.reshape([-1, k]).copy();
+    let first = rows.get(0).get(0).int64_value(&[]);
+    let _ = rows.get(0).get(1).fill_(first);
+    let repeated = rows.reshape(result.sparse_idx.size());
+    results[target] = rebuilt(result, repeated, result.sparse_val.copy());
+    results
+}
+
 /// One variable carries one value fewer than it has indices.
 fn counts_differ(honest: &[DistroResult]) -> Vec<DistroResult> {
     let mut results = honest.to_vec();
@@ -127,6 +145,16 @@ fn each_payload_that_does_not_fit_is_named_for_why() {
         distro.check_results(&*model, &counts_differ(&honest)),
         Err(DistroResultMismatch::Values { .. })
     ));
+    assert!(matches!(
+        distro.check_results(&*model, &index_repeated(&honest)),
+        Err(DistroResultMismatch::Indices { .. })
+    ));
+    // The same check stands on the payload alone, as the verifier makes it.
+    assert!(matches!(
+        Distro::check_encodings(&index_repeated(&honest)),
+        Err(DistroResultMismatch::Indices { .. })
+    ));
+    assert_eq!(Distro::check_encodings(&honest), Ok(()));
 }
 
 /// Without 1-bit quantization the values travel as floating point, and a peer

@@ -2,6 +2,7 @@
 //! one batch. It works from the records a client keeps, with no replay and no
 //! committee (wienerlabs/leviathan-net#46).
 
+use leviathan_verifier::PayloadBand;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -101,7 +102,7 @@ fn config(
         run_id: h.run_id.clone(),
         submitted_dir,
         reference_dir: Some(scratch(&format!("{tag}-reference"))),
-        band: 0.05,
+        band: PayloadBand::Distance(0.05),
         audit_assigned: true,
         dry_run,
         verdict_mode: true,

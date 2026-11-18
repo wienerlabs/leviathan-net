@@ -110,16 +110,27 @@ Open: model, revision, dataset URL, measured peak VRAM per class.
 
 ## 3. Security parameters
 
-### The band is measured, and it is the one parameter that is settled
+### The band: a band on churn and flips, still to be calibrated per class
 
 | Class | dtype | samples | drift max | safety | band | vs default 0.05 |
 |---|---|---|---|---|---|---|
 | RTX 3060 Ti | bf16 | 32 | 0.005804 | 5.0 | **0.029019** | comfortably under |
 
-Honest drift on the dominant class is tight (min 0.00258, mean 0.00366). The
-shipped default of 0.05 does not falsely convict 3060 Ti nodes. **The 3090 class
-has not been measured** and should be before the run opens, because a 24 GB class
-is the fallback if the model does not fit in 8 GB.
+That row was measured on unquantized values at a constant learning rate. Every
+Leviathan run sends 1-bit signs, and over signs a replay differs by
+coordinates picked differently (churn) or signs turned (flips), not by a
+small, smooth distance.
+- **The verifier daemon's band.** For a 1-bit run the daemon is held to
+  `--churn-band` and `--flip-band`, and refuses a band on the distance unless
+  it only watches.
+- **Where the bands come from.** `calibrate-band` reports them, per pair of node
+  class and verifier class (`BAND_CALIBRATION.md`, wienerlabs/leviathan-net#49).
+- **What is measured so far.** The CPU and the M1's GPU:
+  - In a round's first step and over the first rounds, honest single-step
+    replays across classes churn 1.5–4% and almost never flip.
+  - Later rounds with an fp32 verifier reach 8–14% churn.
+- **What is not.** The GPU classes nodes rent (3060 Ti, 3090) have to be
+  calibrated this way before the run opens.
 
 Two cautions already recorded in `BAND_CALIBRATION.md` and worth repeating: CPU
 bf16 is not a stand-in for accelerator bf16 (it spikes past 0.2 when rounding
@@ -292,9 +303,9 @@ earned rewards for the epoch and nothing else.** The audit works, the committee
 works, the appeals court works, the economic argument does not. Stage two is one
 `run_bond_config_update`, no redeploy, no migration.
 
-Settled: `verification_percent = 10`, band `0.05` default (3060 Ti measured at
-0.029), and the final round's audit window: at least twice a verifier's worst
-latency, measured, with the rehearsals at 25 s. Open: committee size, the
+Settled: `verification_percent = 10`, and the final round's audit window: at least twice a verifier's worst
+latency, measured, with the rehearsals at 25 s. Open: committee size, the sign
+band for each class pair nodes rent (wienerlabs/leviathan-net#49), the
 flagship's `cooldown_time` once its model's pass is measured, and whether the
 first public run is stage one (bondless) or waits for the audit.
 

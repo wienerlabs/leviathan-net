@@ -43,8 +43,12 @@ use psyche_coordinator::model::LLM;
 use psyche_data_provider::LocalDataProvider;
 use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::BatchDataCPU;
+use leviathan_verifier::sends_signs;
 use psyche_verifier::calibrate_band;
+use psyche_verifier::calibrate_sign_band;
 use psyche_verifier::relative_l2_distance;
+use psyche_verifier::sign_drift;
+use psyche_verifier::SignDrift;
 use psyche_verifier::DEFAULT_BAND;
 use psyche_verifier::DEFAULT_SAFETY_FACTOR;
 
@@ -188,7 +192,14 @@ async fn main() -> Result<()> {
         batches.push((batch_id, data));
     }
 
+    // A run that sends 1-bit signs is judged on its churn and flips, so each
+    // sample is measured on those too (wienerlabs/leviathan-net#49).
+    let one_bit = sends_signs(&llm.optimizer);
     let mut drifts = Vec::with_capacity(args.samples);
+    let mut sign_drifts: Vec<SignDrift> = Vec::with_capacity(args.samples);
+    // How many coordinates a payload sends, the fewest of any sample: the sign
+    // band is never narrower than one of them.
+    let mut coordinates = u64::MAX;
     for (i, (batch_id, data)) in batches.into_iter().enumerate() {
         let step = (i + 1) as u32;
         let reference = compute_delta(
@@ -211,12 +222,31 @@ async fn main() -> Result<()> {
         )?;
         let drift = relative_l2_distance(&target, &reference)
             .map_err(|e| anyhow!("distance on sample {i}: {e:?}"))?;
-        eprintln!("[calibrate] sample {i:>3}: drift {drift:.6}");
+        if one_bit {
+            let sent = reference.iter().filter(|value| **value != 0.0).count();
+            coordinates = coordinates.min(sent as u64);
+            let signs = sign_drift(&target, &reference)
+                .map_err(|e| anyhow!("signs on sample {i}: {e:?}"))?;
+            eprintln!(
+                "[calibrate] sample {i:>3}: drift {drift:.6} churn {:.6} flips {:.6}",
+                signs.churn, signs.flips
+            );
+            sign_drifts.push(signs);
+        } else {
+            eprintln!("[calibrate] sample {i:>3}: drift {drift:.6}");
+        }
         drifts.push(drift);
     }
 
     let band =
         calibrate_band(&drifts, args.safety_factor).map_err(|e| anyhow!("calibrating: {e:?}"))?;
+    let sign_band = match one_bit {
+        true => Some(
+            calibrate_sign_band(&sign_drifts, args.safety_factor, coordinates)
+                .map_err(|e| anyhow!("calibrating the sign band: {e:?}"))?,
+        ),
+        false => None,
+    };
 
     let n = drifts.len() as f32;
     let mean = drifts.iter().sum::<f32>() / n;
@@ -249,6 +279,24 @@ async fn main() -> Result<()> {
             "default is TOO LOW for this class"
         }
     );
+    if let Some(sign_band) = sign_band {
+        let worst =
+            |part: fn(&SignDrift) -> f32| sign_drifts.iter().map(part).fold(0.0f32, f32::max);
+        println!("coordinates sent    {coordinates}");
+        println!(
+            "churn / flips max   {:.6} / {:.6}",
+            worst(|d| d.churn),
+            worst(|d| d.flips)
+        );
+        println!(
+            "calibrated signs    churn {:.6}, flips {:.6}",
+            sign_band.churn, sign_band.flips
+        );
+        println!(
+            "this run sends 1-bit signs: judge its payloads with --churn-band {:.6} --flip-band {:.6}",
+            sign_band.churn, sign_band.flips
+        );
+    }
 
     if reference_device == target_device && reference_kind == target_kind {
         eprintln!(
@@ -267,7 +315,7 @@ async fn main() -> Result<()> {
             "{{\"class\":\"{}\",\"model\":\"{}\",\"reference_device\":\"{}\",\
              \"reference_dtype\":\"{}\",\"target_device\":\"{}\",\"target_dtype\":\"{}\",\
              \"samples\":[{}],\"drift_min\":{},\"drift_mean\":{},\"drift_max\":{},\
-             \"safety_factor\":{},\"band\":{}}}\n",
+             \"safety_factor\":{},\"band\":{}{}}}\n",
             args.class,
             llm.checkpoint,
             device_label(reference_device),
@@ -280,6 +328,24 @@ async fn main() -> Result<()> {
             max,
             args.safety_factor,
             band,
+            match sign_band {
+                Some(sign_band) => format!(
+                    ",\"churn\":[{}],\"flips\":[{}],\"sign_band\":{{\"churn\":{},\"flips\":{}}}",
+                    sign_drifts
+                        .iter()
+                        .map(|d| format!("{}", d.churn))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    sign_drifts
+                        .iter()
+                        .map(|d| format!("{}", d.flips))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    sign_band.churn,
+                    sign_band.flips
+                ),
+                None => String::new(),
+            },
         );
         std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
         eprintln!("[calibrate] wrote {}", path.display());
