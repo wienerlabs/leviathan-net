@@ -117,18 +117,21 @@ impl PythonDistributedTrainer {
 
         let it = model.iteration();
         let local: WrappedPythonCausalLM = model.local.clone();
-        let local = Box::new(LocalTrainer::new(
-            ParallelModels {
-                models: vec![Box::new(local) as Box<dyn CausalLM>],
-                barrier: Arc::new(NopBarrier) as Arc<dyn Barrier>,
-                data_parallel: None,
-            },
-            lr_scheduler,
-            optimizer,
-            micro_batch_size,
-            stats,
-            grad_accum_in_fp32,
-        ));
+        let local = Box::new(
+            LocalTrainer::new(
+                ParallelModels {
+                    models: vec![Box::new(local) as Box<dyn CausalLM>],
+                    barrier: Arc::new(NopBarrier) as Arc<dyn Barrier>,
+                    data_parallel: None,
+                },
+                lr_scheduler,
+                optimizer,
+                micro_batch_size,
+                stats,
+                grad_accum_in_fp32,
+            )
+            .without_state_commitment(),
+        );
 
         Ok(Self {
             model,

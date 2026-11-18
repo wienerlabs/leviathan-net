@@ -400,6 +400,7 @@ impl TrainingStepMetadata {
                                 distro_results,
                                 cancelled,
                                 nonce,
+                                state_digest,
                             } = completed_trainer.map_err(|_| TrainError::TrainCrashed)??;
 
                             event!(train::TrainingFinished {
@@ -449,6 +450,9 @@ impl TrainingStepMetadata {
                                             .collect::<std::result::Result<Vec<_>, _>>()
                                             .map_err(TrainError::SerializeDistroResult)?,
                                         trainer_nonce: nonce,
+                                        // The state the round was trained from, which the
+                                        // signature binds (wienerlabs/leviathan-net#89).
+                                        state_digest,
                                     };
 
                                     if let Some(dir) = write_gradients_dir {
@@ -1140,6 +1144,7 @@ mod write_gradients_tests {
             trainer_nonce: 2,
             batch_id: BatchId(ClosedInterval::new(8, 9)),
             distro_results: vec![SerializedDistroResult::try_from(&result).unwrap()],
+            state_digest: Some(psyche_core::sha256(b"the state trained from")),
         }
     }
 

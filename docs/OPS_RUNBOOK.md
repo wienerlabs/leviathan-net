@@ -230,6 +230,14 @@ wienerlabs/leviathan-net#67 is a flag day.
 - **How.** Bring a run up on the new build from its start. Do not upgrade it
   mid-run.
 
+wienerlabs/leviathan-net#89 is a flag day of the same kind. The hash a node
+signs moves to `v3` and binds the digest of the state the node trained the
+payload from: its weights and its error-feedback buffer as the round began
+(`docs/ROUND_AUDIT.md`). A payload carries that digest, a kept commitment
+record grows from 128 to 161 bytes, and the treasurer's evidence carries it
+too. Every node, verifier and treasurer of a run moves together, from the
+run's start.
+
 The treasurer's own accounts grow the same way:
 
 | Change | Account | Size (bytes) |
@@ -241,6 +249,7 @@ The treasurer's own accounts grow the same way:
 | Votes counted per signed payload: gained `vote_commitments`, the commitment hash each vote convicts on | `AuditVerdict` | 6470 |
 | wienerlabs/leviathan-net#72: gained `uncharged_slash_reports` | `Participant` | 73 |
 | wienerlabs/leviathan-net#72: new, one per slash no verdict accounts for | `SlashReport` | 134 |
+| wienerlabs/leviathan-net#89: evidence gained the state the target trained from (`state_committed`, `state_digest`) | `AuditVerdict` | 6503 |
 | wienerlabs/leviathan-net#92: new, one per proof of equivocation a reporter committed to and has not revealed | `EquivocationCommitment` | 113 |
 | wienerlabs/leviathan-net#92: new, one per run that set an equivocation bounty | `EquivocationBounty` | 43 |
 

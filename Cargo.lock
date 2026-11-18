@@ -7524,6 +7524,7 @@ name = "psyche-modeling"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "byteorder",
  "clap",
  "clap-markdown",

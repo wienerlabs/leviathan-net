@@ -66,14 +66,18 @@ fn slash_report_is_the_length_it_is_allocated_at() {
 ///   1 ejected, 2 charged), `charge_epoch_start` (u64), `charge_rate` (u64)
 ///   and `appeal_upheld` (one byte), before `voters`. The voter lists move 18
 ///   bytes.
-/// - 6470, this one, appends `vote_commitments`: the commitment hash each vote
+/// - 6470 appends `vote_commitments`: the commitment hash each vote
 ///   convicts on, one 32-byte entry per voter, so votes are counted per payload
 ///   rather than refused when the first vote cited another. It comes after
 ///   `appeal_voters`, so every field a 4418 decoder reads is where it was.
+/// - 6503, this one, ends `evidence` with the state the target trained the
+///   payload from (wienerlabs/leviathan-net#89): `state_committed` (one byte)
+///   and `state_digest` (32 bytes, zeros when not committed), before
+///   `pending_since_unix`. Every field after the evidence moves 33 bytes.
 ///
-/// A decoder has to learn 6470 before it reads accounts from the deployment
+/// A decoder has to learn 6503 before it reads accounts from the deployment
 /// carrying it.
 #[test]
 fn audit_verdict_is_the_length_the_web_decoder_expects() {
-    assert_eq!(AuditVerdict::space_with_discriminator(), 6470);
+    assert_eq!(AuditVerdict::space_with_discriminator(), 6503);
 }

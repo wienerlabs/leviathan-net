@@ -33,10 +33,28 @@ pub struct CommitmentEvidence {
     pub step: u32,
     pub trainer_nonce: u32,
     pub results_digest: [u8; 32],
+    /// Whether the target committed to the state it trained the payload from
+    /// (wienerlabs/leviathan-net#89).
+    pub state_committed: bool,
+    /// That state's digest, which the target's signature binds. All zeros,
+    /// and not part of the hash, when it committed to none. A fixed width, so
+    /// every field after the evidence sits where it does either way.
+    pub state_digest: [u8; 32],
 }
 
 impl CommitmentEvidence {
-    pub const SPACE: usize = 8 + 4 + 4 + 32;
+    pub const SPACE: usize = 8 + 4 + 4 + 32 + 1 + 32;
+
+    /// The state digest the target committed to, if it committed to one.
+    pub fn state(&self) -> Option<&[u8; 32]> {
+        self.state_committed.then_some(&self.state_digest)
+    }
+
+    /// `state_committed` and `state_digest` for `state`, the digest a payload
+    /// names, if any: an absent one is all zeros.
+    pub fn state_fields(state: Option<[u8; 32]>) -> (bool, [u8; 32]) {
+        (state.is_some(), state.unwrap_or([0; 32]))
+    }
 
     /// The hash the target signed, if this is a payload it committed to for
     /// `batch_start..=batch_end` in the run `run` (`commitment_run`).
@@ -54,6 +72,7 @@ impl CommitmentEvidence {
             batch_start,
             batch_end,
             &self.results_digest,
+            self.state(),
         )
     }
 
@@ -303,11 +322,57 @@ mod tests {
             step: 4,
             trainer_nonce: 1,
             results_digest: [3; 32],
+            state_committed: true,
+            state_digest: [5; 32],
         };
         let run = payload_commitment_run("a run");
         assert_eq!(
             evidence.committed_hash(&run, 8, 15),
-            payload_commitment_hash(&run, 1_700_000_000, 4, 1, 8, 15, &[3; 32])
+            payload_commitment_hash(
+                &run,
+                1_700_000_000,
+                4,
+                1,
+                8,
+                15,
+                &[3; 32],
+                Some(&[5; 32])
+            )
+        );
+        // The state the target trained from is part of what it signed
+        // (wienerlabs/leviathan-net#89).
+        for (state_committed, state_digest) in
+            [(true, [6; 32]), (false, [0; 32])]
+        {
+            assert_ne!(
+                evidence.committed_hash(&run, 8, 15),
+                CommitmentEvidence {
+                    state_committed,
+                    state_digest,
+                    ..evidence
+                }
+                .committed_hash(&run, 8, 15),
+                "{state_committed} {state_digest:?}"
+            );
+        }
+        let stateless = CommitmentEvidence {
+            state_committed: false,
+            state_digest: [0; 32],
+            ..evidence
+        };
+        assert_eq!(stateless.state(), None);
+        assert_eq!(
+            stateless.committed_hash(&run, 8, 15),
+            payload_commitment_hash(
+                &run,
+                1_700_000_000,
+                4,
+                1,
+                8,
+                15,
+                &[3; 32],
+                None
+            )
         );
         assert_ne!(
             evidence.committed_hash(&run, 8, 15),

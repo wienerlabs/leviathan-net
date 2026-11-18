@@ -48,6 +48,22 @@ pub fn replayed_digest() -> [u8; 32] {
     payload_digest(HONEST_PAYLOAD)
 }
 
+/// The state a node in these suites claims it trained a round from. They
+/// train no model, so it is the digest of who trained which round, which no
+/// two nodes or rounds share (wienerlabs/leviathan-net#89).
+pub fn claimed_state(
+    node: &NodeIdentity,
+    coordinator: &Coordinator,
+) -> [u8; 32] {
+    let mut bytes = node.signer().to_vec();
+    bytes.extend_from_slice(node.p2p_identity());
+    bytes.extend_from_slice(
+        &coordinator.epoch_state.start_timestamp.to_be_bytes(),
+    );
+    bytes.extend_from_slice(&coordinator.progress.step.to_be_bytes());
+    sha256(&bytes)
+}
+
 /// A node's identity with its own p2p key, as a client joins with.
 pub fn identity(wallet: &Keypair, p2p: &Keypair) -> NodeIdentity {
     NodeIdentity::new(wallet.pubkey().to_bytes(), p2p.pubkey().to_bytes())
@@ -67,6 +83,7 @@ pub fn signed_payload(
         node,
         p2p,
         payload_digest(payload),
+        Some(claimed_state(node, coordinator)),
     )
     .expect("the node trains a batch this round")
 }
@@ -77,7 +94,11 @@ pub fn payload_header(
     coordinator: &Coordinator,
     node: &NodeIdentity,
 ) -> PayloadHeader {
-    signed_commitment::payload_header(coordinator, node)
+    signed_commitment::payload_header(
+        coordinator,
+        node,
+        Some(claimed_state(node, coordinator)),
+    )
     .expect("the node trains a batch this round")
 }
 
@@ -114,6 +135,7 @@ fn signed_record(
         trainer_nonce: header.trainer_nonce,
         batch_id: header.batch_id,
         distro_results,
+        state_digest: header.state_digest,
     };
     let data_hash = payload.comptue_hash(run_id).unwrap();
     let key = psyche_network::SecretKey::from_bytes(&p2p.secret().to_bytes());

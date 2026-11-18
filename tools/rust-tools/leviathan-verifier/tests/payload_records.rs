@@ -52,6 +52,7 @@ fn payload(name: &str) -> TransmittableDistroResult {
         trainer_nonce: 4,
         batch_id: BatchId(ClosedInterval::new(16, 17)),
         distro_results: read_dump(&fixture(name)).unwrap(),
+        state_digest: Some(psyche_core::sha256(b"the state trained from")),
     }
 }
 

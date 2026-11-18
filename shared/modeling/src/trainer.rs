@@ -1,7 +1,7 @@
 use crate::{
     AllReduce, CausalLM, Communicator, CommunicatorId, CudaSynchronize, Distro, DistroResult,
     EosToks, Fp32GradientAccumulator, Optimizer, ReduceType, StableVariableIterator,
-    unsharded_cpu_variables,
+    round_state_digest, unsharded_cpu_variables, write_round_state,
 };
 use anyhow::{Error, Result};
 use psyche_core::{Barrier, BatchId, LearningRateSchedule, OptimizerDefinition};
@@ -236,6 +236,10 @@ pub struct TrainOutput {
     pub nonce: u32,
     pub distro_results: Option<DistroResults>,
     pub cancelled: bool,
+    /// The digest of the state the round was trained from, which the node
+    /// commits to in the payload it signs (wienerlabs/leviathan-net#89). None
+    /// from a trainer that commits to none.
+    pub state_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +260,7 @@ enum ParallelAssignment {
         rollback: Vec<(u32, Vec<DistroResults>)>,
         cancel_training: CancellationToken,
         prev_self_distro_results: Option<Vec<DistroResults>>,
+        commit_state: bool,
     },
     Optimize {
         distro_results: Option<Vec<DistroResults>>,
@@ -289,6 +294,7 @@ enum ParallelResult {
         nonce: u32,
         cancelled: bool,
         distro_results: Option<DistroResults>,
+        state_digest: Option<[u8; 32]>,
     },
     Optimize,
     Forward {
@@ -488,6 +494,10 @@ pub struct LocalTrainer {
     barrier: Arc<dyn Barrier>,
     data_parallel: Option<Vec<DataParallel>>,
     can_do_inferences: Vec<Arc<AtomicBool>>,
+    /// Whether each round's training commits to the state it trains from
+    /// (wienerlabs/leviathan-net#89). A trainer driven from Python cannot:
+    /// its ranks there do not join the gathers the digest needs.
+    commit_state: bool,
 }
 
 #[derive(Debug, Error)]
@@ -590,7 +600,52 @@ impl LocalTrainer {
             barrier,
             data_parallel,
             can_do_inferences,
+            commit_state: true,
         }
+    }
+
+    /// This trainer, committing to no state in the rounds it trains: one
+    /// driven from Python, whose ranks there do not join the gathers the
+    /// digest needs (wienerlabs/leviathan-net#89).
+    pub fn without_state_commitment(self) -> Self {
+        Self {
+            commit_state: false,
+            ..self
+        }
+    }
+
+    /// The digest of the state `model` and `optimizer` train round `step`
+    /// from, on the model thread at `index`. The first thread hashes it. The
+    /// others of a sharded model only join the gathers it needs, and those of
+    /// an unsharded one do nothing. A state that cannot be encoded is logged
+    /// and committed to as none, which an audit then finds unrevealable.
+    fn commit_round_state(
+        model: &dyn CausalLM,
+        optimizer: &Distro,
+        index: usize,
+        step: u32,
+    ) -> Option<[u8; 32]> {
+        if index == 0 {
+            return match round_state_digest(model, optimizer) {
+                Ok(digest) => Some(digest),
+                Err(err) => {
+                    error!(
+                        step,
+                        "Cannot commit to the state this round trains from: {err}"
+                    );
+                    None
+                }
+            };
+        }
+        if model.variables().any(|variable| variable.is_sharded()) {
+            if let Err(err) = write_round_state(&mut std::io::sink(), model, optimizer) {
+                error!(
+                    step,
+                    "Cannot gather the state this round trains from: {err}"
+                );
+            }
+        }
+        None
     }
 
     fn forward_backward(
@@ -683,6 +738,7 @@ impl LocalTrainer {
                 rollback: rollback.clone(),
                 prev_self_distro_results: prev_self_distro_results.clone(),
                 cancel_training: cancel_training.clone(),
+                commit_state: self.commit_state,
             })
             .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
         }
@@ -691,6 +747,7 @@ impl LocalTrainer {
         let mut final_distro_results = None;
         let mut final_cancelled = false;
         let mut final_nonce = 0;
+        let mut final_state_digest = None;
         for (_, rx) in &self.models {
             match rx
                 .recv()
@@ -701,10 +758,14 @@ impl LocalTrainer {
                     distro_results,
                     cancelled,
                     nonce,
+                    state_digest,
                 } => {
                     if final_distro_results.is_none() {
                         final_distro_results = distro_results;
                         final_nonce = nonce;
+                    }
+                    if final_state_digest.is_none() {
+                        final_state_digest = state_digest;
                     }
                     final_cancelled = cancelled;
                     final_loss += loss;
@@ -725,6 +786,7 @@ impl LocalTrainer {
             distro_results: final_distro_results,
             cancelled: final_cancelled,
             nonce: final_nonce,
+            state_digest: final_state_digest,
         })
     }
 
@@ -996,6 +1058,7 @@ impl LocalTrainer {
                     rollback: _,
                     prev_self_distro_results,
                     cancel_training,
+                    commit_state,
                 }) => {
                     // this needs even more work for overlapped
                     // for (step, result) in rollback.iter().rev() {
@@ -1075,6 +1138,7 @@ impl LocalTrainer {
                         grad_accum.zero_grad();
                     }
 
+                    let mut state_digest = None;
                     let lr = Trainer::get_lr(&lr_scheduler, step, warmup_lr_between);
                     let prev_lr = match step {
                         0 => Trainer::get_lr(&lr_scheduler, 0, warmup_lr_between),
@@ -1103,6 +1167,17 @@ impl LocalTrainer {
                             if zero_optim {
                                 optimizer.zero_optim();
                                 tracing::info!("Zeroed optimizer states");
+                            }
+                            // The state this round trains from, committed to
+                            // before the lookahead moves the weights
+                            // (wienerlabs/leviathan-net#89).
+                            if commit_state {
+                                state_digest = Self::commit_round_state(
+                                    model.as_ref(),
+                                    optimizer,
+                                    index,
+                                    step,
+                                );
                             }
                             match &prev_self_distro_results {
                                 Some(_) => optimizer.error_correction(model.as_ref(), prev_lr),
@@ -1249,6 +1324,7 @@ impl LocalTrainer {
                             distro_results,
                             cancelled,
                             nonce,
+                            state_digest,
                         })
                         .is_err()
                     {

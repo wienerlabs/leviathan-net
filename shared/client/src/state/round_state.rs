@@ -144,6 +144,7 @@ mod tests {
             trainer_nonce: 1,
             batch_id,
             distro_results: vec![],
+            state_digest: Some(psyche_core::sha256(b"the state trained from")),
         }
     }
 

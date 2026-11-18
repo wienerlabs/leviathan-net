@@ -127,6 +127,8 @@ pub fn signed_commitment_of(
     p2p: [u8; 32],
 ) -> SignedCommitment {
     let record = commitment.record;
+    let (state_committed, state_digest) =
+        CommitmentEvidence::state_fields(record.state_digest);
     SignedCommitment {
         run: commitment_run(coordinator),
         batch_start: record.batch_id.0.start,
@@ -136,6 +138,8 @@ pub fn signed_commitment_of(
             step: record.step,
             trainer_nonce: record.trainer_nonce,
             results_digest: commitment.results_digest,
+            state_committed,
+            state_digest,
         },
         signer: p2p,
         signature: record.signature,

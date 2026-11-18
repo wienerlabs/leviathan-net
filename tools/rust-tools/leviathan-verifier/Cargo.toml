@@ -27,6 +27,10 @@ path = "src/bin/measure_error_feedback.rs"
 name = "check-error-feedback-fidelity"
 path = "src/bin/check_error_feedback_fidelity.rs"
 
+[[bin]]
+name = "measure-round-state"
+path = "src/bin/measure_round_state.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

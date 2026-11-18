@@ -437,6 +437,9 @@ async fn run() -> Result<()> {
         ),
         &p2ps[target_node],
         target_payload,
+        // The demo's node trains nothing, so it commits to no state
+        // (wienerlabs/leviathan-net#89).
+        None,
     )?;
 
     println!("[+] {} verifiers convict the target (a pending slash opens the challenge window)", verifier_quorum);

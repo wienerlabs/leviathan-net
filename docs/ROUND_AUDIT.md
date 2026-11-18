@@ -50,6 +50,11 @@ v3 = sha256("leviathan/payload-commitment/v3" || run || epoch_start || step
   should be: the node told peers two different things about one round.
 - **It is a flag day**, like #67's v2: every node, verifier and treasurer of a
   run moves together, from the run's start.
+- **A node may commit to no state.** The hash then binds a tag saying so,
+  which no digest can stand in for. A trainer driven from Python does this:
+  its ranks there do not join the gathers a digest of a sharded model needs.
+  Its rounds past the first cannot be replayed, and an audit of one finds no
+  state to fetch.
 
 ## When the digest is taken, and what it costs
 
@@ -63,9 +68,19 @@ and hashes them. That is about twice the model, every round, on every node.
 | about 350M | about 1.3 GiB | about 1.3 GiB |
 | about 1B | about 3.7 GiB | about 3.7 GiB |
 
-The copy and the hash run while the GPU trains, so they cost a round's time
-only where they are slower than the step. The commitment PR measures both on
-the rehearsal and records them.
+Measured with `measure-round-state` on the FineWeb rehearsal's 19.1M Llama in
+bf16, on an M1 Pro, after a real step filled the buffer (20 rounds each):
+
+| Where the node trains | State | Copied off the device, encoded and hashed |
+|---|---|---|
+| CPU | 73.0 MiB | 0.045 s per round |
+| M1 GPU (`mps`) | 73.0 MiB | 0.082 s per round |
+
+That is about 0.9 GiB/s from the GPU. The trainer takes the digest on its
+thread before the round's forward pass, so the round waits for it. At that
+rate a 350M state would take about 1.5 s a round and a 1B state about 4 s;
+those are extrapolated, not measured, and a CUDA node's copy rate is its
+own.
 
 ## Retention, and serving a state
 

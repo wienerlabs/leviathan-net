@@ -85,23 +85,27 @@ pub fn trained_step(coordinator: &Coordinator) -> Result<u32> {
 
 /// Which work a payload is: the round, named by when its epoch started and
 /// its step, the trainer's nonce, and the batch (wienerlabs/leviathan-net#43,
-/// #67).
+/// #67), and the state the trainer trained it from, if it committed to one
+/// (wienerlabs/leviathan-net#89).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PayloadHeader {
     pub epoch_start: u64,
     pub step: u32,
     pub trainer_nonce: u32,
     pub batch_id: BatchId,
+    pub state_digest: Option<[u8; 32]>,
 }
 
 /// Which work a payload of `node` from the round the coordinator is in is:
 /// the epoch and the step trained there, the trainer's nonce, and the batch
 /// the coordinator assigned `node` in that round. The committee is the
 /// round's own draw, with the tie-breaker seats it reserves, as the clients
-/// and the treasurer draw it.
+/// and the treasurer draw it. The chain does not hold the state `node` trained
+/// from, so the header commits to `state_digest`, which the caller names.
 pub fn payload_header(
     coordinator: &Coordinator,
     node: &NodeIdentity,
+    state_digest: Option<[u8; 32]>,
 ) -> Result<PayloadHeader> {
     // Batches are assigned by the committee drawn for the round, over the
     // roster as it stood then. In a warmup, or once the roster has moved since
@@ -126,6 +130,7 @@ pub fn payload_header(
         // the start of the epoch has trained one per round before this.
         trainer_nonce: step - coordinator.epoch_state.start_step,
         batch_id: batch,
+        state_digest,
     })
 }
 
@@ -153,11 +158,15 @@ impl SignedCommitment {
         header: PayloadHeader,
         results_digest: [u8; 32],
     ) -> SignedCommitment {
+        let (state_committed, state_digest) =
+            CommitmentEvidence::state_fields(header.state_digest);
         let evidence = CommitmentEvidence {
             epoch_start: header.epoch_start,
             step: header.step,
             trainer_nonce: header.trainer_nonce,
             results_digest,
+            state_committed,
+            state_digest,
         };
         let (batch_start, batch_end) =
             (header.batch_id.0.start, header.batch_id.0.end);
@@ -175,17 +184,19 @@ impl SignedCommitment {
 
     /// What `node` signed, with `p2p`, the key it joined with, for its payload
     /// of the round the coordinator is in, whose results digest is
-    /// `results_digest`.
+    /// `results_digest`, trained from the state `state_digest` names, if it
+    /// committed to one (wienerlabs/leviathan-net#89).
     pub fn for_round(
         coordinator: &Coordinator,
         node: &NodeIdentity,
         p2p: &Keypair,
         results_digest: [u8; 32],
+        state_digest: Option<[u8; 32]>,
     ) -> Result<SignedCommitment> {
         if node.p2p_identity() != &p2p.pubkey().to_bytes() {
             return Err(anyhow!("{node} did not join with this p2p key"));
         }
-        let header = payload_header(coordinator, node)?;
+        let header = payload_header(coordinator, node, state_digest)?;
         Ok(SignedCommitment::sign(
             p2p,
             commitment_run(coordinator),
@@ -204,6 +215,7 @@ impl SignedCommitment {
                 self.batch_start,
                 self.batch_end,
             )),
+            state_digest: self.evidence.state().copied(),
         }
     }
 
