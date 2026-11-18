@@ -9,10 +9,12 @@
 #
 # Each round's verifier also fetches, from the payload's trainer, the state
 # the payload it audits commits to (wienerlabs/leviathan-net#89): every one
-# has to be revealed, and be the state its payload commits to.
+# has to be revealed, and be the state its payload commits to. One of the
+# clients forges every result it sends; replayed from the states revealed,
+# its payloads have to be convicted and every other one cleared.
 #
 #   cargo build --bin psyche-centralized-server --bin psyche-centralized-client \
-#     --bin check-revealed-states
+#     --bin check-revealed-states --bin audit-revealed-rounds
 #   ./scripts/verifier-seats.sh
 #
 # Requires the libtorch environment (see docs/OPS_RUNBOOK.md) and the network,
@@ -28,6 +30,11 @@ TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 
 LABEL="[verifier-seats]"
 NODES=3
+# The last client sends forged results: its signs flipped and scaled, as the
+# swarm's cheater does.
+FORGER=$((NODES - 1))
+NODE_ENV=()
+NODE_ENV[$FORGER]="LEVIATHAN_FAKE_DELTA=sign_flip"
 # shellcheck source=lib/real-client-run.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/real-client-run.sh"
 run_real_clients
@@ -72,4 +79,11 @@ done
 # trains seats a verifier, so every step a payload was trained at has one.
 "$BIN/check-revealed-states" --run-config "$RUN_CONFIG" --dumps "${dumps[@]}" --revealed "$revealed" \
     --every-trained-step
-echo "$LABEL passed: every verifier fetched the state each payload it audited commits to"
+echo "$LABEL every verifier fetched the state each payload it audited commits to"
+
+# Replayed from the states revealed, by the band the replay smoke holds an
+# exact replay to: the forger convicted, everyone else cleared.
+echo "$LABEL replaying the audited rounds from their revealed states"
+"$BIN/audit-revealed-rounds" --run-config "$RUN_CONFIG" --dumps "${dumps[@]}" \
+    --forged-by "$WORK/dumps$FORGER" --churn-band 0 --flip-band 0
+echo "$LABEL passed: every forged payload convicted and every honest one cleared, replayed from the states their trainers revealed"

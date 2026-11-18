@@ -374,19 +374,25 @@ impl CompressDCT {
         }
     }
 
-    pub fn compress(x: &Tensor, topk: i64) -> (Tensor, Tensor, Vec<i64>, i64) {
-        let _no_grad = tch::no_grad_guard();
+    /// `x` as `compress` picks its coefficients from: the last two dimensions
+    /// of a 2D+ encoding flattened into one.
+    fn flat_view(x: &Tensor) -> Tensor {
         let xshape = x.size();
         let ndim = xshape.len();
-
-        let x = if ndim > 2 {
+        if ndim > 2 {
             // Equivalent to rearrange(x, "... y x h w -> ... y x (h w)")
             let mut new_shape: Vec<i64> = xshape[..ndim - 2].to_vec();
             new_shape.push(xshape[ndim - 2] * xshape[ndim - 1]);
             x.view(new_shape.as_slice())
         } else {
             x.shallow_clone()
-        };
+        }
+    }
+
+    pub fn compress(x: &Tensor, topk: i64) -> (Tensor, Tensor, Vec<i64>, i64) {
+        let _no_grad = tch::no_grad_guard();
+        let xshape = x.size();
+        let x = Self::flat_view(x);
 
         let totalk = *x.size().last().unwrap();
         let topk = Self::clamp_topk(&x, topk);
@@ -760,6 +766,27 @@ impl Distro {
         vars: &dyn CausalLM,
         results: &[DistroResult],
     ) -> Result<(), DistroResultMismatch> {
+        self.check_layout(vars, results, true)
+    }
+
+    /// As `check_results`, but of the indices alone: each result's shape,
+    /// `totalk` and indices, whatever its values. A node's own previous
+    /// result is read off its buffer at its indices (`results_at`), so the
+    /// values it broadcast, forged or not, play no part.
+    fn check_indices(
+        &self,
+        vars: &dyn CausalLM,
+        results: &[DistroResult],
+    ) -> Result<(), DistroResultMismatch> {
+        self.check_layout(vars, results, false)
+    }
+
+    fn check_layout(
+        &self,
+        vars: &dyn CausalLM,
+        results: &[DistroResult],
+        values: bool,
+    ) -> Result<(), DistroResultMismatch> {
         let expected_count = vars.variables().count();
         if results.len() != expected_count {
             return Err(DistroResultMismatch::Count {
@@ -775,7 +802,7 @@ impl Distro {
             // by their magnitudes, which no honest node can send; and one of a
             // run that sends values, packed signs (wienerlabs/leviathan-net#95).
             let packed = result.sparse_val.kind() == Kind::Bool;
-            if packed != self.quantize_1bit {
+            if values && packed != self.quantize_1bit {
                 return Err(DistroResultMismatch::Values {
                     index,
                     name,
@@ -805,19 +832,22 @@ impl Distro {
                 });
             }
             let flat = flattened(&expected);
-            Self::check_sparse(&flat, totalk, result).map_err(|(on_indices, reason)| {
-                match on_indices {
-                    true => DistroResultMismatch::Indices {
-                        index,
-                        name: name.clone(),
-                        reason,
-                    },
-                    false => DistroResultMismatch::Values {
-                        index,
-                        name: name.clone(),
-                        reason,
-                    },
-                }
+            // Every check of the indices comes before any of the values.
+            let checked = match Self::check_sparse(&flat, totalk, result) {
+                Err((false, _)) if !values => Ok(()),
+                checked => checked,
+            };
+            checked.map_err(|(on_indices, reason)| match on_indices {
+                true => DistroResultMismatch::Indices {
+                    index,
+                    name: name.clone(),
+                    reason,
+                },
+                false => DistroResultMismatch::Values {
+                    index,
+                    name: name.clone(),
+                    reason,
+                },
             })?;
         }
         Ok(())
@@ -1107,6 +1137,42 @@ impl Distro {
         for state in &mut self.state {
             let _ = state.delta.logical_tensor().zero_();
         }
+    }
+
+    /// The values a node sent for its previous round, unquantized, as its
+    /// buffer holds them: each buffer encoded as `generate` encodes it to
+    /// send, at the indices of `previous`, the node's previous result as it
+    /// broadcast it. A node's next step takes those values out of its buffer
+    /// first (`generate`'s `prev_self_results`), and nothing changes the
+    /// buffer between the step that computed them and that one: so they
+    /// follow from the buffer and the result's public indices alone, and a
+    /// node never reveals them (wienerlabs/leviathan-net#89). The indices of
+    /// `previous` are checked against the model first, as a peer's are; its
+    /// values, forged or not, play no part. Every rank of a sharded model has
+    /// to call this together.
+    pub fn results_at(
+        &mut self,
+        vars: &dyn CausalLM,
+        previous: &[DistroResult],
+    ) -> Result<Vec<DistroResult>, DistroResultMismatch> {
+        self.check_indices(vars, previous)?;
+        let _no_grad = tch::no_grad_guard();
+        let mut results = Vec::with_capacity(previous.len());
+        for ((index, var), sent) in vars.variables().enumerate().zip(previous) {
+            let kind = var.logical_tensor().kind();
+            let full_delta = self.state[index].delta.gather_full_tensor();
+            let encoded = self.transform.encode(&full_delta.to_kind(kind));
+            let flat = CompressDCT::flat_view(&encoded);
+            let idx = decompress_idx(sent.totalk.abs(), &sent.sparse_idx.to_device(flat.device()));
+            results.push(DistroResult {
+                sparse_idx: sent.sparse_idx.shallow_clone(),
+                sparse_val: flat.gather(-1, &idx, false),
+                xshape: sent.xshape.clone(),
+                totalk: sent.totalk,
+                stats: None,
+            });
+        }
+        Ok(results)
     }
 
     /// The error-feedback buffer as variables, one per model variable in the

@@ -12,6 +12,7 @@ use leviathan_verifier::judge_payload;
 use leviathan_verifier::sends_signs;
 use leviathan_verifier::PayloadBand;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::revealed::revealed_round;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
 use leviathan_verifier::ReplayWork;
@@ -464,13 +465,31 @@ pub async fn audit_pass(
                 }
             }
             (None, Some(engine)) => {
-                // A replay reproduces only the first step of a cold-start
-                // epoch, trained from zeroed error feedback, and the run says
-                // which step that is. Judging any other step against it would
-                // convict honest nodes (wienerlabs/leviathan-net#47, #48), and
-                // so would the same step trained again after a restart, from
-                // other weights (wienerlabs/leviathan-net#67).
-                if !coordinator.is_replayable(record.epoch_start, record.step) {
+                // A payload whose trainer revealed the state it trained from
+                // is replayed from that state, at whatever round of the epoch
+                // (wienerlabs/leviathan-net#89). What this verifier did not
+                // keep to replay it with is its own gap, not the target's.
+                let revealed = match revealed_round(submitted_path) {
+                    Ok(revealed) => revealed,
+                    Err(err) => {
+                        println!(
+                            "[verifier-daemon] skip  {key} committer {committer} cannot be replayed from its revealed state: {err}"
+                        );
+                        report.unreplayable += 1;
+                        continue;
+                    },
+                };
+                // Without one, a replay reproduces only the first step of a
+                // cold-start epoch, trained from zeroed error feedback, and
+                // the run says which step that is. Judging any other step
+                // against it would convict honest nodes
+                // (wienerlabs/leviathan-net#47, #48), and so would the same
+                // step trained again after a restart, from other weights
+                // (wienerlabs/leviathan-net#67).
+                if revealed.is_none()
+                    && !coordinator
+                        .is_replayable(record.epoch_start, record.step)
+                {
                     continue;
                 }
                 // The replay of the work this payload is signed for, found by
@@ -479,7 +498,11 @@ pub async fn audit_pass(
                 // was built from an earlier read, and anyone leaving the epoch
                 // in between moves the committer to a seat whose batch is
                 // someone else's.
-                match engine.replay_work(&dump) {
+                let replayed = match &revealed {
+                    Some(round) => engine.replay_revealed_work(&dump, round),
+                    None => engine.replay_work(&dump),
+                };
+                match replayed {
                     Ok(delta) => delta,
                     Err(err) => {
                         println!(

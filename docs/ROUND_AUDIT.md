@@ -165,18 +165,44 @@ reaches it at that key.
 The daemon audits a payload past a run's first step when its state is beside
 it:
 
-1. It reads `<dump>.state` and checks its digest against the payload's
-   commitment.
-2. It builds a replay trainer of the run's model, loads the state into it
-   (`Trainer::load`, which takes weights and a buffer across dtypes, #48), and
-   derives the previous round's values from the buffer and the node's round
-   `h - 1` payload, which every node holds.
-3. It replays round `h` on the node's batch, and judges the payload against
-   the replay as it judges a first step: by the run's band, on the distance
-   or, for 1-bit runs, on churn and flips (#49).
+1. **The state.** It reads `<dump>.state` (`read_round_state`), whose digest
+   the reveal already checked against the payload's commitment.
+2. **Loading it.** It loads the state into its replay trainer (`Trainer::load`,
+   which takes weights and a buffer across dtypes, #48).
+3. **The previous round's values.** A node's step at round `h` first takes
+   out of its buffer the values it sent at round `h - 1`. Those values are the
+   buffer encoded as the node encodes it to send, read at the indices of its
+   round `h - 1` payload (`Distro::results_at`). Nothing changes the buffer
+   between the step that sent them and this one (`apply` touches only the
+   weights), so they follow from the revealed state and the payload's public
+   indices, and are never revealed.
+4. **What the node did the round before.** The verifier keeps beside the dump
+   what the node did the round before (`<dump>.previous`), from its own view
+   of that round's draw:
+   - **nothing:** it verified there, or the round opens its epoch, which every
+     node starts afresh; its step takes nothing out;
+   - **trained:** it trained a batch there, whose payload the verifier kept
+     with every other.
+5. **The replay.** It replays round `h` on the node's batch, and judges the
+   payload against the replay as it judges a first step: by the run's band,
+   on the distance or, for 1-bit runs, on churn and flips (#49).
 
 `Coordinator::is_replayable` then no longer limits what is judged; the state's
 presence does.
+
+**What the verifier cannot replay is its own gap, not the node's:**
+- it did not see the round before;
+- the node trained more than one batch there, and only the last one's values
+  are the buffer's;
+- it did not keep the node's payload of that round.
+
+The payload is skipped, not convicted.
+
+**On the same class the replay is exact.** On the CPU, a replay from the state
+a node committed to at round 3 sends exactly what the node sent there, and
+commits to the same state. Three real clients, one forging every result,
+check it end to end: replayed from the states the verifiers fetched, every
+honest payload is cleared at a band of zero and every forged one convicted.
 
 ## Continuity
 

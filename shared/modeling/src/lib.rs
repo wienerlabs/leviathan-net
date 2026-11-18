@@ -61,8 +61,8 @@ pub use rms_norm::RMSNorm;
 pub use rope::{RoPECache, RoPEConfig, RoPEType, default_rope, rotate_half, yarn_get_mscale};
 pub use round_state::{
     KeptRoundState, PARTIAL_ROUND_STATE_EXTENSION, ROUND_STATE_DOMAIN, ROUND_STATE_EXTENSION,
-    RoundStateError, keep_round_state, round_state_digest, round_state_file, round_state_len,
-    write_round_state,
+    RoundStateError, RoundStateTensors, keep_round_state, read_round_state, round_state_digest,
+    round_state_file, round_state_len, write_round_state,
 };
 pub use safetensor_utils::{
     LoadSafetensorsError, SaveSafetensorsError, load_safetensors_into_variables,

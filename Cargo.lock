@@ -5066,6 +5066,7 @@ dependencies = [
  "serde",
  "tch",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util 0.7.18",
  "toml 0.8.23",
