@@ -24,6 +24,10 @@ type Connection = NetworkConnection<TransmittableDistroResult, TransmittableDist
 /// How often the stores in these tests collect what no tag keeps.
 const GC_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How many collection intervals a forgotten state may still be served for,
+/// before a test takes it as never dropped.
+const COLLECTIONS_TO_WAIT: u32 = 100;
+
 /// A network connection as a client starts one, on this machine, without
 /// relays, serving `round_states` if it keeps any.
 async fn connect<A: Allowlist + Send + Sync + 'static>(
@@ -225,8 +229,11 @@ async fn only_a_peer_on_the_roster_can_fetch_a_state() {
 }
 
 /// A state is kept until its epoch ends. Keeping the first state of a later
-/// epoch forgets every state of an earlier one: its file is gone, it is no
-/// longer kept, and no verifier can fetch it, while the later one is served.
+/// epoch forgets every state of an earlier one: its file is gone and it is no
+/// longer kept at once, and once the store's collector has run, no verifier
+/// can fetch it, while the later one is served. A state as small as this
+/// model's is held inside the store's database rather than in its file, so
+/// the collector, not the file's removal, is what stops it being served.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_state_is_forgotten_once_its_epoch_ends() {
     let recipe = genesis_recipe();
@@ -250,10 +257,20 @@ async fn a_state_is_forgotten_once_its_epoch_ends() {
     let out = tempfile::tempdir().unwrap();
 
     let gone = out.path().join("first.state");
-    verifier
+    let mut collections = 0;
+    while verifier
         .fetch_round_state(node_addr.clone(), first, len, &gone)
         .await
-        .unwrap_err();
+        .is_ok()
+    {
+        std::fs::remove_file(&gone).unwrap();
+        collections += 1;
+        assert!(
+            collections < COLLECTIONS_TO_WAIT,
+            "a forgotten state was still served after {collections} collection intervals"
+        );
+        tokio::time::sleep(GC_INTERVAL).await;
+    }
     assert!(!gone.exists());
 
     let served = out.path().join("second.state");
