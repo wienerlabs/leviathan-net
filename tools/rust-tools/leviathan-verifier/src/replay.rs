@@ -155,6 +155,11 @@ pub struct ReplayTrainerConfig {
     /// gap between the two is the dominant source of honest drift the tolerance
     /// band has to cover, so the calibration harness sweeps this.
     pub kind: tch::Kind,
+    /// The dtype the DisTrO error-feedback buffer is kept in, if not each
+    /// parameter's own. A client keeps it in the parameter's dtype, where a bf16
+    /// buffer neither decays nor takes small increments
+    /// (wienerlabs/leviathan-net#90); this measures the alternative.
+    pub error_feedback_kind: Option<tch::Kind>,
 }
 
 impl ReplayTrainerConfig {
@@ -174,6 +179,7 @@ impl ReplayTrainerConfig {
             optimizer: llm.optimizer,
             device,
             kind,
+            error_feedback_kind: None,
         }
     }
 
@@ -337,7 +343,7 @@ pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
     )
     .context("cannot load the replay model")?;
     model.prepare_for_training();
-    Ok(LocalTrainer::new(
+    let mut trainer: Trainer = LocalTrainer::new(
         ParallelModels {
             models: vec![model],
             barrier: Arc::new(CancellableBarrier::new(1)) as Arc<dyn Barrier>,
@@ -349,7 +355,13 @@ pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
         None,
         false,
     )
-    .into())
+    .into();
+    if let Some(kind) = config.error_feedback_kind {
+        trainer
+            .set_error_feedback_kind(kind)
+            .map_err(|error| anyhow!("cannot keep the error feedback in {kind:?}: {error}"))?;
+    }
+    Ok(trainer)
 }
 
 /// Recomputes the honest result of a piece of work.

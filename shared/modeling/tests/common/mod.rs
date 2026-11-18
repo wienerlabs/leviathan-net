@@ -99,9 +99,14 @@ fn read_genesis_recipe() -> Recipe {
 }
 
 pub fn load(recipe: &Recipe) -> Box<dyn CausalLM> {
+    load_in(recipe, Kind::Float)
+}
+
+/// The model in `kind`, as a node that trains in it loads it.
+pub fn load_in(recipe: &Recipe, kind: Kind) -> Box<dyn CausalLM> {
     let model = auto_model_for_causal_lm_from_pretrained(
         recipe.repo_files.clone(),
-        Some(Kind::Float),
+        Some(kind),
         None,
         Some(Device::Cpu),
         None,
