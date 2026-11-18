@@ -121,7 +121,7 @@ So the simulation is checked against real clients, byte for byte. `scripts/error
 
 It requires at least two epochs, so that the closing rounds and an epoch's start are covered.
 
-**Result.** On five independent runs (release and debug builds, fresh identities, different shuffles of the data between nodes), all 70 payloads of 35 training rounds over 3 epochs matched byte for byte.
+**Result.** On six independent runs (release and debug builds, fresh identities, different shuffles of the data between nodes), all 70 payloads of 35 training rounds over 3 epochs matched byte for byte.
 
 **What it covers.** It covers the logic the measurement shares with the client:
 - the round order;

@@ -56,14 +56,16 @@ until grep -aq "Server listening on" "$WORK/server.log"; do
     sleep 1
 done
 
-# A client stops with an error once the run is finished (wienerlabs/leviathan-net#82),
-# so how it exited says nothing; what counts is that it saw the run through to
-# the end. The console log colours its fields, so the escapes go first.
+# A client returns once its run is finished and its last checkpoint is done
+# (wienerlabs/leviathan-net#82). It has to have seen the run through to the end
+# and returned cleanly. The console log colours its fields, so the escapes go
+# first.
 finished() {
     tr -d '\033' < "$WORK/client$1.log" | grep -aq 'new_state[^ ]*Finished'
 }
 
 CLIENTS=()
+RETURNED=()
 for node in 0 1; do
     # A fresh identity per client: the run admits each by its own key.
     RAW_IDENTITY_SECRET_KEY=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n') \
@@ -84,9 +86,14 @@ while true; do
     for node in 0 1; do
         if kill -0 "${CLIENTS[$node]}" 2>/dev/null; then
             running=$((running + 1))
-        elif ! finished "$node"; then
-            echo "[fidelity] client $node stopped before the run finished; logs in $WORK" >&2
-            exit 1
+        elif [[ -z "${RETURNED[$node]:-}" ]]; then
+            status=0
+            wait "${CLIENTS[$node]}" || status=$?
+            if ((status != 0)) || ! finished "$node"; then
+                echo "[fidelity] client $node stopped with status $status before it saw the run finish; logs in $WORK" >&2
+                exit 1
+            fi
+            RETURNED[$node]=1
         fi
     done
     if ((running == 0)); then
