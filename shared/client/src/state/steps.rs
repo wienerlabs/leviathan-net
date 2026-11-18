@@ -26,7 +26,7 @@ use tracing::{Instrument, debug, error, info, trace, trace_span, warn};
 use super::{
     FinishedBroadcast, RunInitConfigAndIO,
     cooldown::{CooldownError, CooldownStep, CooldownStepMetadata},
-    evals::EvalError,
+    evals::{EvalError, MaybeRunningEvals, RunningEvals},
     init::InitRunError,
     round_state::RoundState,
     stats::StatsLogger,
@@ -754,75 +754,59 @@ impl StepStateMachine {
     }
 
     async fn apply_state(&mut self, state: Coordinator) -> Result<(), StepError> {
-        let client_index = match state
+        let Some(client_index) = state
             .epoch_state
             .clients
             .iter()
             .position(|x| x.id == self.identity)
-        {
-            Some(index) => index as u64,
-            None => {
-                trace!(
-                    "saw new step, but we're not one of the clients. our id: {}, all clients: {:?}",
-                    self.identity,
-                    &state
-                        .epoch_state
-                        .clients
-                        .iter()
-                        .map(|c| c.id)
-                        .collect::<Vec<_>>()
-                );
-
-                let new_step = match std::mem::take(&mut self.active_step) {
-                    ActiveStep::Intermediate => {
-                        unreachable!("can never be in intermediate state.")
-                    }
-                    ActiveStep::Warmup(warmup) => ActiveStep::Warmup(warmup),
-                    ActiveStep::Cooldown(cooldown) => {
-                        trace!(
-                            "since we're not a member of this step, killing cooldown step and returning to warmup to wait."
-                        );
-                        let (trainers, upload_handle) = cooldown.finish().await?;
-                        if let Some(handle) = upload_handle {
-                            self.pending_upload_handles.push(handle);
-                        }
-                        ActiveStep::Warmup(self.warmup.start(
-                            trainers,
-                            &mut self.previous_round,
-                            &mut self.current_round,
-                        ))
-                    }
-                    ActiveStep::Training(training) => {
-                        trace!(
-                            "since we're not a member of this step, killing training step and returning to warmup to wait."
-                        );
-                        ActiveStep::Warmup(self.warmup.start(
-                            training.finish().await?.evals_or_trainers,
-                            &mut self.previous_round,
-                            &mut self.current_round,
-                        ))
-                    }
-                    ActiveStep::Witness(witness) => {
-                        trace!(
-                            "since we're not a member of this step, killing witness step and returning to warmup to wait."
-                        );
-                        ActiveStep::Warmup(self.warmup.start(
-                            witness.finish().await?,
-                            &mut self.previous_round,
-                            &mut self.current_round,
-                        ))
-                    }
-                    ActiveStep::Finished => ActiveStep::Finished,
-                };
-                self.active_step = new_step;
-
-                return Ok(());
-            }
+            .map(|index| index as u64)
+        else {
+            trace!(
+                "saw new step, but we're not one of the clients. our id: {}, all clients: {:?}",
+                self.identity,
+                &state
+                    .epoch_state
+                    .clients
+                    .iter()
+                    .map(|c| c.id)
+                    .collect::<Vec<_>>()
+            );
+            let step = std::mem::take(&mut self.active_step);
+            self.active_step = match transition(step.kind(), state.run_state, false) {
+                Transition::Stay => step,
+                // Off the roster, whatever this epoch's step was is left for a
+                // warmup, to wait for an epoch the client is in.
+                Transition::Rewarm => {
+                    trace!(
+                        "since we're not a member of this step, killing the {step} step and returning to warmup to wait."
+                    );
+                    self.rewarm(step).await?
+                }
+                // A client dropped from the run, by a health check or for
+                // being too slow, still sees the run finish, and stops then
+                // instead of waiting for an epoch that will never come
+                // (wienerlabs/leviathan-net#84).
+                Transition::Finish => self.finish_run(step).await?,
+                // Never reached: off the roster a client only waits or stops.
+                // The step is put back, so the machine stays whole.
+                other => {
+                    let step_error = StepError::Desync {
+                        active_step: format!("{step} off the roster ({other:?})"),
+                        run_state: state.run_state,
+                    };
+                    self.active_step = step;
+                    return Err(step_error);
+                }
+            };
+            return Ok(());
         };
 
-        let new_step: ActiveStep = match (std::mem::take(&mut self.active_step), state.run_state) {
+        let step = std::mem::take(&mut self.active_step);
+        let next = transition(step.kind(), state.run_state, true);
+        let new_step: ActiveStep = match (step, next) {
+            (step, Transition::Stay) => step,
             // start training at the beginning of an epoch
-            (ActiveStep::Warmup(warmup), RunState::RoundTrain) => {
+            (ActiveStep::Warmup(warmup), Transition::Train) => {
                 let trainers = warmup.finish().stop_evals().await?;
                 self.step_finish_time = None;
                 self.sent_warmup_finished = false;
@@ -841,7 +825,7 @@ impl StepStateMachine {
             }
 
             // start witnessing after training is done
-            (ActiveStep::Training(training), RunState::RoundWitness) => {
+            (ActiveStep::Training(training), Transition::Witness) => {
                 let FinishedTrainers {
                     evals_or_trainers,
                     round_losses,
@@ -885,7 +869,7 @@ impl StepStateMachine {
                 )?)
             }
             // within an epoch, loop back to training after witnessing
-            (ActiveStep::Witness(witnessing), RunState::RoundTrain) => {
+            (ActiveStep::Witness(witnessing), Transition::Train) => {
                 let trainers = witnessing.finish().await?.stop_evals().await?;
                 ActiveStep::Training(self.training.start(
                     client_index,
@@ -897,56 +881,34 @@ impl StepStateMachine {
             }
 
             // the epoch ended & we're transitioning to cooldown
-            (ActiveStep::Witness(witnessing), RunState::Cooldown) => {
+            (ActiveStep::Witness(witnessing), Transition::Cooldown) => {
                 let trainers = witnessing.finish().await?.stop_evals().await?;
                 // check here
                 self.cleanup_completed_uploads();
 
                 ActiveStep::Cooldown(self.cooldown.start(trainers, &state)?)
             }
-            // the run is over: its last cooldown checkpoints the model, and
-            // the client stops once that is done (wienerlabs/leviathan-net#82)
-            (ActiveStep::Cooldown(cooldown), RunState::Finished) => {
-                let (evals, upload_handle) = cooldown.finish().await?;
-                if let Some(handle) = upload_handle {
-                    self.pending_upload_handles.push(handle);
-                }
-                evals.stop_evals().await?;
-                // Its upload stays held, finished or not, so the shutdown
-                // reads its outcome rather than dropping it unread.
-                ActiveStep::Finished
-            }
-            // a run paused at its end, and resumed, is over: its last cooldown
-            // already finished on the way into the pause
-            (ActiveStep::Warmup(warmup), RunState::Finished) => {
-                warmup.finish().stop_evals().await?;
-                ActiveStep::Finished
-            }
-            // cooldown is done, we consider waiting for members and warmup to be basically the same
-            (ActiveStep::Cooldown(cooldown), RunState::WaitingForMembers)
-            | (ActiveStep::Cooldown(cooldown), RunState::Warmup)
-            | (ActiveStep::Cooldown(cooldown), RunState::Paused) => {
-                let (trainers, upload_handle) = cooldown.finish().await?;
-                if let Some(handle) = upload_handle {
-                    self.pending_upload_handles.push(handle);
-                }
-                ActiveStep::Warmup(self.warmup.start(
-                    trainers,
-                    &mut self.previous_round,
-                    &mut self.current_round,
-                ))
-            }
-            // stay in existing run state if there's no reason to change.
-            (current_step, next_run_state) if current_step.allowed_in_run_state(next_run_state) => {
-                current_step
-            }
-            // but if it's not allowed in this run state, we've desynced.
-            (current_step, next_run_state) => {
+            // The epoch is over and the next one has not started: from the
+            // cooldown, or, for a client that missed the cooldown because it
+            // was slow or its updates were coalesced, from a round. Waiting
+            // for members and warmup are basically the same.
+            (step, Transition::Rewarm) => self.rewarm(step).await?,
+            // The run is over. From its last cooldown, which checkpoints the
+            // model, the client stops once that is done
+            // (wienerlabs/leviathan-net#82). From a warmup, the run was paused
+            // at its end and resumed. From a round, the client missed the last
+            // cooldown, being slow or its updates coalesced, and stops instead
+            // of failing on a desync (wienerlabs/leviathan-net#84).
+            (step, Transition::Finish) => self.finish_run(step).await?,
+            // if the step is not allowed in this run state, we've desynced.
+            // The step is put back, so the machine stays whole.
+            (current_step, _) => {
                 let step_error = StepError::Desync {
                     active_step: current_step.to_string(),
-                    run_state: next_run_state,
+                    run_state: state.run_state,
                 };
                 debug!("DESYNC: {step_error}");
+                self.active_step = current_step;
                 return Err(step_error);
             }
         };
@@ -968,6 +930,55 @@ impl StepStateMachine {
         self.pending_upload_handles
             .retain(|handle| !handle.is_finished());
     }
+
+    /// Leaves `step` for a warmup, to wait for the next epoch. Its trainers,
+    /// or the evals running on them, go on to the warmup, and an upload its
+    /// cooldown started is kept for the shutdown to read.
+    async fn rewarm(&mut self, step: ActiveStep) -> Result<ActiveStep, StepError> {
+        let evals_or_trainers: MaybeRunningEvals = match step {
+            ActiveStep::Intermediate => {
+                unreachable!("can never be in intermediate state.")
+            }
+            ActiveStep::Warmup(warmup) => return Ok(ActiveStep::Warmup(warmup)),
+            ActiveStep::Finished => return Ok(ActiveStep::Finished),
+            ActiveStep::Training(training) => training.finish().await?.evals_or_trainers,
+            ActiveStep::Witness(witness) => witness.finish().await?.into(),
+            ActiveStep::Cooldown(cooldown) => self.finish_cooldown(cooldown).await?.into(),
+        };
+        Ok(ActiveStep::Warmup(self.warmup.start(
+            evals_or_trainers,
+            &mut self.previous_round,
+            &mut self.current_round,
+        )))
+    }
+
+    /// Leaves `step` because the run is over: its evals stop, and an upload
+    /// its cooldown started stays held, finished or not, so the shutdown reads
+    /// its outcome rather than dropping it unread.
+    async fn finish_run(&mut self, step: ActiveStep) -> Result<ActiveStep, StepError> {
+        let evals: MaybeRunningEvals = match step {
+            ActiveStep::Intermediate => {
+                unreachable!("can never be in intermediate state.")
+            }
+            ActiveStep::Finished => return Ok(ActiveStep::Finished),
+            ActiveStep::Warmup(warmup) => warmup.finish().into(),
+            ActiveStep::Training(training) => training.finish().await?.evals_or_trainers,
+            ActiveStep::Witness(witness) => witness.finish().await?.into(),
+            ActiveStep::Cooldown(cooldown) => self.finish_cooldown(cooldown).await?.into(),
+        };
+        evals.stop_evals().await?;
+        Ok(ActiveStep::Finished)
+    }
+
+    /// Waits for `cooldown` to finish, keeps the upload it started, and
+    /// returns its evals.
+    async fn finish_cooldown(&mut self, cooldown: CooldownStep) -> Result<RunningEvals, StepError> {
+        let (evals, upload_handle) = cooldown.finish().await?;
+        if let Some(handle) = upload_handle {
+            self.pending_upload_handles.push(handle);
+        }
+        Ok(evals)
+    }
 }
 
 #[derive(Default, Debug)]
@@ -984,21 +995,97 @@ enum ActiveStep {
 }
 
 impl ActiveStep {
-    pub fn allowed_in_run_state(&self, run_state: RunState) -> bool {
-        match (self, run_state) {
-            (ActiveStep::Intermediate, _) => {
+    fn kind(&self) -> StepKind {
+        match self {
+            ActiveStep::Intermediate => {
                 unreachable!("the intermediate run state can never be seen, it's ephemeral")
             }
-            (
-                ActiveStep::Warmup(..),
-                RunState::Warmup | RunState::WaitingForMembers | RunState::Paused,
-            ) => true,
-            (ActiveStep::Cooldown(..), RunState::Cooldown) => true,
-            (ActiveStep::Training(..), RunState::RoundTrain) => true,
-            (ActiveStep::Witness(..), RunState::RoundWitness) => true,
-            (ActiveStep::Finished, RunState::Finished) => true,
-            _ => false,
+            ActiveStep::Warmup(..) => StepKind::Warmup,
+            ActiveStep::Training(..) => StepKind::Training,
+            ActiveStep::Witness(..) => StepKind::Witness,
+            ActiveStep::Cooldown(..) => StepKind::Cooldown,
+            ActiveStep::Finished => StepKind::Finished,
         }
+    }
+}
+
+/// Which step a client is in, without what the step holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepKind {
+    Warmup,
+    Training,
+    Witness,
+    Cooldown,
+    Finished,
+}
+
+impl StepKind {
+    /// Whether a client may stay in this step while the run is in
+    /// `run_state`.
+    fn allowed_in_run_state(self, run_state: RunState) -> bool {
+        matches!(
+            (self, run_state),
+            (
+                StepKind::Warmup,
+                RunState::Warmup | RunState::WaitingForMembers | RunState::Paused
+            ) | (StepKind::Cooldown, RunState::Cooldown)
+                | (StepKind::Training, RunState::RoundTrain)
+                | (StepKind::Witness, RunState::RoundWitness)
+                | (StepKind::Finished, RunState::Finished)
+        )
+    }
+}
+
+/// What a client does with its step when it sees the run in a new state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transition {
+    /// Keep the step.
+    Stay,
+    /// Train the round: from the warmup, or after witnessing the last one.
+    Train,
+    /// Witness the round it trained.
+    Witness,
+    /// Cool down the epoch it witnessed the last round of.
+    Cooldown,
+    /// Leave the step for a warmup, to wait for the next epoch.
+    Rewarm,
+    /// Leave the step and stop: the run is over.
+    Finish,
+    /// The step cannot be in this run state.
+    Desync,
+}
+
+/// What a client in `step` does when it sees the run in `run_state`, given
+/// whether it is on the roster of the run's epoch.
+///
+/// A finished run stops every client, on the roster or off it, whatever step
+/// it is in. One dropped from the run, by a health check or for being too
+/// slow, used to wait in warmup for an epoch that would never come, and a
+/// member that missed the last cooldown failed on a desync
+/// (wienerlabs/leviathan-net#84). Off the roster, a client only ever waits in
+/// warmup or stops. On it, a client that missed the end of an epoch, because
+/// it was slow or its updates were coalesced, goes back to warmup as from the
+/// cooldown.
+fn transition(step: StepKind, run_state: RunState, on_roster: bool) -> Transition {
+    match (step, run_state, on_roster) {
+        (StepKind::Finished, RunState::Finished, _) | (StepKind::Finished, _, false) => {
+            Transition::Stay
+        }
+        (StepKind::Finished, _, true) => Transition::Desync,
+        (_, RunState::Finished, _) => Transition::Finish,
+        (StepKind::Warmup, _, false) => Transition::Stay,
+        (_, _, false) => Transition::Rewarm,
+        (StepKind::Warmup, RunState::RoundTrain, true) => Transition::Train,
+        (StepKind::Training, RunState::RoundWitness, true) => Transition::Witness,
+        (StepKind::Witness, RunState::RoundTrain, true) => Transition::Train,
+        (StepKind::Witness, RunState::Cooldown, true) => Transition::Cooldown,
+        (
+            StepKind::Training | StepKind::Witness | StepKind::Cooldown,
+            RunState::WaitingForMembers | RunState::Warmup | RunState::Paused,
+            true,
+        ) => Transition::Rewarm,
+        (step, run_state, true) if step.allowed_in_run_state(run_state) => Transition::Stay,
+        (_, _, true) => Transition::Desync,
     }
 }
 
@@ -1297,6 +1384,202 @@ impl From<&RunManager> for ClientTUIState {
                 }
             }
             _ => Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    const STEPS: [StepKind; 5] = [
+        StepKind::Warmup,
+        StepKind::Training,
+        StepKind::Witness,
+        StepKind::Cooldown,
+        StepKind::Finished,
+    ];
+
+    const RUN_STATES: [RunState; 8] = [
+        RunState::Uninitialized,
+        RunState::WaitingForMembers,
+        RunState::Warmup,
+        RunState::RoundTrain,
+        RunState::RoundWitness,
+        RunState::Cooldown,
+        RunState::Finished,
+        RunState::Paused,
+    ];
+
+    /// What the step machine did before wienerlabs/leviathan-net#84, written
+    /// out from its old `match`.
+    fn before_84(step: StepKind, run_state: RunState, on_roster: bool) -> Transition {
+        if !on_roster {
+            return match step {
+                StepKind::Warmup | StepKind::Finished => Transition::Stay,
+                StepKind::Training | StepKind::Witness | StepKind::Cooldown => Transition::Rewarm,
+            };
+        }
+        match (step, run_state) {
+            (StepKind::Warmup, RunState::RoundTrain) => Transition::Train,
+            (StepKind::Training, RunState::RoundWitness) => Transition::Witness,
+            (StepKind::Witness, RunState::RoundTrain) => Transition::Train,
+            (StepKind::Witness, RunState::Cooldown) => Transition::Cooldown,
+            (StepKind::Cooldown | StepKind::Warmup, RunState::Finished) => Transition::Finish,
+            (
+                StepKind::Cooldown,
+                RunState::WaitingForMembers | RunState::Warmup | RunState::Paused,
+            ) => Transition::Rewarm,
+            (step, run_state) if step.allowed_in_run_state(run_state) => Transition::Stay,
+            _ => Transition::Desync,
+        }
+    }
+
+    /// The transitions #84 changes, and what they are now.
+    fn changed_by_84(step: StepKind, run_state: RunState, on_roster: bool) -> Option<Transition> {
+        match (step, run_state, on_roster) {
+            // Off the roster, a finished run stops the client.
+            (
+                StepKind::Warmup | StepKind::Training | StepKind::Witness | StepKind::Cooldown,
+                RunState::Finished,
+                false,
+            ) => Some(Transition::Finish),
+            // A member that missed the last cooldown stops.
+            (StepKind::Training | StepKind::Witness, RunState::Finished, true) => {
+                Some(Transition::Finish)
+            }
+            // A member that missed the end of an epoch waits for the next.
+            (
+                StepKind::Training | StepKind::Witness,
+                RunState::WaitingForMembers | RunState::Warmup | RunState::Paused,
+                true,
+            ) => Some(Transition::Rewarm),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn only_the_transitions_84_names_change() {
+        let mut changed = 0;
+        for step in STEPS {
+            for run_state in RUN_STATES {
+                for on_roster in [false, true] {
+                    let now = transition(step, run_state, on_roster);
+                    match changed_by_84(step, run_state, on_roster) {
+                        Some(expected) => {
+                            changed += 1;
+                            assert_ne!(
+                                before_84(step, run_state, on_roster),
+                                expected,
+                                "{step:?} {run_state:?} on roster {on_roster}"
+                            );
+                            assert_eq!(
+                                now, expected,
+                                "{step:?} {run_state:?} on roster {on_roster}"
+                            );
+                        }
+                        None => assert_eq!(
+                            now,
+                            before_84(step, run_state, on_roster),
+                            "{step:?} {run_state:?} on roster {on_roster}"
+                        ),
+                    }
+                }
+            }
+        }
+        // 4 off the roster, 2 members finishing, 6 members rewarming.
+        assert_eq!(changed, 12);
+    }
+
+    #[test]
+    fn a_client_dropped_from_the_run_stops_when_it_finishes() {
+        // Dropped mid-epoch, it was sent back to warmup to wait.
+        for step in [StepKind::Training, StepKind::Witness, StepKind::Cooldown] {
+            assert_eq!(
+                transition(step, RunState::RoundTrain, false),
+                Transition::Rewarm
+            );
+        }
+        // It waits there while the run goes on without it.
+        for run_state in RUN_STATES.into_iter().filter(|s| *s != RunState::Finished) {
+            assert_eq!(
+                transition(StepKind::Warmup, run_state, false),
+                Transition::Stay,
+                "{run_state:?}"
+            );
+        }
+        // And stops once the run is over, whatever step it is in by then.
+        for step in [
+            StepKind::Warmup,
+            StepKind::Training,
+            StepKind::Witness,
+            StepKind::Cooldown,
+        ] {
+            assert_eq!(
+                transition(step, RunState::Finished, false),
+                Transition::Finish,
+                "{step:?}"
+            );
+        }
+        assert_eq!(
+            transition(StepKind::Finished, RunState::Finished, false),
+            Transition::Stay
+        );
+    }
+
+    #[test]
+    fn off_the_roster_a_client_only_waits_or_stops() {
+        for step in STEPS {
+            for run_state in RUN_STATES {
+                assert!(
+                    matches!(
+                        transition(step, run_state, false),
+                        Transition::Stay | Transition::Rewarm | Transition::Finish
+                    ),
+                    "{step:?} {run_state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_member_that_missed_the_end_of_an_epoch_does_not_desync() {
+        for step in [StepKind::Training, StepKind::Witness] {
+            assert_eq!(
+                transition(step, RunState::Finished, true),
+                Transition::Finish,
+                "{step:?}"
+            );
+            for run_state in [
+                RunState::WaitingForMembers,
+                RunState::Warmup,
+                RunState::Paused,
+            ] {
+                assert_eq!(
+                    transition(step, run_state, true),
+                    Transition::Rewarm,
+                    "{step:?} {run_state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_member_still_desyncs_where_it_cannot_be() {
+        for (step, run_state) in [
+            (StepKind::Warmup, RunState::RoundWitness),
+            (StepKind::Warmup, RunState::Cooldown),
+            (StepKind::Training, RunState::Cooldown),
+            (StepKind::Witness, RunState::Uninitialized),
+            (StepKind::Cooldown, RunState::RoundTrain),
+            (StepKind::Cooldown, RunState::RoundWitness),
+            (StepKind::Finished, RunState::RoundTrain),
+        ] {
+            assert_eq!(
+                transition(step, run_state, true),
+                Transition::Desync,
+                "{step:?} {run_state:?}"
+            );
         }
     }
 }

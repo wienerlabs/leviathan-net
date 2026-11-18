@@ -153,6 +153,23 @@ impl App {
     pub fn get_coordinator(&self) -> Coordinator {
         self.coordinator
     }
+
+    /// Takes `id` off the roster of the epoch under way, as a health check
+    /// that drops it does: it leaves at the end of the round. Unlike a
+    /// disconnect, the client stays connected, and is sent the run's state
+    /// like every connected client (wienerlabs/leviathan-net#84).
+    pub fn withdraw_client(&mut self, id: &NodeIdentity) -> Result<()> {
+        let index = self
+            .coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|client| client.id == *id)
+            .ok_or_else(|| anyhow!("{id} is not on the roster"))?;
+        self.coordinator
+            .withdraw(index as u64)
+            .map_err(|err| anyhow!("Coordinator withdraw error: {err}"))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]

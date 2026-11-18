@@ -854,6 +854,49 @@ async fn a_client_that_joins_too_late_stops_cleanly_when_the_run_finishes() {
     assert_clients_stop_cleanly(client_handles).await;
 }
 
+/// A client dropped from the run, here on purpose rather than by a health
+/// check that a slow client may or may not trip, waits in warmup while the run
+/// goes on without it. The server keeps sending it the run's state, as it does
+/// every connected client, and once the run is over the dropped client stops
+/// cleanly too, instead of waiting for an epoch that will never come
+/// (wienerlabs/leviathan-net#84).
+///
+/// The run goes on with a single client, so that it finishes whoever else
+/// leaves: a client dropped mid-round leaves its batch untrained, and the
+/// health checks that follow may drop another. Every client that leaves this
+/// way has to stop cleanly as well.
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn a_client_dropped_from_the_run_stops_cleanly_when_the_run_finishes() {
+    let clients: u16 = 3;
+    let server_handle =
+        CoordinatorServerHandle::new_with_min_clients(clients, 1, clients, 1, LAST_STEP).await;
+    let client_handles = spawn_clients(
+        clients as usize,
+        server_handle.server_port,
+        &server_handle.run_id,
+    )
+    .await;
+
+    assert_with_retries(|| server_handle.get_run_state(), RunState::RoundTrain).await;
+    let roster = server_handle.get_clients().await;
+    assert_eq!(roster.len(), clients as usize);
+    let dropped = roster.iter().last().expect("the roster has clients").id;
+    server_handle.withdraw_client(dropped).await.unwrap();
+
+    assert_with_retries(|| server_handle.get_run_state(), RunState::Finished).await;
+    let coordinator = server_handle.get_coordinator().await;
+    assert_eq!(coordinator.progress.step, LAST_STEP);
+    assert!(
+        !coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .any(|client| client.id == dropped),
+        "the dropped client was still on the roster when the run finished"
+    );
+    assert_clients_stop_cleanly(client_handles).await;
+}
+
 /// The run's last cooldown checkpoints the model a finished run publishes.
 /// Each client finishes writing that checkpoint before it returns, rather than
 /// stopping with it still in flight (wienerlabs/leviathan-net#82).

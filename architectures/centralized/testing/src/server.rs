@@ -57,6 +57,10 @@ enum TestingQueryMsg {
     TogglePause {
         respond_to: oneshot::Sender<()>,
     },
+    WithdrawClient {
+        id: NodeIdentity,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 struct CoordinatorServer {
@@ -69,6 +73,7 @@ struct CoordinatorServer {
 impl CoordinatorServer {
     pub async fn new(
         query_chan_receiver: Receiver<TestingQueryMsg>,
+        init_min_clients: u16,
         min_clients: u16,
         global_batch_size: u16,
         witness_nodes: u16,
@@ -80,7 +85,7 @@ impl CoordinatorServer {
             max_round_train_time: MAX_ROUND_TRAIN_TIME,
             round_witness_time: ROUND_WITNESS_TIME,
             min_clients,
-            init_min_clients: min_clients,
+            init_min_clients,
             global_batch_size_start: global_batch_size,
             global_batch_size_end: global_batch_size,
             global_batch_size_warmup_tokens: 0,
@@ -177,6 +182,13 @@ impl CoordinatorServer {
                 self.inner.toggle_pause();
                 respond_to.send(()).unwrap();
             }
+            TestingQueryMsg::WithdrawClient { id, respond_to } => {
+                let withdrawn = self
+                    .inner
+                    .withdraw_client(&id)
+                    .map_err(|err| format!("{err:#}"));
+                respond_to.send(withdrawn).unwrap();
+            }
         }
     }
 
@@ -212,6 +224,26 @@ impl CoordinatorServerHandle {
         witness_nodes: u16,
         total_steps: u32,
     ) -> Self {
+        Self::new_with_min_clients(
+            init_min_clients,
+            init_min_clients,
+            global_batch_size,
+            witness_nodes,
+            total_steps,
+        )
+        .await
+    }
+
+    /// A server whose run starts once `init_min_clients` have joined, goes on
+    /// while it has `min_clients`, and ends once its step reaches
+    /// `total_steps`.
+    pub async fn new_with_min_clients(
+        init_min_clients: u16,
+        min_clients: u16,
+        global_batch_size: u16,
+        witness_nodes: u16,
+        total_steps: u32,
+    ) -> Self {
         debug!("creating coordinator server...");
         let (query_chan_sender, query_chan_receiver) = mpsc::channel(64);
 
@@ -227,6 +259,7 @@ impl CoordinatorServerHandle {
             .spawn(CoordinatorServer::new(
                 query_chan_receiver,
                 init_min_clients,
+                min_clients,
                 global_batch_size,
                 witness_nodes,
                 total_steps,
@@ -336,6 +369,18 @@ impl CoordinatorServerHandle {
     pub async fn toggle_pause(&self) {
         let (send, recv) = oneshot::channel::<()>();
         let msg = TestingQueryMsg::TogglePause { respond_to: send };
+        let _ = self.query_chan_sender.send(msg).await;
+        recv.await.expect("Coordinator actor task has been killed")
+    }
+
+    /// Takes `id` off the roster on purpose, as a health check that drops it
+    /// does. The client stays connected (wienerlabs/leviathan-net#84).
+    pub async fn withdraw_client(&self, id: NodeIdentity) -> Result<(), String> {
+        let (send, recv) = oneshot::channel();
+        let msg = TestingQueryMsg::WithdrawClient {
+            id,
+            respond_to: send,
+        };
         let _ = self.query_chan_sender.send(msg).await;
         recv.await.expect("Coordinator actor task has been killed")
     }
