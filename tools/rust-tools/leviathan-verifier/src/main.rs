@@ -12,6 +12,8 @@ use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::payload_band;
+use leviathan_verifier::sends_signs;
+use leviathan_verifier::PayloadBand;
 use leviathan_verifier::replay_epoch;
 use leviathan_verifier::DumpKey;
 use leviathan_verifier::read_run_model;
@@ -122,6 +124,19 @@ async fn main() -> Result<()> {
                 .first_step
                 .unwrap_or(CoordinatorProgress::default().step);
             let llm = read_run_model(run_config)?;
+            // A run that sends 1-bit signs is judged on its churn and flips,
+            // one that sends values on its distance (wienerlabs/leviathan-net#49).
+            match (sends_signs(&llm.optimizer), band) {
+                (true, PayloadBand::Distance(_)) => eprintln!(
+                    "[verifier] warning: the run sends 1-bit signs, and a band on their distance either convicts honest replays from other hardware or lets a cheater turn over a large share of its signs: judge it with --churn-band and --flip-band (docs/BAND_CALIBRATION.md)"
+                ),
+                (false, PayloadBand::Signs(_)) => {
+                    return Err(anyhow!(
+                        "the run sends values, not 1-bit signs, and a band on the signs cannot see their magnitudes: pass --band"
+                    ))
+                }
+                _ => {}
+            }
             let config = ReplayTrainerConfig::for_run(
                 &llm,
                 checkpoint_repo_files(&published_checkpoint(&llm)?)?,

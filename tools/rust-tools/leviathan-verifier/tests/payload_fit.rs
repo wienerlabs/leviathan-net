@@ -489,3 +489,41 @@ fn a_sign_band_that_is_not_one_is_the_verifiers_problem() {
     )
     .is_err());
 }
+
+/// The honest payload with one row naming a coordinate twice. Decompressed on
+/// its own it reads as the mean of the two; decompressed with its peers', as
+/// every node does, it counts twice.
+fn repeated_index() -> Vec<SerializedDistroResult> {
+    let mut results = honest_results();
+    let target = results
+        .iter()
+        .position(|r| {
+            let r = DistroResult::try_from(r).unwrap();
+            r.totalk < 256 && *r.sparse_idx.size().last().unwrap() > 1
+        })
+        .expect("a result with 8-bit indices, more than one a row");
+    let mut result = DistroResult::try_from(&results[target]).unwrap();
+    let k = *result.sparse_idx.size().last().unwrap();
+    let rows = result.sparse_idx.reshape([-1, k]).copy();
+    let first = rows.get(0).get(0).int64_value(&[]);
+    let _ = rows.get(0).get(1).fill_(first);
+    result.sparse_idx = rows.reshape(result.sparse_idx.size());
+    results[target] = SerializedDistroResult::try_from(&result).unwrap();
+    results
+}
+
+#[test]
+fn a_payload_naming_a_coordinate_twice_is_unfit_under_either_band() {
+    let path = dump("repeated-index", &repeated_index());
+    for band in [PayloadBand::Distance(DEFAULT_BAND), signs(1.0, 1.0)] {
+        let judged = judge_payload(&path, &one_bit_reference(), band, Device::Cpu).unwrap();
+        assert!(
+            judged
+                .unfit
+                .as_deref()
+                .is_some_and(|reason| reason.contains("more than once")),
+            "{band}: {judged:?}"
+        );
+        assert!(judged.verdict.fraud, "{band}");
+    }
+}

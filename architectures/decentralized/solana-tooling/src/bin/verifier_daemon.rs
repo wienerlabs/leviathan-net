@@ -17,9 +17,7 @@ use leviathan_verifier::index_dir;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::parse_dtype;
 use leviathan_verifier::payload_band;
-use leviathan_verifier::sends_signs;
 use leviathan_verifier::DumpKey;
-use leviathan_verifier::PayloadBand;
 use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::ReplayAssignment;
@@ -88,9 +86,10 @@ struct Args {
     churn_band: Option<f32>,
     #[arg(long)]
     flip_band: Option<f32>,
-    /// The dtype this daemon replays in. The network trains in bf16; a replay
-    /// in bf16 churns less against it, but runs far slower on a CPU, and its
-    /// band has to be calibrated for it (`docs/BAND_CALIBRATION.md`).
+    /// The dtype this daemon replays in. The network trains in bf16. A replay
+    /// in bf16 may churn less against it, which the measurements so far hint
+    /// at without settling, but it runs far slower on a CPU. Its band has to
+    /// be calibrated for it (`docs/BAND_CALIBRATION.md`).
     #[arg(long, default_value = "fp32")]
     replay_dtype: String,
     #[arg(long, default_value_t = 8)]
@@ -187,7 +186,7 @@ impl Replayer {
                 checkpoint_repo_files(&checkpoint)?,
                 tch::Device::Cpu,
                 // fp32 unless the operator chose otherwise. The network trains
-                // in BFloat16. A bf16 replay churns less against it, but is
+                // in BFloat16. A bf16 replay may churn less against it, but is
                 // emulated on a CPU and far slower, and moving the dtype moves
                 // what counts as a forgery, so the band has to be calibrated
                 // for the dtype chosen (wienerlabs/leviathan-net#49).
@@ -350,38 +349,6 @@ async fn main() -> Result<()> {
         ),
         None => ToolboxEndpoint::new_devnet().await,
     };
-
-    // A run that sends 1-bit signs is judged on its churn and flips. A band
-    // on their distance either convicts honest replays from other hardware or
-    // lets a cheater turn over a large share of its signs. A band on the
-    // signs cannot see magnitudes, so a run that sends values is judged on
-    // its distance (wienerlabs/leviathan-net#49). A daemon that only watches
-    // may hold either to either.
-    if !args.dry_run {
-        let state =
-            get_coordinator_account_state(&mut endpoint, &coordinator_account)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "coordinator account {} not found",
-                        coordinator_account
-                    )
-                })?;
-        let Model::LLM(llm) = state.coordinator.model;
-        match (sends_signs(&llm.optimizer), band) {
-            (true, PayloadBand::Distance(_)) => {
-                return Err(anyhow!(
-                    "the run sends 1-bit signs: pass --churn-band and --flip-band, calibrated with calibrate-band for this daemon's hardware (docs/BAND_CALIBRATION.md), or watch with --dry-run"
-                ));
-            },
-            (false, PayloadBand::Signs(_)) => {
-                return Err(anyhow!(
-                    "the run sends values, not 1-bit signs, and a band on the signs cannot see their magnitudes: pass --band, or watch with --dry-run"
-                ));
-            },
-            _ => {},
-        }
-    }
 
     let config = AuditConfig {
         run_id: args.run_id.clone(),

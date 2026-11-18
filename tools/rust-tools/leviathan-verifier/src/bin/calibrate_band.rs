@@ -197,6 +197,9 @@ async fn main() -> Result<()> {
     let one_bit = sends_signs(&llm.optimizer);
     let mut drifts = Vec::with_capacity(args.samples);
     let mut sign_drifts: Vec<SignDrift> = Vec::with_capacity(args.samples);
+    // How many coordinates a payload sends, the fewest of any sample: the sign
+    // band is never narrower than one of them.
+    let mut coordinates = u64::MAX;
     for (i, (batch_id, data)) in batches.into_iter().enumerate() {
         let step = (i + 1) as u32;
         let reference = compute_delta(
@@ -220,6 +223,8 @@ async fn main() -> Result<()> {
         let drift = relative_l2_distance(&target, &reference)
             .map_err(|e| anyhow!("distance on sample {i}: {e:?}"))?;
         if one_bit {
+            let sent = reference.iter().filter(|value| **value != 0.0).count();
+            coordinates = coordinates.min(sent as u64);
             let signs = sign_drift(&target, &reference)
                 .map_err(|e| anyhow!("signs on sample {i}: {e:?}"))?;
             eprintln!(
@@ -237,7 +242,7 @@ async fn main() -> Result<()> {
         calibrate_band(&drifts, args.safety_factor).map_err(|e| anyhow!("calibrating: {e:?}"))?;
     let sign_band = match one_bit {
         true => Some(
-            calibrate_sign_band(&sign_drifts, args.safety_factor)
+            calibrate_sign_band(&sign_drifts, args.safety_factor, coordinates)
                 .map_err(|e| anyhow!("calibrating the sign band: {e:?}"))?,
         ),
         false => None,
@@ -277,6 +282,7 @@ async fn main() -> Result<()> {
     if let Some(sign_band) = sign_band {
         let worst =
             |part: fn(&SignDrift) -> f32| sign_drifts.iter().map(part).fold(0.0f32, f32::max);
+        println!("coordinates sent    {coordinates}");
         println!(
             "churn / flips max   {:.6} / {:.6}",
             worst(|d| d.churn),

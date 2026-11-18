@@ -147,10 +147,13 @@ Over 1-bit payloads a replay can differ from what a node sent in two ways:
   sent is one the replay did not send;
 - **flips:** it picks the same coordinate with the other sign.
 
-The relative L2 distance mixes the two:
+Where both send as many coordinates, as two honest top-k's of one model do,
+the relative L2 distance mixes the two:
 `distance² = 2 · churn + 4 · (1 − churn) · flips`, where churn is a share of
-the coordinates the node sent and flips a share of those both sent. So the
-distance is the square root of the share of coordinates in question. A safety
+the coordinates sent and flips a share of those both sent. So the distance is
+the square root of the share of coordinates in question. Churn is counted from
+both sides, the larger of the two shares, so a payload that leaves out honest
+coordinates, or adds its own, churns as much as it left out or added. A safety
 factor of k on a band on the distance multiplies by k² the share of its
 coordinates a cheater may then choose. The same factor on a band on churn and
 flips multiplies that share by k.
@@ -201,12 +204,16 @@ What this shows:
   never flips.** A band on the flips can be held near zero, and with it the
   cheapest cheat over signs, turning them over. It cannot be held at zero,
   because a sign near zero can cross it, as the genesis sample did.
-- **Replaying in the run's dtype narrows the churn.** The bf16 replay's worst
-  churn in 100 rounds was 3.8%, against 8.3% and 11.8% for the fp32 replays.
-  Each is a single run, so the tails are indicative rather than established.
+- **Replaying in the run's dtype may narrow the churn's tail.** This is not
+  established:
+  - The bf16 replay's worst churn in 100 rounds was 3.8%, against 8.3% and
+    11.8% for the fp32 replays.
+  - Over the first 40 rounds, though, every pair stays under 3.9%.
+  - The fp32 replays' worst rounds are a handful of spikes in single runs.
+  - The bf16 replay is also on another device.
 - **A verifier of the nodes' own class replays exactly**, within one process.
-  Whether another machine of the same GPU class does is #89's to measure. Where
-  it does, both bands can be 0.
+  Whether another machine of the same GPU class does is #89's to measure. Only
+  where it is shown to may a band be as tight as the calibration allows.
 
 **What the verifier does now:**
 - **1-bit runs.** `leviathan-verifier` and the verifier daemon take
@@ -216,22 +223,40 @@ What this shows:
   and fraud. The daemon tests' `fraud` fixture is such a payload: it moves no
   sign and no coordinate, only magnitudes. Nodes still apply such payloads
   (wienerlabs/leviathan-net#95).
-- **The daemon refuses a mismatched band** unless it only watches
-  (`--dry-run`): a band on the distance for a run that sends 1-bit signs, and a
-  band on the signs for one that sends values.
+- **A coordinate named twice in a row is refused**, by nodes and verifiers
+  alike. A verifier reading the payload on its own sees the mean of the two,
+  while every node, decompressing it with its peers', counts it twice. One
+  payload could otherwise pass the verifier while voting twice.
+- **The daemon judges no payload under a mismatched band** unless it only
+  watches (`--dry-run`):
+  - a band on the distance for a run that sends 1-bit signs, or a band on the
+    signs for one that sends values;
+  - it reads the run's optimizer every pass, so it also catches a run
+    configured after it started;
+  - it says so in its log, and counts the payloads as ones it cannot judge yet
+    (`leviathan_verifier_contributions_unreplayable_total`).
+  - The CLI warns about a band on the distance for a 1-bit run, and refuses a
+    band on the signs for one that sends values.
 - **`--replay-dtype`** chooses the daemon's replay dtype, fp32 by default. A
-  bf16 replay churns less, but is emulated on a CPU and runs several times
-  slower (`measure-error-feedback` took about 45 s a round with a CPU bf16
+  bf16 replay may churn less (see above), but is emulated on a CPU and runs
+  several times slower (`measure-error-feedback` took about 45 s a round with a CPU bf16
   shadow). Its band has to be calibrated for the dtype chosen.
 - **Calibration.** `calibrate-band` reports churn and flips per sample, with
-  the band they call for and the flags to pass. Calibrate per pair of node
-  class and verifier class, with more samples than the 8 above, and use the
-  safety factor knowing it is now linear in the cheater's share.
+  the band they call for and the flags to pass.
+  - Calibrate per pair of node class and verifier class, with more samples
+    than the 8 above, and use the safety factor knowing it is now linear in the
+    cheater's share.
+  - No band comes out narrower than one coordinate of the payload. A sample
+    set that caught no flip does not mean an honest node never crosses zero.
+  - `calibrate-band` measures a run's first step, from a zeroed buffer. Later
+    rounds, which #89 makes auditable, churn more (the table above), so a band
+    calibrated on first steps covers first-step audits only.
 
 **What is not settled here:**
 - **The price of a cheat.** Under a band of churn c and flips f, a cheater
   chooses at most c of the coordinates it sends, signs included, and turns over
-  f of the rest. What that buys against robust aggregation, and so how large a
+  f of the rest: c + (1 − c) · f of them in all, 11.8% at the genesis
+  calibration's 6.1% each. What that buys against robust aggregation, and so how large a
   band the audit economics can afford, is the band-sweep damage analysis's to
   price. It is not in this repository.
 - **The GPU classes nodes rent** (CUDA) are not measured, and only the CPU and

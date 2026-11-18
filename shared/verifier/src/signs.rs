@@ -9,19 +9,25 @@
 //!   node sent is one the replay did not send at all;
 //! - **flips:** it picks the same coordinate with the other sign.
 //!
-//! The relative L2 distance over the decompressed signs mixes the two:
+//! Where both send as many coordinates, as two honest top-k's of one model
+//! do, the relative L2 distance over the decompressed signs mixes the two:
 //! `distance² = 2 · churn + 4 · (1 − churn) · flips`. A band on the distance
 //! wide enough for honest churn across hardware classes lets a cheater flip a
 //! quarter of its band's square in signs instead. Judging the two apart lets
 //! each have its own band.
+//!
+//! Churn is counted from both sides, so a payload that sends fewer
+//! coordinates than the replay, leaving out the honest ones it does not like,
+//! churns as much as it left out (wienerlabs/leviathan-net#49 review).
 
 use crate::VerifierError;
 
 /// How a replay of a 1-bit payload differs from what its node sent.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignDrift {
-    /// The share of the coordinates the node sent that the replay did not
-    /// send at all, because its top-k kept other ones.
+    /// The larger of two shares: of the coordinates the node sent, those the
+    /// replay did not send at all, and of those the replay sent, those the
+    /// node did not. Where both send as many, the two are the same.
     pub churn: f32,
     /// Of the coordinates both sent, the share the replay sent with the
     /// other sign.
@@ -30,7 +36,8 @@ pub struct SignDrift {
 
 impl SignDrift {
     /// The relative L2 distance these two make over 1-bit payloads that send
-    /// as many coordinates each.
+    /// as many coordinates each. Payloads that do not send as many are not
+    /// tied to it.
     pub fn distance(&self) -> f32 {
         (2.0 * self.churn + 4.0 * (1.0 - self.churn) * self.flips).sqrt()
     }
@@ -81,28 +88,28 @@ pub fn sign_drift(submitted: &[f32], recomputed: &[f32]) -> Result<SignDrift, Ve
     if let Some(index) = recomputed.iter().position(|value| !value.is_finite()) {
         return Err(VerifierError::NonFiniteReplay { index });
     }
-    let (mut held, mut churned, mut flipped) = (0u64, 0u64, 0u64);
+    // What the node sent, what the replay sent, and what both sent.
+    let (mut held, mut replay_held, mut shared, mut flipped) = (0u64, 0u64, 0u64, 0u64);
     for (sent, replayed) in submitted.iter().zip(recomputed) {
-        if *sent == 0.0 {
-            continue;
-        }
-        held += 1;
-        if *replayed == 0.0 {
-            churned += 1;
-        } else if (*sent > 0.0) != (*replayed > 0.0) {
-            flipped += 1;
+        held += u64::from(*sent != 0.0);
+        replay_held += u64::from(*replayed != 0.0);
+        if *sent != 0.0 && *replayed != 0.0 {
+            shared += 1;
+            flipped += u64::from((*sent > 0.0) != (*replayed > 0.0));
         }
     }
-    if held == 0 {
-        let replay_sent = recomputed.iter().any(|value| *value != 0.0);
-        return Ok(SignDrift {
-            churn: f32::from(u8::from(replay_sent)),
-            flips: 0.0,
-        });
-    }
-    let shared = held - churned;
+    // A share of nothing is nothing, except that a side that sent nothing
+    // churned everything the other side sent.
+    let share = |part: u64, whole: u64, other: u64| match whole {
+        0 => f32::from(u8::from(other > 0)),
+        whole => part as f32 / whole as f32,
+    };
     Ok(SignDrift {
-        churn: churned as f32 / held as f32,
+        churn: share(held - shared, held, replay_held).max(share(
+            replay_held - shared,
+            replay_held,
+            held,
+        )),
         flips: match shared {
             0 => 0.0,
             shared => flipped as f32 / shared as f32,
@@ -140,18 +147,23 @@ pub fn verify_signs_within_band(
     })
 }
 
-/// The band a set of honest drifts calls for: each part's worst sample times
-/// `safety_factor`, at least 1, and no more than 1, which is everything.
+/// The band a set of honest drifts calls for, from payloads that send
+/// `coordinates` coordinates: each part's worst sample times `safety_factor`
+/// (at least 1), never narrower than one coordinate and never wider than
+/// everything.
 ///
 /// The two parts are calibrated apart. Honest replays across hardware classes
-/// churn but do not flip, so a band calibrated this way holds flips tight
-/// where a band on the distance has to let them through
-/// (wienerlabs/leviathan-net#49).
+/// churn and rarely flip, so a band calibrated this way holds flips tight
+/// where a band on the distance has to let them through. It never holds them
+/// at zero: a sign near zero can cross it in any replay but an exact one, and
+/// a sample set too small to have caught one would otherwise convict the
+/// honest node that does (wienerlabs/leviathan-net#49).
 pub fn calibrate_sign_band(
     drifts: &[SignDrift],
     safety_factor: f32,
+    coordinates: u64,
 ) -> Result<SignBand, VerifierError> {
-    if drifts.is_empty() {
+    if drifts.is_empty() || coordinates == 0 {
         return Err(VerifierError::EmptyCalibration);
     }
     if drifts
@@ -164,10 +176,12 @@ pub fn calibrate_sign_band(
         return Err(VerifierError::InvalidBand(safety_factor));
     }
     let factor = safety_factor.max(1.0);
+    let one_coordinate = 1.0 / coordinates as f32;
     let worst = |part: fn(&SignDrift) -> f32| drifts.iter().map(part).fold(0.0f32, f32::max);
+    let band = |worst: f32| (worst * factor).max(one_coordinate).min(1.0);
     Ok(SignBand {
-        churn: (worst(|drift| drift.churn) * factor).min(1.0),
-        flips: (worst(|drift| drift.flips) * factor).min(1.0),
+        churn: band(worst(|drift| drift.churn)),
+        flips: band(worst(|drift| drift.flips)),
     })
 }
 
@@ -221,6 +235,43 @@ mod tests {
         let drift = sign_drift(&sent(), &replay).unwrap();
         let l2 = crate::relative_l2_distance(&sent(), &replay).unwrap();
         assert!((drift.distance() - l2).abs() < 1e-6, "{drift:?} vs {l2}");
+    }
+
+    #[test]
+    fn a_payload_that_leaves_out_honest_coordinates_churns_what_it_left_out() {
+        // It sends one coordinate a chunk where the replay sends two, each of
+        // the ones it sends right in place and sign.
+        let mut fewer = sent();
+        fewer[3] = 0.0;
+        fewer[12] = 0.0;
+        let drift = sign_drift(&fewer, &sent()).unwrap();
+        assert_eq!(
+            drift,
+            SignDrift {
+                churn: 0.5,
+                flips: 0.0
+            }
+        );
+        // Held to no churn, it is fraud, as its distance always made it.
+        let band = SignBand {
+            churn: 0.0,
+            flips: 0.0,
+        };
+        assert!(
+            verify_signs_within_band(&fewer, &sent(), band)
+                .unwrap()
+                .fraud
+        );
+    }
+
+    #[test]
+    fn a_payload_that_sends_extra_coordinates_churns_what_it_added() {
+        let mut more = sent();
+        more[1] = 1.0;
+        more[14] = -1.0;
+        let drift = sign_drift(&more, &sent()).unwrap();
+        assert!((drift.churn - 2.0 / 6.0).abs() < 1e-6, "{drift:?}");
+        assert_eq!(drift.flips, 0.0);
     }
 
     #[test]
@@ -322,26 +373,48 @@ mod tests {
                 flips: 0.001,
             },
         ];
-        let band = calibrate_sign_band(&drifts, 2.0).unwrap();
+        let band = calibrate_sign_band(&drifts, 2.0, 10_000).unwrap();
         assert!((band.churn - 0.08).abs() < 1e-6, "{band:?}");
         assert!((band.flips - 0.002).abs() < 1e-6, "{band:?}");
         // A factor below 1 does not narrow the band below what honest
         // replays showed, and no band goes past everything.
-        let band = calibrate_sign_band(&drifts, 0.5).unwrap();
+        let band = calibrate_sign_band(&drifts, 0.5, 10_000).unwrap();
         assert!((band.churn - 0.04).abs() < 1e-6, "{band:?}");
-        let band = calibrate_sign_band(&drifts, 100.0).unwrap();
+        let band = calibrate_sign_band(&drifts, 100.0, 10_000).unwrap();
         assert_eq!(band.churn, 1.0);
         // Every honest drift it was calibrated on passes it.
-        let band = calibrate_sign_band(&drifts, 1.0).unwrap();
+        let band = calibrate_sign_band(&drifts, 1.0, 10_000).unwrap();
         for drift in drifts {
             assert!(drift.churn <= band.churn && drift.flips <= band.flips);
         }
     }
 
     #[test]
+    fn a_part_no_sample_drifted_in_is_still_given_one_coordinate() {
+        // No sample flipped, and none churned: an exact-looking calibration.
+        let drifts = [SignDrift {
+            churn: 0.0,
+            flips: 0.0,
+        }];
+        let band = calibrate_sign_band(&drifts, 5.0, 82).unwrap();
+        assert_eq!(band.churn, 1.0 / 82.0);
+        assert_eq!(band.flips, 1.0 / 82.0);
+        // So one sign crossing zero in a payload of 82 coordinates passes it.
+        let one_flip = SignDrift {
+            churn: 0.0,
+            flips: 1.0 / 82.0,
+        };
+        assert!(one_flip.flips <= band.flips);
+        assert_eq!(
+            calibrate_sign_band(&drifts, 5.0, 0),
+            Err(VerifierError::EmptyCalibration)
+        );
+    }
+
+    #[test]
     fn a_calibration_needs_samples_made_of_numbers() {
         assert_eq!(
-            calibrate_sign_band(&[], 2.0),
+            calibrate_sign_band(&[], 2.0, 10_000),
             Err(VerifierError::EmptyCalibration)
         );
         assert_eq!(
@@ -350,7 +423,8 @@ mod tests {
                     churn: f32::NAN,
                     flips: 0.0
                 }],
-                2.0
+                2.0,
+                10_000
             ),
             Err(VerifierError::NonFiniteCalibration)
         );
@@ -360,7 +434,8 @@ mod tests {
                     churn: 0.1,
                     flips: 0.0
                 }],
-                f32::NAN
+                f32::NAN,
+                10_000
             ),
             Err(VerifierError::InvalidBand(_))
         ));

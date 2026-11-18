@@ -910,6 +910,28 @@ impl Distro {
                 format!("reach {lowest}..={highest}, outside 0..{totalk}"),
             ));
         }
+        // Each row names each of its coordinates once, as a top-k does. A
+        // coordinate named twice is read as the mean of its values where a
+        // payload is decompressed on its own, as a verifier does, but counts
+        // twice where peers' indices are decompressed together, as `apply`
+        // does, so one payload would say one thing to the verifier and another
+        // to every node (wienerlabs/leviathan-net#49).
+        if k > 1 {
+            let (sorted, _) = decoded.reshape([-1, k]).sort(-1, false);
+            let repeated = sorted
+                .narrow(-1, 1, k - 1)
+                .eq_tensor(&sorted.narrow(-1, 0, k - 1))
+                .any()
+                .to_kind(Kind::Int64)
+                .f_int64_value(&[])
+                .map_err(|error| (true, format!("cannot be read: {error}")))?;
+            if repeated != 0 {
+                return Err((
+                    true,
+                    "name a coordinate more than once in a row".to_string(),
+                ));
+            }
+        }
 
         let values = &result.sparse_val;
         if values.size() != shape {

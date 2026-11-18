@@ -4,6 +4,7 @@
 //! them now (wienerlabs/leviathan-net#67).
 
 use leviathan_verifier::PayloadBand;
+use psyche_verifier::SignBand;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -75,11 +76,17 @@ async fn kept_fraud_naming(
         &subject.wallet,
         header,
     );
+    // The rehearsal sends 1-bit signs, so its payloads are held to a band on
+    // their signs. The reference is the honest payload itself, so no churn
+    // and no flip is honest (wienerlabs/leviathan-net#49).
     let config = AuditConfig {
         run_id: harness.run_id.clone(),
         submitted_dir,
         reference_dir: Some(reference_dir),
-        band: PayloadBand::Distance(0.05),
+        band: PayloadBand::Signs(SignBand {
+            churn: 0.0,
+            flips: 0.0,
+        }),
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
@@ -194,4 +201,31 @@ pub async fn a_fraud_newer_than_the_daemons_view_is_looked_at_again() {
             "a payload ahead of the view was settled"
         );
     }
+}
+
+/// The rehearsal sends 1-bit signs. A daemon that holds its payloads to a band
+/// on their distance instead judges none of them, convicting no one, and counts
+/// them as payloads it cannot judge yet until it is given the band the run
+/// calls for. It reads the run's optimizer every pass, so a run configured
+/// after the daemon started is caught too (wienerlabs/leviathan-net#49).
+#[tokio::test]
+pub async fn a_daemon_holding_a_one_bit_run_to_a_distance_band_judges_none_of_its_payloads(
+) {
+    let mut harness = training_run(446, "Leviathan wrong band daemon").await;
+    let (mut config, key) = kept_fraud(&mut harness, "wrong-band").await;
+    config.band = PayloadBand::Distance(0.05);
+    let mut judged = HashSet::new();
+    let report = pass(&mut harness, &config, &mut judged).await;
+    assert_eq!(report.fraud_found, 0, "{report:?}");
+    assert_eq!(report.cleared, 0, "{report:?}");
+    assert_eq!(report.unreplayable, 1, "{report:?}");
+    assert!(!judged.contains(&key));
+
+    // Given the band on its signs, the same daemon convicts the fraud.
+    config.band = PayloadBand::Signs(SignBand {
+        churn: 0.0,
+        flips: 0.0,
+    });
+    let report = pass(&mut harness, &config, &mut judged).await;
+    assert_eq!(report.fraud_found, 1, "{report:?}");
 }

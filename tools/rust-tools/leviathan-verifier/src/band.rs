@@ -11,6 +11,8 @@ use std::fmt;
 
 use anyhow::anyhow;
 use anyhow::Result;
+use psyche_verifier::verify_signs_within_band;
+use psyche_verifier::verify_within_band;
 use psyche_verifier::SignBand;
 use psyche_verifier::SignDrift;
 use psyche_verifier::DEFAULT_BAND;
@@ -28,16 +30,27 @@ pub enum PayloadBand {
 
 impl PayloadBand {
     /// The largest relative L2 distance a payload within this band can be
-    /// at. For a band on the distance it is that band; for a band on the
-    /// signs it is the distance its churn and flips make together.
+    /// at. For a band on the distance it is that band. For a band on the
+    /// signs it is the largest of `2 · churn + 4 · (1 − churn) · flips` over
+    /// churn and flips within it, square-rooted: with flips above a half it
+    /// is reached with no churn at all. Like that identity, it holds for
+    /// payloads that send as many coordinates as the replay.
     pub fn distance_bound(&self) -> f32 {
         match self {
             PayloadBand::Distance(band) => *band,
-            PayloadBand::Signs(band) => SignDrift {
-                churn: band.churn,
-                flips: band.flips,
+            PayloadBand::Signs(band) => {
+                let churned = SignDrift {
+                    churn: band.churn,
+                    flips: band.flips,
+                }
+                .distance();
+                let unchurned = SignDrift {
+                    churn: 0.0,
+                    flips: band.flips,
+                }
+                .distance();
+                churned.max(unchurned)
             }
-            .distance(),
         }
     }
 }
@@ -65,16 +78,27 @@ pub fn payload_band(
     churn_band: Option<f32>,
     flip_band: Option<f32>,
 ) -> Result<PayloadBand> {
-    match (band, churn_band, flip_band) {
-        (None, Some(churn), Some(flips)) => Ok(PayloadBand::Signs(SignBand { churn, flips })),
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(anyhow!(
-            "--band holds a payload to its distance, --churn-band and --flip-band to its signs: pass one or the other"
-        )),
-        (_, Some(_), None) | (_, None, Some(_)) => Err(anyhow!(
-            "--churn-band and --flip-band go together: a 1-bit payload is held to both"
-        )),
-        (band, None, None) => Ok(PayloadBand::Distance(band.unwrap_or(DEFAULT_BAND))),
+    let band = match (band, churn_band, flip_band) {
+        (None, Some(churn), Some(flips)) => PayloadBand::Signs(SignBand { churn, flips }),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(anyhow!(
+                "--band holds a payload to its distance, --churn-band and --flip-band to its signs: pass one or the other"
+            ))
+        }
+        (_, Some(_), None) | (_, None, Some(_)) => {
+            return Err(anyhow!(
+                "--churn-band and --flip-band go together: a 1-bit payload is held to both"
+            ))
+        }
+        (band, None, None) => PayloadBand::Distance(band.unwrap_or(DEFAULT_BAND)),
+    };
+    // A band that is not one is refused here, where it is given, rather
+    // than on every payload it is used on.
+    match band {
+        PayloadBand::Distance(distance) => verify_within_band(&[], &[], distance).map(|_| ())?,
+        PayloadBand::Signs(signs) => verify_signs_within_band(&[], &[], signs).map(|_| ())?,
     }
+    Ok(band)
 }
 
 #[cfg(test)]
@@ -113,6 +137,15 @@ mod tests {
     }
 
     #[test]
+    fn a_band_that_is_not_one_is_refused_where_it_is_given() {
+        assert!(payload_band(Some(-0.1), None, None).is_err());
+        assert!(payload_band(Some(f32::NAN), None, None).is_err());
+        assert!(payload_band(None, Some(1.5), Some(0.0)).is_err());
+        assert!(payload_band(None, Some(0.05), Some(f32::NAN)).is_err());
+        assert!(payload_band(None, Some(0.0), Some(0.0)).is_ok());
+    }
+
+    #[test]
     fn a_sign_band_admits_the_distance_its_churn_and_flips_make() {
         let band = PayloadBand::Signs(SignBand {
             churn: 0.08,
@@ -120,5 +153,12 @@ mod tests {
         });
         assert!((band.distance_bound() - 0.4).abs() < 1e-6);
         assert_eq!(PayloadBand::Distance(0.05).distance_bound(), 0.05);
+        // With flips above a half, the most distance is reached by flipping
+        // every shared sign it may and churning nothing.
+        let band = PayloadBand::Signs(SignBand {
+            churn: 0.5,
+            flips: 0.9,
+        });
+        assert!((band.distance_bound() - (4.0f32 * 0.9).sqrt()).abs() < 1e-6);
     }
 }

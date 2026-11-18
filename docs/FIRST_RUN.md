@@ -125,8 +125,10 @@ small, smooth distance.
   it only watches.
 - **Where the bands come from.** `calibrate-band` reports them, per pair of node
   class and verifier class (`BAND_CALIBRATION.md`, wienerlabs/leviathan-net#49).
-- **What is measured so far.** The CPU and the M1's GPU: honest single-step
-  replays across classes churn 1.5–4% and almost never flip.
+- **What is measured so far.** The CPU and the M1's GPU:
+  - In a round's first step and over the first rounds, honest single-step
+    replays across classes churn 1.5–4% and almost never flip.
+  - Later rounds with an fp32 verifier reach 8–14% churn.
 - **What is not.** The GPU classes nodes rent (3060 Ti, 3090) have to be
   calibrated this way before the run opens.
 
