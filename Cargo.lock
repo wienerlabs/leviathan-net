@@ -7733,6 +7733,7 @@ dependencies = [
 name = "psyche-solana-tooling"
 version = "0.2.0"
 dependencies = [
+ "anchor-client",
  "anchor-lang",
  "anchor-spl",
  "anyhow",
@@ -7755,6 +7756,7 @@ dependencies = [
  "psyche-solana-rpc",
  "psyche-solana-treasurer",
  "psyche-verifier",
+ "psyche-watcher",
  "serde",
  "solana-sdk",
  "solana_toolbox_endpoint",

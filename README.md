@@ -144,6 +144,12 @@ Programs build with `anchor build --no-idl`. The instruction layers are exercise
 cargo test -p psyche-solana-tooling
 ```
 
+The client's own Solana backend speaks RPC, which memnet does not have. One suite runs it against a local `solana-test-validator` with the coordinator and authorizer built for SBF (`cargo build-sbf`), named by `LEVIATHAN_SBF_DIR` or found where `anchor build` leaves them. It checks that a client waits for its last checkpoint to be recorded before it exits (wienerlabs/leviathan-net#85):
+
+```
+LEVIATHAN_SBF_DIR=<dir with both .so files> cargo test -p psyche-solana-tooling --test mod -- --ignored validator_
+```
+
 The whole security economics also runs against live devnet through the toolbox RPC endpoint:
 
 ```

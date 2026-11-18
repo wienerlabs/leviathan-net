@@ -2,6 +2,7 @@ mod appeals_harness;
 mod bonded_run;
 mod chain_state;
 mod memnet_authorizer_full_cycle;
+mod memnet_coordinator_checkpoint;
 mod memnet_coordinator_data_layout;
 mod memnet_coordinator_full_round;
 mod memnet_coordinator_init_free;
@@ -43,6 +44,7 @@ mod memnet_treasurer_verifier_liability;
 mod memnet_treasurer_withdraw_hold;
 mod refusal;
 mod signed_payload;
+mod validator_checkpoint_flush;
 #[cfg(feature = "daemon")]
 mod memnet_verifier_daemon;
 #[cfg(feature = "daemon")]

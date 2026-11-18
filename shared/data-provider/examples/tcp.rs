@@ -35,6 +35,10 @@ impl WatcherBackend for DummyBackend {
     async fn send_checkpoint(&mut self, _checkpoint: model::Checkpoint) -> anyhow::Result<()> {
         bail!("Data provider does not send checkpoints");
     }
+
+    async fn flush_checkpoints(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct DummyDataProvider;

@@ -716,10 +716,13 @@ impl Client {
                 // Every upload is done once its outcome is read, so whatever
                 // checkpoint any of them left, before the wait above looked or
                 // after its last look, is in the channel by then and still goes
-                // out. Networking shuts down either way, and then the first
-                // failure fails the shutdown: an upload that failed, a
-                // checkpoint that could not be sent, or p2p
-                // (wienerlabs/leviathan-net#82).
+                // out. A backend may send it in the background, so the shutdown
+                // then waits for every checkpoint it was given to land: the
+                // process exiting used to drop the send of the run's last one
+                // (wienerlabs/leviathan-net#85). Networking shuts down either
+                // way, and then the first failure fails the shutdown: an upload
+                // that failed, a checkpoint that could not be sent or recorded,
+                // or p2p (wienerlabs/leviathan-net#82).
                 let uploads = run.finish_uploads().await;
                 let mut sent = Ok(());
                 while let Ok(checkpoint) = rx_checkpoint.try_recv() {
@@ -729,10 +732,11 @@ impl Client {
                         sent = sending;
                     }
                 }
+                let recorded = watcher.backend_mut().flush_checkpoints().await;
                 let down = p2p_shutdown
                     .await
                     .map_err(|e| anyhow!("Error shutting down p2p: {e}"));
-                uploads.and(sent).and(down)
+                uploads.and(sent).and(recorded).and(down)
             }
         });
 

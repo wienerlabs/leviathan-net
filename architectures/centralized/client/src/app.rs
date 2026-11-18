@@ -73,6 +73,14 @@ impl WatcherBackend for Backend {
         self.tx.send(ToSend::Checkpoint(checkpoint))?;
         Ok(())
     }
+
+    /// Nothing to wait for here: a checkpoint is queued for the app, which
+    /// sends the server everything the client left once the client finishes,
+    /// and fails if a checkpoint could not go out
+    /// (wienerlabs/leviathan-net#82).
+    async fn flush_checkpoints(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct App {
