@@ -35,7 +35,9 @@ pub use causal_language_model::{
     LanguageModelForward,
 };
 pub use device_utils::{Devices, get_optimal_devices};
-pub use distro::{CompressDCT, Distro, DistroResult, DistroResultMismatch, TransformDCT};
+pub use distro::{
+    CompressDCT, Distro, DistroResult, DistroResultMismatch, ErrorFeedbackMismatch, TransformDCT,
+};
 pub use dummy::{DummyModel, get_dummy_parameters};
 pub use fp32_gradient_accumulator::Fp32GradientAccumulator;
 pub use models::*;

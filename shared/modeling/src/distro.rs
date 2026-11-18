@@ -554,6 +554,19 @@ impl Clone for DistroResult {
     }
 }
 
+/// Why an error-feedback buffer does not fit an optimizer's.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ErrorFeedbackMismatch {
+    #[error("{given} buffers for {expected} variables")]
+    Count { given: usize, expected: usize },
+    #[error("variable {index} has shape {expected:?}, its buffer {given:?}")]
+    Shape {
+        index: usize,
+        expected: Vec<i64>,
+        given: Vec<i64>,
+    },
+}
+
 pub struct Distro {
     sgd: COptimizer,
     compression_decay: f64,
@@ -1040,6 +1053,46 @@ impl Distro {
         for state in &mut self.state {
             let _ = state.delta.logical_tensor().zero_();
         }
+    }
+
+    /// A copy of the error-feedback buffer on the CPU: what this optimizer
+    /// has computed and not yet sent, one tensor per model variable in the
+    /// model's order. With the node's weights, it is the state a node would
+    /// reveal for an audit of its next round (wienerlabs/leviathan-net#48).
+    pub fn error_feedback(&self) -> Vec<Tensor> {
+        let _no_grad = tch::no_grad_guard();
+        self.state
+            .iter()
+            .map(|state| state.delta.local_tensor().to_device(Device::Cpu).copy())
+            .collect()
+    }
+
+    /// Replaces the error-feedback buffer with `buffer`, as
+    /// [`Self::error_feedback`] returns it, cast to this buffer's dtype and
+    /// device. A buffer that does not fit the model changes nothing.
+    pub fn load_error_feedback(&mut self, buffer: &[Tensor]) -> Result<(), ErrorFeedbackMismatch> {
+        if buffer.len() != self.state.len() {
+            return Err(ErrorFeedbackMismatch::Count {
+                given: buffer.len(),
+                expected: self.state.len(),
+            });
+        }
+        for (index, (state, given)) in self.state.iter().zip(buffer).enumerate() {
+            let expected = state.delta.local_tensor().size();
+            if given.size() != expected {
+                return Err(ErrorFeedbackMismatch::Shape {
+                    index,
+                    expected,
+                    given: given.size(),
+                });
+            }
+        }
+        let _no_grad = tch::no_grad_guard();
+        for (state, given) in self.state.iter_mut().zip(buffer) {
+            let mut delta = state.delta.local_tensor();
+            delta.copy_(&given.to_device(delta.device()).to_kind(delta.kind()));
+        }
+        Ok(())
     }
 
     pub fn quantize_nozeros_tensor_to_boolean_sign(tensor: &Tensor) -> Tensor {

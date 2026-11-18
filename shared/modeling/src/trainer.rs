@@ -272,6 +272,11 @@ enum ParallelAssignment {
     },
     Extract,
     TruncateBf16,
+    ErrorFeedback,
+    Load {
+        weights: HashMap<String, Tensor>,
+        error_feedback: Option<Vec<Tensor>>,
+    },
 }
 
 #[derive(Debug)]
@@ -290,6 +295,12 @@ enum ParallelResult {
         variables: HashMap<String, Tensor>,
     },
     TruncateBf16,
+    ErrorFeedback {
+        buffer: Option<Vec<Tensor>>,
+    },
+    Load {
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -367,6 +378,39 @@ impl Trainer {
         }
     }
 
+    /// A copy of each model thread's DisTrO error-feedback buffer on the CPU,
+    /// None for a thread whose optimizer keeps none.
+    pub fn error_feedback(
+        &mut self,
+    ) -> Result<Vec<Option<Vec<Tensor>>>, TrainerThreadCommunicationError> {
+        match self {
+            Trainer::Local(local_trainer) => local_trainer.error_feedback(),
+            #[cfg(feature = "python")]
+            Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
+                "hand out its error feedback",
+            )),
+        }
+    }
+
+    /// Loads `weights`, as [`Self::extract`] returns them, into every model
+    /// thread, and each thread's `error_feedback`, as [`Self::error_feedback`]
+    /// returns it, into that thread's DisTrO buffer. Each thread checks the
+    /// state against its model before it writes any of it, so a state that
+    /// does not fit changes nothing in that thread.
+    pub fn load(
+        &mut self,
+        weights: &HashMap<String, Tensor>,
+        error_feedback: Option<&[Vec<Tensor>]>,
+    ) -> Result<(), TrainerThreadCommunicationError> {
+        match self {
+            Trainer::Local(local_trainer) => local_trainer.load(weights, error_feedback),
+            #[cfg(feature = "python")]
+            Trainer::PythonDistributed(_) => {
+                Err(TrainerThreadCommunicationError::Unsupported("load a state"))
+            }
+        }
+    }
+
     pub fn can_do_inference(&self) -> bool {
         match self {
             Trainer::Local(local_trainer) => local_trainer.can_do_inference(),
@@ -438,6 +482,12 @@ pub enum TrainerThreadCommunicationError {
 
     #[error("Attempting to pad batch that's already on GPU")]
     PaddingBatch,
+
+    #[error("This trainer cannot {0}")]
+    Unsupported(&'static str),
+
+    #[error("Could not load the trainer's state: {0}")]
+    Load(String),
 
     #[cfg(feature = "python")]
     #[error("Python error: {0}")]
@@ -735,6 +785,86 @@ impl LocalTrainer {
             }
         }
         Ok(())
+    }
+
+    /// A copy of each model thread's DisTrO error-feedback buffer on the CPU,
+    /// None for a thread whose optimizer keeps none.
+    pub fn error_feedback(
+        &mut self,
+    ) -> Result<Vec<Option<Vec<Tensor>>>, TrainerThreadCommunicationError> {
+        self.barrier.reset();
+        for (tx, _) in &self.models {
+            tx.send(ParallelAssignment::ErrorFeedback)
+                .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
+        }
+        let mut buffers = Vec::with_capacity(self.models.len());
+        for (_, rx) in &self.models {
+            match rx
+                .recv()
+                .map_err(|_| TrainerThreadCommunicationError::RecvResult)?
+            {
+                ParallelResult::ErrorFeedback { buffer } => buffers.push(buffer),
+                result => {
+                    return Err(TrainerThreadCommunicationError::UnexpectedResult(format!(
+                        "{result:?}"
+                    )));
+                }
+            }
+        }
+        Ok(buffers)
+    }
+
+    /// Loads `weights`, as [`Self::extract`] returns them, into every model
+    /// thread, and each thread's `error_feedback`, as [`Self::error_feedback`]
+    /// returns it, into that thread's DisTrO buffer. Each thread checks the
+    /// state against its model before it writes any of it, so a state that
+    /// does not fit changes nothing in that thread.
+    pub fn load(
+        &mut self,
+        weights: &HashMap<String, Tensor>,
+        error_feedback: Option<&[Vec<Tensor>]>,
+    ) -> Result<(), TrainerThreadCommunicationError> {
+        if let Some(buffers) = error_feedback {
+            if buffers.len() != self.models.len() {
+                return Err(TrainerThreadCommunicationError::Load(format!(
+                    "{} buffers for {} model threads",
+                    buffers.len(),
+                    self.models.len()
+                )));
+            }
+        }
+        self.barrier.reset();
+        for (index, (tx, _)) in self.models.iter().enumerate() {
+            let weights = weights
+                .iter()
+                .map(|(name, tensor)| (name.clone(), tensor.shallow_clone()))
+                .collect();
+            let error_feedback = error_feedback
+                .map(|buffers| buffers[index].iter().map(Tensor::shallow_clone).collect());
+            tx.send(ParallelAssignment::Load {
+                weights,
+                error_feedback,
+            })
+            .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
+        }
+        let mut failure = None;
+        for (_, rx) in &self.models {
+            match rx
+                .recv()
+                .map_err(|_| TrainerThreadCommunicationError::RecvResult)?
+            {
+                ParallelResult::Load { error } => failure = failure.or(error),
+                result => {
+                    return Err(TrainerThreadCommunicationError::UnexpectedResult(format!(
+                        "{result:?}"
+                    )));
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(TrainerThreadCommunicationError::Load(error)),
+            None => Ok(()),
+        }
     }
 
     // todo: refactor args into a struct
@@ -1155,6 +1285,33 @@ impl LocalTrainer {
                         return;
                     }
                 }
+                Ok(ParallelAssignment::ErrorFeedback) => {
+                    let buffer = match &optimizer {
+                        Optimizer::Distro { optimizer, .. } => Some(optimizer.error_feedback()),
+                        Optimizer::Torch { .. } | Optimizer::Null => None,
+                    };
+                    if submission
+                        .send(ParallelResult::ErrorFeedback { buffer })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ParallelAssignment::Load {
+                    weights,
+                    error_feedback,
+                }) => {
+                    let error = load_state(
+                        model.as_ref(),
+                        &mut optimizer,
+                        &weights,
+                        error_feedback.as_deref(),
+                    )
+                    .err();
+                    if submission.send(ParallelResult::Load { error }).is_err() {
+                        return;
+                    }
+                }
                 Err(_) => {
                     return;
                 }
@@ -1277,6 +1434,58 @@ impl CausalLM for LocalTrainer {
     fn convert(&self, _state_dict: Option<HashMap<String, Tensor>>) -> HashMap<String, Tensor> {
         unimplemented!();
     }
+}
+
+/// Writes `weights` into `model`'s variables and `error_feedback` into
+/// `optimizer`'s DisTrO buffer. Both are checked against the model before
+/// either is written, so a state that does not fit changes nothing.
+fn load_state(
+    model: &dyn CausalLM,
+    optimizer: &mut Optimizer,
+    weights: &HashMap<String, Tensor>,
+    error_feedback: Option<&[Tensor]>,
+) -> Result<(), String> {
+    let _no_grad = tch::no_grad_guard();
+    let variables: Vec<_> = model.variables().collect();
+    if variables.len() != weights.len() {
+        return Err(format!(
+            "{} weights for {} variables",
+            weights.len(),
+            variables.len()
+        ));
+    }
+    for variable in &variables {
+        let given = weights
+            .get(variable.name())
+            .ok_or_else(|| format!("no weights for {}", variable.name()))?;
+        if given.size() != variable.full_tensor_shape() {
+            return Err(format!(
+                "{} has shape {:?}, its weights {:?}",
+                variable.name(),
+                variable.full_tensor_shape(),
+                given.size()
+            ));
+        }
+    }
+    match (optimizer, error_feedback) {
+        (_, None) => {}
+        (Optimizer::Distro { optimizer, .. }, Some(buffer)) => optimizer
+            .load_error_feedback(buffer)
+            .map_err(|error| error.to_string())?,
+        (Optimizer::Torch { .. } | Optimizer::Null, Some(_)) => {
+            return Err("the optimizer keeps no error feedback".to_string());
+        }
+    }
+    for variable in &variables {
+        let given = weights[variable.name()].shallow_clone();
+        let source = match variable.is_sharded() {
+            true => variable.shard_other_tensor_like_me(given),
+            false => given,
+        };
+        let mut local = variable.local_tensor();
+        local.copy_(&source.to_device(local.device()).to_kind(local.kind()));
+    }
+    Ok(())
 }
 
 fn optimize_step(

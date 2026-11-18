@@ -147,3 +147,10 @@ to it.
 - A per-class band far above `DEFAULT_BAND` (0.05) is expected for bf16 and is the
   point of this exercise: it tells us the shipped default is a placeholder and the
   real economics must use the measured, per-class value.
+- The band covers one step replayed from a known state. A replay of later steps
+  drifts with every step of its window, so they are to be checked one
+  transition at a time instead, from the state an audited node reveals
+  (`docs/ERROR_FEEDBACK.md`, #48). Across classes such a transition still
+  drifts: 0.31 mean and 0.41 max between bf16 on an M1 GPU and fp32 on its CPU,
+  all of it top-k churn with no sign wrong. That is far above the default band
+  and the 0.029 above, which is the 1-bit problem of #49.
