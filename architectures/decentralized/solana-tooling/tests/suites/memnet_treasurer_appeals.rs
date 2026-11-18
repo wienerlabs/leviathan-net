@@ -486,6 +486,53 @@ pub async fn a_challenged_target_cannot_leave_until_the_appeal_resolves() {
     assert_eq!(h.collateral_of(target_idx).await - before, BOND - SLASHING_RATE);
 }
 
+/// An appeal is ruled on before its deadline. Past it the conviction the
+/// verifiers reached stands and only waits to be finalised, which anyone may
+/// do, and the withdrawal hold already counts it as owed. The bench was the
+/// one party the deadline did not bind: whichever came first, a finalise or a
+/// bench seated after the deadline, decided whether the conviction stood.
+#[tokio::test]
+pub async fn a_bench_cannot_rule_past_the_appeal_deadline() {
+    let mut h = setup("Leviathan appeals deadline", 450).await;
+    let target_key = h.target_key;
+    let target_index = h.target_index;
+    let target = h.clients[h.target_client_idx].insecure_clone();
+    h.reach_verifier_quorum().await;
+    process_treasurer_run_open_challenge(&mut h.endpoint, &h.payer, &target, &h.run)
+        .await
+        .unwrap();
+    assert_eq!(h.verdict_status().await, VerdictStatus::Challenged);
+
+    h.endpoint
+        .forward_clock_unix_timestamp(APPEAL_WINDOW as u64 + 1)
+        .await
+        .unwrap();
+    let quorum = h.tie_breaker_quorum as usize;
+    let bench: Vec<usize> = h.tie_breakers.iter().take(quorum).map(|(i, _)| *i).collect();
+    for client_idx in bench {
+        assert_eq!(
+            refusal_code(h.cast_appeal(client_idx, true).await),
+            treasurer_refusal(ProgramError::AppealWindowClosed),
+            "a bench ruled on an appeal past its deadline"
+        );
+    }
+    assert_eq!(h.verdict_status().await, VerdictStatus::Challenged);
+
+    process_treasurer_run_finalize_slash(
+        &mut h.endpoint,
+        &h.payer,
+        &h.run,
+        &h.coordinator_account,
+        &h.run_id,
+        &target_key,
+        target_index,
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.verdict_status().await, VerdictStatus::Upheld);
+    assert_eq!(h.client_state(&target_key).await, Some(ClientState::Ejected));
+}
+
 /// An innocent target whose appeal overturns the conviction is not held at
 /// all: it leaves with its whole bond (wienerlabs/leviathan-net#36).
 #[tokio::test]

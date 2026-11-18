@@ -484,4 +484,7 @@ pub enum ProgramError {
 
     #[msg("The target is on the roster of an epoch that will be charged; its conviction lands there through run_finalize_slash")]
     TargetInChargingEpoch,
+
+    #[msg("The appeal's deadline has passed, so the bench can no longer rule on it")]
+    AppealWindowClosed,
 }

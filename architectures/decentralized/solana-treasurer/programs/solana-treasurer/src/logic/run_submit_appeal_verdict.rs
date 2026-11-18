@@ -8,6 +8,7 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_coordinator::CoordinatorInstance;
 use psyche_solana_coordinator::SlashClientParams;
 
+use crate::state::appeal_window_open;
 use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
@@ -178,6 +179,19 @@ pub fn run_submit_appeal_verdict_processor(
         }
         if verdict.status != VerdictStatus::Challenged {
             return err!(ProgramError::VerdictNotChallenged);
+        }
+        // An appeal is ruled on before its deadline. Past it the conviction
+        // the verifiers reached stands and only waits to be finalised: anyone
+        // may finalise it (`run_finalize_slash`), and a withdrawal already
+        // settles it as owed (`withdrawal_standing`). A bench seated after
+        // the deadline used to be able to overturn it still, whenever nobody
+        // had finalised it first.
+        if !appeal_window_open(
+            context.accounts.run.appeal_window_seconds,
+            verdict.challenged_since_unix,
+            Clock::get()?.unix_timestamp,
+        ) {
+            return err!(ProgramError::AppealWindowClosed);
         }
         // The bench is drawn again every round, over the whole roster, and the
         // target stays on the roster while it appeals, so a later round can
