@@ -49,6 +49,31 @@ pub fn find_slash_report(
     .0
 }
 
+pub fn find_equivocation_commitment(
+    run: &Pubkey,
+    reporter: &Pubkey,
+    commitment: &[u8; 32],
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            state::EquivocationCommitment::SEEDS_PREFIX,
+            run.as_ref(),
+            reporter.as_ref(),
+            commitment.as_ref(),
+        ],
+        &crate::ID,
+    )
+    .0
+}
+
+pub fn find_equivocation_bounty(run: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[state::EquivocationBounty::SEEDS_PREFIX, run.as_ref()],
+        &crate::ID,
+    )
+    .0
+}
+
 pub fn find_audit_verdict(run: &Pubkey, target: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[
@@ -205,11 +230,32 @@ pub mod psyche_solana_treasurer {
         run_charge_due_conviction_processor(context, params)
     }
 
+    pub fn run_commit_equivocation(
+        context: Context<RunCommitEquivocationAccounts>,
+        params: RunCommitEquivocationParams,
+    ) -> Result<()> {
+        run_commit_equivocation_processor(context, params)
+    }
+
     pub fn run_slash_equivocation(
         context: Context<RunSlashEquivocationAccounts>,
         params: RunSlashEquivocationParams,
     ) -> Result<()> {
         run_slash_equivocation_processor(context, params)
+    }
+
+    pub fn run_close_equivocation_commitment(
+        context: Context<RunCloseEquivocationCommitmentAccounts>,
+        params: RunCloseEquivocationCommitmentParams,
+    ) -> Result<()> {
+        run_close_equivocation_commitment_processor(context, params)
+    }
+
+    pub fn run_set_equivocation_bounty(
+        context: Context<RunSetEquivocationBountyAccounts>,
+        params: RunSetEquivocationBountyParams,
+    ) -> Result<()> {
+        run_set_equivocation_bounty_processor(context, params)
     }
 
     pub fn run_charge_slash_report(
@@ -423,6 +469,15 @@ pub enum ProgramError {
 
     #[msg("This slash names no reporter, so its bounty stays in the vault")]
     SlashReportOwesNoBounty,
+
+    #[msg("The reporter committed to no such proof of equivocation")]
+    EquivocationNotCommitted,
+
+    #[msg("A proof of equivocation is revealed in a later slot than the reporter committed to it")]
+    EquivocationCommittedTooRecently,
+
+    #[msg("An equivocation's reporter may be given less than the whole of the target's forfeit")]
+    EquivocationBountyTooHigh,
 
     #[msg("The verdict holds no conviction recorded as due")]
     ConvictionNotDue,

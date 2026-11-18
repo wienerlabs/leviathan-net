@@ -3,10 +3,10 @@
 //! to an account the convicted participant names when it leaves
 //! (wienerlabs/leviathan-net#72).
 
-use psyche_solana_tooling::equivocation::process_treasurer_run_slash_equivocation;
 use psyche_solana_tooling::get_accounts::get_participant;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_reporter;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
+use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_equivocation_bounty;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
 use psyche_solana_tooling::slash_reports::get_slash_report;
 use psyche_solana_tooling::slash_reports::process_treasurer_run_charge_slash_report;
@@ -22,6 +22,7 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
 use super::appeals_harness::*;
+use super::memnet_treasurer_equivocation::commit_then_reveal;
 use super::memnet_treasurer_equivocation::resigned;
 use super::refusal::refusal_code;
 use super::refusal::treasurer_refusal;
@@ -102,7 +103,9 @@ async fn authority_slashes(
 }
 
 /// `reporter` proves the target signed two payloads for one batch: the fraud
-/// it signed this round, and its honest payload for the same batch.
+/// it signed this round, and its honest payload for the same batch. The run
+/// gives an equivocation's reporter the same share as a slash's, which it has
+/// to set apart (wienerlabs/leviathan-net#92).
 async fn equivocation_reported_by(
     h: &mut AppealsHarness,
     reporter: &Keypair,
@@ -111,14 +114,24 @@ async fn equivocation_reported_by(
     let first = h.target_commitment;
     let second = resigned(h, &p2p, 0, 0, 0, payload_digest(HONEST_PAYLOAD));
     let payer = h.payer.insecure_clone();
+    let main_authority = h.main_authority.insecure_clone();
     let run_id = h.run_id.clone();
     let target = h.target_key;
-    process_treasurer_run_slash_equivocation(
+    let (run, coordinator_account) = (h.run, h.coordinator_account);
+    process_treasurer_run_set_equivocation_bounty(
+        &mut h.endpoint,
+        &payer,
+        &main_authority,
+        &run,
+        BOUNTY_BPS,
+    )
+    .await?;
+    commit_then_reveal(
         &mut h.endpoint,
         &payer,
         reporter,
-        &h.run,
-        &h.coordinator_account,
+        &run,
+        &coordinator_account,
         &run_id,
         &target,
         h.target_index,

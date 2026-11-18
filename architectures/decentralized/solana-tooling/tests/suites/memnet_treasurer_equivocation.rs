@@ -7,6 +7,7 @@ use psyche_coordinator::RunState;
 use psyche_core::payload_commitment_run;
 use psyche_core::BatchId;
 use psyche_core::ClosedInterval;
+use psyche_solana_tooling::equivocation::process_treasurer_run_commit_equivocation;
 use psyche_solana_tooling::equivocation::process_treasurer_run_slash_equivocation;
 use psyche_solana_tooling::equivocation::run_slash_equivocation_instruction;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_update;
@@ -17,6 +18,7 @@ use psyche_solana_treasurer::ProgramError;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use solana_toolbox_endpoint::ToolboxEndpoint;
 
 use super::appeals_harness::*;
 use super::refusal::refusal_code;
@@ -54,6 +56,42 @@ pub(super) fn resigned(
     )
 }
 
+/// `reporter` commits to the proof that `target` signed `first` and
+/// `second`, and reveals it a slot later, as a reporter has to
+/// (wienerlabs/leviathan-net#92).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn commit_then_reveal(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    reporter: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    target: &Pubkey,
+    target_index: u64,
+    first: &SignedCommitment,
+    second: &SignedCommitment,
+) -> anyhow::Result<()> {
+    process_treasurer_run_commit_equivocation(
+        endpoint, payer, reporter, run, target, first, second,
+    )
+    .await?;
+    endpoint.forward_clock_slot(1).await?;
+    process_treasurer_run_slash_equivocation(
+        endpoint,
+        payer,
+        reporter,
+        run,
+        coordinator_account,
+        run_id,
+        target,
+        target_index,
+        first,
+        second,
+    )
+    .await
+}
+
 /// Anyone sends the proof that the target signed `first` and `second`.
 pub(super) async fn report(
     h: &mut AppealsHarness,
@@ -65,12 +103,13 @@ pub(super) async fn report(
     let target_index = h.target_index;
     let run_id = h.run_id.clone();
     let target = h.target_key;
-    process_treasurer_run_slash_equivocation(
+    let (run, coordinator_account) = (h.run, h.coordinator_account);
+    commit_then_reveal(
         &mut h.endpoint,
         &payer,
         &reporter,
-        &h.run,
-        &h.coordinator_account,
+        &run,
+        &coordinator_account,
         &run_id,
         &target,
         target_index,
@@ -147,8 +186,23 @@ pub async fn commitments_for_different_batches_do_not_convict() {
     let p2p = h.p2ps[h.target_client_idx].insecure_clone();
     let first = h.target_commitment;
     let elsewhere = resigned(&h, &p2p, 0, 0, 100, replayed_digest());
-    // The tooling refuses it outright; the chain is asked directly.
+    // The tooling refuses it outright; the chain is asked directly, for a
+    // proof the reporter committed to.
     let reporter = Keypair::new();
+    let payer = h.payer.insecure_clone();
+    let (run, target_key) = (h.run, h.target_key);
+    process_treasurer_run_commit_equivocation(
+        &mut h.endpoint,
+        &payer,
+        &reporter,
+        &run,
+        &target_key,
+        &first,
+        &elsewhere,
+    )
+    .await
+    .unwrap();
+    h.endpoint.forward_clock_slot(1).await.unwrap();
     let instruction = run_slash_equivocation_instruction(
         &h.payer.pubkey(),
         &reporter.pubkey(),
@@ -160,7 +214,6 @@ pub async fn commitments_for_different_batches_do_not_convict() {
         &first,
         &elsewhere,
     );
-    let payer = h.payer.insecure_clone();
     assert_eq!(
         refusal_code(
             h.endpoint
@@ -238,7 +291,7 @@ pub async fn a_proof_naming_another_seat_is_refused() {
         let payer = h.payer.insecure_clone();
         let run_id = h.run_id.clone();
         let (run, coordinator_account) = (h.run, h.coordinator_account);
-        let refused = process_treasurer_run_slash_equivocation(
+        let refused = commit_then_reveal(
             &mut h.endpoint,
             &payer,
             &reporter,
@@ -269,6 +322,20 @@ pub async fn one_proven_signature_is_not_two() {
     let first = h.target_commitment;
     let second = resigned(&h, &p2p, 0, 1, 0, replayed_digest());
     let reporter = Keypair::new();
+    let payer = h.payer.insecure_clone();
+    let (run, target_key) = (h.run, h.target_key);
+    process_treasurer_run_commit_equivocation(
+        &mut h.endpoint,
+        &payer,
+        &reporter,
+        &run,
+        &target_key,
+        &first,
+        &second,
+    )
+    .await
+    .unwrap();
+    h.endpoint.forward_clock_slot(1).await.unwrap();
     let instruction = run_slash_equivocation_instruction(
         &h.payer.pubkey(),
         &reporter.pubkey(),
@@ -280,7 +347,6 @@ pub async fn one_proven_signature_is_not_two() {
         &first,
         &second,
     );
-    let payer = h.payer.insecure_clone();
     for proofs in [
         vec![first.proof_instruction()],
         vec![second.proof_instruction()],

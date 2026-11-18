@@ -18,9 +18,11 @@ use psyche_solana_treasurer::accounts::ParticipantClaimAccounts;
 use psyche_solana_treasurer::accounts::ParticipantCreateAccounts;
 use psyche_solana_treasurer::accounts::RunBondConfigUpdateAccounts;
 use psyche_solana_treasurer::accounts::RunCreateAccounts;
+use psyche_solana_treasurer::accounts::RunSetEquivocationBountyAccounts;
 use psyche_solana_treasurer::accounts::RunSetSlashBountyAccounts;
 use psyche_solana_treasurer::accounts::RunSlashAccounts;
 use psyche_solana_treasurer::accounts::RunUpdateAccounts;
+use psyche_solana_treasurer::find_equivocation_bounty;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::find_run;
 use psyche_solana_treasurer::find_slash_report;
@@ -32,6 +34,7 @@ use psyche_solana_treasurer::instruction::ParticipantClaim;
 use psyche_solana_treasurer::instruction::ParticipantCreate;
 use psyche_solana_treasurer::instruction::RunBondConfigUpdate;
 use psyche_solana_treasurer::instruction::RunCreate;
+use psyche_solana_treasurer::instruction::RunSetEquivocationBounty;
 use psyche_solana_treasurer::instruction::RunSetSlashBounty;
 use psyche_solana_treasurer::instruction::RunSlash;
 use psyche_solana_treasurer::instruction::RunUpdate;
@@ -43,6 +46,7 @@ use psyche_solana_treasurer::logic::ParticipantCreateParams;
 use psyche_solana_treasurer::logic::ParticipantJoinRunParams;
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
+use psyche_solana_treasurer::logic::RunSetEquivocationBountyParams;
 use psyche_solana_treasurer::logic::RunSetSlashBountyParams;
 use psyche_solana_treasurer::accounts::RunSubmitAuditVerdictAccounts;
 use psyche_solana_treasurer::accounts::RunSetChallengeConfigAccounts;
@@ -356,6 +360,37 @@ pub async fn process_treasurer_run_submit_audit_verdict(
             &[commitment.proof_instruction(), instruction],
             &[verifier],
         )
+        .await?;
+    Ok(())
+}
+
+/// `main_authority` sets the share of an equivocating target's forfeit that
+/// goes to its reporter, which has to be less than all of it
+/// (wienerlabs/leviathan-net#92).
+pub async fn process_treasurer_run_set_equivocation_bounty(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    main_authority: &Keypair,
+    run: &Pubkey,
+    bounty_bps: u16,
+) -> Result<()> {
+    let accounts = RunSetEquivocationBountyAccounts {
+        payer: payer.pubkey(),
+        main_authority: main_authority.pubkey(),
+        run: *run,
+        equivocation_bounty: find_equivocation_bounty(run),
+        system_program: system_program::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSetEquivocationBounty {
+            params: RunSetEquivocationBountyParams { bounty_bps },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[main_authority])
         .await?;
     Ok(())
 }

@@ -138,6 +138,41 @@ async fn funded_daemon(h: &mut AppealsHarness) -> Keypair {
     daemon
 }
 
+/// What a pass reports when it finds a proof and commits to it, to reveal it
+/// on a later pass (wienerlabs/leviathan-net#92).
+fn committed() -> PassReport {
+    PassReport {
+        equivocations: 1,
+        ..PassReport::default()
+    }
+}
+
+/// A pass that commits to the proof, leaving the peer as it was, and, a slot
+/// later, the pass that reveals it. Returns what the second reported.
+async fn commit_then_reveal(
+    h: &mut AppealsHarness,
+    daemon: &Keypair,
+    config: &AuditConfig,
+    judged: &mut HashSet<String>,
+) -> PassReport {
+    let target_key = h.target_key;
+    assert_eq!(pass(h, daemon, config, judged).await, committed());
+    assert_eq!(
+        h.client_state(&target_key).await,
+        Some(ClientState::Healthy),
+        "the proof landed before it was revealed"
+    );
+    // A pass in the slot it committed in waits for a later one, which the
+    // chain takes the proof from, and counts no failure.
+    assert_eq!(pass(h, daemon, config, judged).await, committed());
+    assert_eq!(
+        h.client_state(&target_key).await,
+        Some(ClientState::Healthy)
+    );
+    h.endpoint.forward_clock_slot(1).await.unwrap();
+    pass(h, daemon, config, judged).await
+}
+
 /// A pass finds the second payload beside the first and ejects the peer that
 /// signed both. A dry run holds it back, a settled record is not judged again,
 /// a daemon that lost what it settled finds the peer ejected, and the epoch
@@ -169,7 +204,7 @@ pub async fn a_pass_convicts_a_peer_that_signed_two_payloads_for_a_batch() {
     let live = config(&h, dir, "convict", false);
     let mut judged = HashSet::new();
     assert_eq!(
-        pass(&mut h, &daemon, &live, &mut judged).await,
+        commit_then_reveal(&mut h, &daemon, &live, &mut judged).await,
         PassReport {
             equivocations: 1,
             submitted: 1,
@@ -274,7 +309,7 @@ pub async fn a_proof_that_fails_to_land_is_sent_again_until_it_does() {
         .await
         .unwrap();
     assert_eq!(
-        pass(&mut h, &daemon, &live, &mut judged).await,
+        commit_then_reveal(&mut h, &daemon, &live, &mut judged).await,
         PassReport {
             equivocations: 1,
             submitted: 1,
@@ -376,17 +411,8 @@ pub async fn an_equivocation_is_convicted_with_nothing_to_replay_against() {
     };
 
     let mut judged = HashSet::new();
-    let report = audit_pass(
-        &mut h.endpoint,
-        &daemon,
-        &h.coordinator_account,
-        &h.run,
-        &replaying,
-        None,
-        &mut judged,
-    )
-    .await
-    .expect("a pass with no replay still judges equivocations");
+    let report =
+        commit_then_reveal(&mut h, &daemon, &replaying, &mut judged).await;
     assert_eq!(
         report,
         PassReport {

@@ -697,6 +697,7 @@ pub fn treasurer_run_charge_slash_report(
                 charge_epoch_start,
             ),
             target_participant: psyche_solana_treasurer::find_participant(&run, target),
+            equivocation_bounty: psyche_solana_treasurer::find_equivocation_bounty(&run),
         },
         psyche_solana_treasurer::instruction::RunChargeSlashReport {
             params: psyche_solana_treasurer::logic::RunChargeSlashReportParams {

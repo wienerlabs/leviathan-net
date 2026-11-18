@@ -12,6 +12,7 @@ use anyhow::Result;
 use psyche_solana_coordinator::coordinator_account_from_bytes;
 use psyche_solana_treasurer::accounts::RunChargeSlashReportAccounts;
 use psyche_solana_treasurer::accounts::RunPaySlashReportBountyAccounts;
+use psyche_solana_treasurer::find_equivocation_bounty;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::find_slash_report;
 use psyche_solana_treasurer::instruction::RunChargeSlashReport;
@@ -111,6 +112,7 @@ pub fn run_charge_slash_report_instruction(
         coordinator_account: *coordinator_account,
         slash_report: find_slash_report(run, target, charge_epoch_start),
         target_participant: find_participant(run, target),
+        equivocation_bounty: find_equivocation_bounty(run),
     };
     Instruction {
         accounts: accounts.to_account_metas(None),

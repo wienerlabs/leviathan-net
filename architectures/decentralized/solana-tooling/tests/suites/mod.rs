@@ -33,6 +33,7 @@ mod memnet_treasurer_due_conviction_charge;
 mod memnet_treasurer_create_claim;
 mod memnet_treasurer_create_update;
 mod memnet_treasurer_equivocation;
+mod memnet_treasurer_equivocation_report;
 mod memnet_treasurer_slash_report;
 mod memnet_treasurer_final_round_audit;
 mod memnet_treasurer_full_epoch;
