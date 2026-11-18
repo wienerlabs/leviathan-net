@@ -161,6 +161,7 @@ mod tests {
     use super::*;
     use crate::state::CommitmentEvidence;
     use crate::state::ConvictionCharge;
+    use crate::state::VerdictKind;
 
     const RATE: u64 = 200;
     const BOUNTY_BPS: u16 = 5_000;
@@ -236,6 +237,7 @@ mod tests {
             voters: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             appeal_voters: vec![],
             vote_commitments: vec![[0; 32]; 2],
+            kind: VerdictKind::Replay,
         }
     }
 

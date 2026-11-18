@@ -15,8 +15,54 @@ pub const MAX_APPEAL_VOTERS: usize = 64;
 const _: () = assert!(MAX_VERDICT_VOTERS <= u64::BITS as usize);
 const _: () = assert!(MAX_APPEAL_VOTERS <= u64::BITS as usize);
 
-/// What a vote convicts on: the payload the target signed, where it sits, and
-/// what the voter's own replay of it hashed to.
+/// The domain a non-reveal vote's key is hashed under (`VerdictKind::vote_key`).
+pub const NON_REVEAL_VOTE_DOMAIN: &[u8] = b"leviathan/non-reveal-vote/v1";
+
+/// What a vote convicts a target of (wienerlabs/leviathan-net#89).
+#[derive(
+    AnchorSerialize,
+    AnchorDeserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Debug,
+    Default,
+)]
+pub enum VerdictKind {
+    /// Its payload is not the honest result of the work it names: the voter's
+    /// replay of it is outside the run's band.
+    #[default]
+    Replay,
+    /// It did not reveal, within the run's reveal window, the state its
+    /// payload commits to. Nothing was replayed, so the replayed hash is
+    /// zero.
+    NonReveal,
+}
+
+impl VerdictKind {
+    /// What a vote of this kind on the payload whose commitment hash is
+    /// `committed_hash` is counted under. A replay's is the commitment hash
+    /// itself; a non-reveal's is a hash of it under a domain of its own. Votes
+    /// that the target did not reveal and votes that its payload is wrong
+    /// are counted apart, and neither completes the other's quorum.
+    pub fn vote_key(self, committed_hash: &[u8; 32]) -> [u8; 32] {
+        match self {
+            VerdictKind::Replay => *committed_hash,
+            VerdictKind::NonReveal => {
+                anchor_lang::solana_program::hash::hashv(&[
+                    NON_REVEAL_VOTE_DOMAIN,
+                    committed_hash,
+                ])
+                .to_bytes()
+            },
+        }
+    }
+}
+
+/// What a vote convicts on: the payload the target signed, where it sits,
+/// what the voter's own replay of it hashed to, and what it convicts the
+/// target of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoteEvidence {
     pub committed_hash: [u8; 32],
@@ -25,6 +71,7 @@ pub struct VoteEvidence {
     pub batch_start: u64,
     pub batch_end: u64,
     pub replayed_hash: [u8; 32],
+    pub kind: VerdictKind,
 }
 
 /// How a vote stopped holding its voter's bond.
@@ -192,9 +239,21 @@ pub struct AuditVerdict {
     /// nobody: it is no seat of the bounty, the crank charges it nothing on an
     /// overturn, and it is released once the verdict resolves.
     ///
+    /// Each entry is the vote's key (`VerdictKind::vote_key`): the commitment
+    /// hash for a replay, a hash of it for a non-reveal.
+    ///
+    /// Last in the account but `kind`, so a decoder of the previous layout
+    /// still reads every field before it.
+    pub vote_commitments: Vec<[u8; 32]>,
+    /// What the recorded evidence convicts the target of: a replay outside
+    /// the band, or a state it did not reveal (wienerlabs/leviathan-net#89).
+    /// An overturned non-reveal costs its voters nothing: a non-reveal cannot
+    /// be proven either way, and a target could otherwise withhold its state
+    /// from the verifiers and serve it to the bench, to charge them.
+    ///
     /// Last in the account, so a decoder of the previous layout still reads
     /// every field before it.
-    pub vote_commitments: Vec<[u8; 32]>,
+    pub kind: VerdictKind,
 }
 
 impl AuditVerdict {
@@ -234,12 +293,18 @@ impl AuditVerdict {
         }
     }
 
-    /// How many votes in `voters` convict on `committed_hash`.
-    pub fn votes_for(&self, committed_hash: &[u8; 32]) -> u16 {
+    /// How many votes in `voters` are counted under `vote_key`
+    /// (`VerdictKind::vote_key`).
+    pub fn votes_for(&self, vote_key: &[u8; 32]) -> u16 {
         self.vote_commitments
             .iter()
-            .filter(|cast| *cast == committed_hash)
+            .filter(|cast| *cast == vote_key)
             .count() as u16
+    }
+
+    /// The key the recorded evidence's votes are counted under.
+    pub fn vote_key(&self) -> [u8; 32] {
+        self.kind.vote_key(&self.committed_hash)
     }
 
     /// Whether the vote at `position` in `voters` convicts on other evidence
@@ -249,7 +314,7 @@ impl AuditVerdict {
     pub fn dissents(&self, position: usize) -> bool {
         matches!(
             self.vote_commitments.get(position),
-            Some(cast) if cast != &self.committed_hash
+            Some(cast) if cast != &self.vote_key()
         )
     }
 
@@ -262,12 +327,13 @@ impl AuditVerdict {
     /// recorded evidence nobody votes for any more, after withdrawals, gives
     /// way to the next vote cast.
     pub fn cast_vote(&mut self, voter: Pubkey, vote: VoteEvidence) -> u16 {
-        let leading = self.votes_for(&self.committed_hash);
+        let recorded = self.vote_key();
+        let leading = self.votes_for(&recorded);
+        let key = vote.kind.vote_key(&vote.committed_hash);
         self.voters.push(voter);
-        self.vote_commitments.push(vote.committed_hash);
-        let agreeing = self.votes_for(&vote.committed_hash);
-        let takes_the_lead =
-            vote.committed_hash != self.committed_hash && agreeing > leading;
+        self.vote_commitments.push(key);
+        let agreeing = self.votes_for(&key);
+        let takes_the_lead = key != recorded && agreeing > leading;
         if leading == 0 || takes_the_lead {
             self.committed_hash = vote.committed_hash;
             self.evidence = vote.evidence;
@@ -275,8 +341,9 @@ impl AuditVerdict {
             self.batch_start = vote.batch_start;
             self.batch_end = vote.batch_end;
             self.replayed_hash = vote.replayed_hash;
+            self.kind = vote.kind;
         }
-        self.verdict_count = self.votes_for(&self.committed_hash);
+        self.verdict_count = self.votes_for(&self.vote_key());
         agreeing
     }
 
@@ -323,6 +390,7 @@ impl AuditVerdict {
             + 4 + MAX_VERDICT_VOTERS * 32 // voters
             + 4 + MAX_APPEAL_VOTERS * 32 // appeal_voters
             + 4 + MAX_VERDICT_VOTERS * 32 // vote_commitments
+            + 1 // kind
     }
 
     /// Whether a fresh dispute may take this account over.
@@ -416,7 +484,7 @@ impl AuditVerdict {
                 // no bit is shifted by taking the vote out.
                 self.voters.remove(position);
                 self.vote_commitments.remove(position);
-                self.verdict_count = self.votes_for(&self.committed_hash);
+                self.verdict_count = self.votes_for(&self.vote_key());
                 Ok(VoteRelease::Withdrawn)
             },
             // A vote for other evidence than a resolved verdict records was
@@ -678,6 +746,7 @@ impl AuditVerdict {
         self.voters.clear();
         self.appeal_voters.clear();
         self.vote_commitments.clear();
+        self.kind = VerdictKind::Replay;
     }
 }
 
@@ -717,6 +786,7 @@ mod tests {
             appeal_voters: vec![],
             // Every vote for the evidence recorded, as a quorum casts them.
             vote_commitments: vec![[0u8; 32]; voters.len()],
+            kind: VerdictKind::Replay,
         }
     }
 
@@ -1294,7 +1364,67 @@ mod tests {
             batch_start: digest as u64,
             batch_end: digest as u64,
             replayed_hash: [replayed; 32],
+            kind: VerdictKind::Replay,
         }
+    }
+
+    /// A vote that the target did not reveal the state of the payload with
+    /// `digest` as its commitment hash.
+    fn non_reveal(digest: u8) -> VoteEvidence {
+        VoteEvidence {
+            replayed_hash: [0; 32],
+            kind: VerdictKind::NonReveal,
+            ..vote(digest, 0)
+        }
+    }
+
+    /// Votes that a payload is wrong and votes that its trainer did not
+    /// reveal its state are counted apart, even on the same payload, and
+    /// neither completes the other's quorum (wienerlabs/leviathan-net#89).
+    #[test]
+    fn non_reveal_and_replay_votes_are_counted_apart() {
+        let cast = voters(4);
+        let mut v = fresh();
+        assert_eq!(v.cast_vote(cast[0], non_reveal(5)), 1);
+        assert_eq!(v.kind, VerdictKind::NonReveal);
+        assert_eq!(v.cast_vote(cast[1], vote(5, 2)), 1);
+        assert_eq!(v.kind, VerdictKind::NonReveal, "a tie keeps the earliest");
+        assert_eq!(v.cast_vote(cast[2], vote(5, 3)), 2);
+        assert_eq!(v.kind, VerdictKind::Replay);
+        assert_eq!(v.committed_hash, [5; 32]);
+        assert_eq!(v.replayed_hash, [3; 32]);
+        assert_eq!(v.verdict_count, 2);
+        assert!(
+            v.dissents(0),
+            "the non-reveal vote convicted on other grounds"
+        );
+        assert!(!v.dissents(1) && !v.dissents(2));
+        // A second non-reveal vote takes it nowhere near the replays' count.
+        assert_eq!(v.cast_vote(cast[3], non_reveal(5)), 2);
+        assert_eq!(v.kind, VerdictKind::Replay, "a tie keeps the recorded");
+        assert_eq!(v.verdict_count, 2);
+    }
+
+    /// A non-reveal is recorded as one, with nothing replayed, its votes
+    /// keyed apart from the commitment hash; a reset forgets it.
+    #[test]
+    fn a_non_reveal_quorum_records_its_kind() {
+        let cast = voters(2);
+        let mut v = fresh();
+        v.cast_vote(cast[0], non_reveal(5));
+        assert_eq!(v.cast_vote(cast[1], non_reveal(5)), 2);
+        assert_eq!(v.verdict_count, 2);
+        assert_eq!(
+            (v.kind, v.committed_hash, v.replayed_hash),
+            (VerdictKind::NonReveal, [5; 32], [0; 32])
+        );
+        assert_ne!(v.vote_key(), [5; 32]);
+        assert_eq!(v.vote_commitments, vec![v.vote_key(); 2]);
+        // Withdrawn, a non-reveal vote is recounted by its kind.
+        v.release_vote(&cast[0], true, false).unwrap();
+        assert_eq!(v.verdict_count, 1);
+        v.reset_for_round(1, 3);
+        assert_eq!(v.kind, VerdictKind::Replay);
     }
 
     fn fresh() -> AuditVerdict {
