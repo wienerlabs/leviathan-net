@@ -221,8 +221,8 @@ What this shows:
 - **Values under a sign band.** A band on the signs cannot see magnitudes. So
   under it, a payload that carries values rather than packed signs is unfit,
   and fraud. The daemon tests' `fraud` fixture is such a payload: it moves no
-  sign and no coordinate, only magnitudes. Nodes still apply such payloads
-  (wienerlabs/leviathan-net#95).
+  sign and no coordinate, only magnitudes. Nodes refuse such payloads too, as
+  not the run's encoding (wienerlabs/leviathan-net#95).
 - **A coordinate named twice in a row is refused**, by nodes and verifiers
   alike. A verifier reading the payload on its own sees the mean of the two,
   while every node, decompressing it with its peers', counts it twice. One
