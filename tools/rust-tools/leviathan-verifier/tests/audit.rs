@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use leviathan_verifier::PayloadBand;
 use leviathan_verifier::audit_dirs;
 use psyche_modeling::CompressDCT;
 use psyche_modeling::DistroResult;
@@ -48,7 +49,13 @@ fn honest_replay_passes_on_real_distro_dumps() {
     write_dump(&submitted, "epoch1700000000-step1-batch0", &honest);
     write_dump(&reference, "epoch1700000000-step1-batch0", &honest);
 
-    let summary = audit_dirs(&submitted, &reference, DEFAULT_BAND, Device::Cpu).unwrap();
+    let summary = audit_dirs(
+        &submitted,
+        &reference,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .unwrap();
     assert_eq!(summary.audited(), 1);
     assert_eq!(summary.fraud(), 0);
 }
@@ -62,7 +69,13 @@ fn sign_flip_is_caught_on_real_distro_dumps() {
     write_dump(&submitted, "epoch1700000000-step1-batch0", &tampered);
     write_dump(&reference, "epoch1700000000-step1-batch0", &honest);
 
-    let summary = audit_dirs(&submitted, &reference, DEFAULT_BAND, Device::Cpu).unwrap();
+    let summary = audit_dirs(
+        &submitted,
+        &reference,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .unwrap();
     assert_eq!(summary.audited(), 1);
     assert_eq!(summary.fraud(), 1);
     assert_eq!(summary.proofs().len(), 1);
@@ -75,7 +88,13 @@ fn missing_reference_is_skipped_not_convicted() {
     let reference = scratch("skip-ref");
     write_dump(&submitted, "epoch1700000000-step9-batch9", &honest);
 
-    let summary = audit_dirs(&submitted, &reference, DEFAULT_BAND, Device::Cpu).unwrap();
+    let summary = audit_dirs(
+        &submitted,
+        &reference,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .unwrap();
     assert_eq!(summary.audited(), 0);
     assert_eq!(summary.fraud(), 0);
 }

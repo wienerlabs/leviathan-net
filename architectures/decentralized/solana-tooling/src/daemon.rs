@@ -9,6 +9,8 @@ use leviathan_telemetry::verifier::PassReport;
 use leviathan_verifier::decompress_dump;
 use leviathan_verifier::index_dir;
 use leviathan_verifier::judge_payload;
+use leviathan_verifier::sends_signs;
+use leviathan_verifier::PayloadBand;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
@@ -17,7 +19,9 @@ use leviathan_verifier::VerifiedCommitment;
 use psyche_coordinator::select_audits_for_current_round;
 use psyche_coordinator::ClientState;
 use psyche_coordinator::Coordinator;
+use psyche_coordinator::model::Model;
 use psyche_core::BatchId;
+use psyche_core::OptimizerDefinition;
 use psyche_network::CommitmentRecord;
 use psyche_solana_treasurer::find_audit_verdict;
 use psyche_solana_treasurer::state::commitment_run;
@@ -48,7 +52,10 @@ pub struct AuditConfig {
     /// audit_pass instead, so this verifier establishes the reference itself
     /// rather than trusting dumps someone else produced.
     pub reference_dir: Option<PathBuf>,
-    pub band: f32,
+    /// What a payload is held to: a band on its distance, or for a run that
+    /// sends 1-bit signs, a band on each of churn and flips
+    /// (wienerlabs/leviathan-net#49).
+    pub band: PayloadBand,
     pub audit_assigned: bool,
     pub dry_run: bool,
     pub verdict_mode: bool,
@@ -218,6 +225,37 @@ async fn already_on_chain(
     })
 }
 
+/// Whether `config`'s band is the kind the run calls for: a band on the signs
+/// for a run that sends 1-bit signs, a band on the distance for one that sends
+/// values (wienerlabs/leviathan-net#49). The run's optimizer is read every
+/// pass, because a run can be configured after its daemon starts. A run not
+/// configured yet has nothing to judge, and a daemon that only watches may
+/// hold either kind to either. Says why when it is not.
+fn band_fits_run(config: &AuditConfig, coordinator: &Coordinator) -> bool {
+    let Model::LLM(llm) = &coordinator.model;
+    if matches!(llm.optimizer, OptimizerDefinition::Dummy) {
+        return false;
+    }
+    if config.dry_run {
+        return true;
+    }
+    match (sends_signs(&llm.optimizer), config.band) {
+        (true, PayloadBand::Distance(_)) => {
+            println!(
+                "[verifier-daemon] the run sends 1-bit signs, and this daemon holds payloads to a band on their distance: judging none until it is given --churn-band and --flip-band, calibrated with calibrate-band for its hardware (docs/BAND_CALIBRATION.md)"
+            );
+            false
+        },
+        (false, PayloadBand::Signs(_)) => {
+            println!(
+                "[verifier-daemon] the run sends values, not 1-bit signs, and a band on the signs cannot see their magnitudes: judging none until this daemon is given --band"
+            );
+            false
+        },
+        _ => true,
+    }
+}
+
 pub async fn audit_pass(
     endpoint: &mut solana_toolbox_endpoint::ToolboxEndpoint,
     authority: &Keypair,
@@ -276,8 +314,17 @@ pub async fn audit_pass(
     // run's open disputes below is what finalises and pays the convictions
     // this daemon voted on before.
     let nothing_to_judge_against = BTreeMap::new();
-    let to_judge = match (&reference, replay) {
-        (None, None) => &nothing_to_judge_against,
+    let band_fits = band_fits_run(config, coordinator);
+    if !band_fits {
+        // Counted as payloads this verifier cannot judge yet, which is what
+        // they are until it is given the band the run calls for.
+        report.unreplayable += submitted
+            .keys()
+            .filter(|key| !judged.contains(*key))
+            .count() as u64;
+    }
+    let to_judge = match (&reference, replay, band_fits) {
+        (None, None, _) | (_, _, false) => &nothing_to_judge_against,
         _ => &submitted,
     };
 
@@ -471,9 +518,15 @@ pub async fn audit_pass(
         }
         let verdict = judged_payload.verdict;
 
+        let signs = match judged_payload.signs {
+            Some(drift) => {
+                format!(", churn {:.4}, flips {:.6}", drift.churn, drift.flips)
+            },
+            None => String::new(),
+        };
         if !verdict.fraud {
             println!(
-                "[verifier-daemon] ok    {key} committer {committer} distance {:.4} within band {:.4}",
+                "[verifier-daemon] ok    {key} committer {committer} distance {:.4}{signs} within {}",
                 verdict.distance, config.band
             );
             report.cleared += 1;
@@ -484,7 +537,7 @@ pub async fn audit_pass(
         let replayed_hash = hash_delta(&reference_delta);
         report.fraud_found += 1;
         println!(
-            "[verifier-daemon] FRAUD {key} committer {committer} distance {:.4} exceeds band {:.4} (committed {} replayed {})",
+            "[verifier-daemon] FRAUD {key} committer {committer} distance {:.4}{signs} outside {} (committed {} replayed {})",
             verdict.distance,
             config.band,
             hex8(&signed.committed_hash()),

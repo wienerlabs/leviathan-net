@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use leviathan_verifier::PayloadBand;
 use leviathan_verifier::audit_with_replay;
 use leviathan_verifier::decompress_results;
 use leviathan_verifier::parse_assignment_key;
@@ -274,8 +275,13 @@ fn a_dump_directory_is_audited_against_a_recomputed_reference() {
     write_dump(&dir, "epoch1700000000-step1-batchB[0, 0]", &honest);
 
     let engine = engine_with_assignment(build_trainer());
-    let summary =
-        audit_with_replay(&dir, &engine, DEFAULT_BAND, Device::Cpu).expect("the audit must run");
+    let summary = audit_with_replay(
+        &dir,
+        &engine,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .expect("the audit must run");
     assert_eq!(summary.audited(), 1, "the dump must be judged, not skipped");
     assert_eq!(
         summary.fraud(),
@@ -289,8 +295,13 @@ fn a_dump_directory_is_audited_against_a_recomputed_reference() {
     write_dump(&fraud_dir, "epoch1700000000-step1-batchB[0, 0]", &forged);
 
     let engine = engine_with_assignment(build_trainer());
-    let summary = audit_with_replay(&fraud_dir, &engine, DEFAULT_BAND, Device::Cpu)
-        .expect("the audit must run");
+    let summary = audit_with_replay(
+        &fraud_dir,
+        &engine,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .expect("the audit must run");
     assert_eq!(summary.fraud(), 1, "a forged dump must be convicted");
     assert_eq!(summary.proofs().len(), 1, "a conviction must carry a proof");
 }
@@ -341,8 +352,13 @@ async fn a_verifier_replays_the_exact_batch_its_target_pulled_from_the_dataset()
         Device::Cpu,
         quantize_1bit(),
     );
-    let summary =
-        audit_with_replay(&dir, &engine, DEFAULT_BAND, Device::Cpu).expect("the audit must run");
+    let summary = audit_with_replay(
+        &dir,
+        &engine,
+        PayloadBand::Distance(DEFAULT_BAND),
+        Device::Cpu,
+    )
+    .expect("the audit must run");
     assert_eq!(summary.audited(), 1);
     assert_eq!(
         summary.fraud(),

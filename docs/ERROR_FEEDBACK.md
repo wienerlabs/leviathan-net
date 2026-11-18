@@ -45,7 +45,7 @@ Each node commits to the state it trains a round from: its weights, its buffer, 
 
 - **Training is unchanged**, so there is no convergence cost.
 - **On a device that repeats itself, the verifier replays the round exactly.** The CPU does, across processes, and the M1's GPU does within one process. Across processes the GPU does not repeat itself: two runs of the same nodes diverge within 4 to 48 rounds. So whether a verifier on its own GPU can replay a node's round exactly is still open, and #89 has to measure it.
-- **A verifier of another class drifts by one round's worth.** Nothing carries from one checked round to the next, so the drift cannot compound. But at 0.17 to 0.41 it is far above any band in force, so a check across classes waits on #49.
+- **A verifier of another class drifts by one round's worth.** Nothing carries from one checked round to the next, so the drift cannot compound. At 0.17 to 0.41 it is far above any band on the distance, so a check across classes is held to a band on churn and flips instead, calibrated per class pair (`docs/BAND_CALIBRATION.md`, #49).
 
 **Option 1 is rejected.** A reset costs convergence whatever the verifier's hardware: 1.6% to 12.5% of the loss by round 1000, depending on how often it resets, and no gap is closing. On top of that, across hardware classes a replay of the window drifts further with every round, even with the weights pinned at its start.
 
@@ -104,7 +104,7 @@ Over 1-bit payloads, where the replay sends as many coordinates as node 0, the t
 distance² = 2 · churn + 4 · (1 − churn) · flips
 ```
 
-The `1 − churn` is there because `flips` is a share of the coordinates both sent, not of all node 0 sent. It holds to within 2e-7 over every round measured here. A distance can therefore come from top-k churn alone, with no sign wrong. That is the difference #49 has to price.
+The `1 − churn` is there because `flips` is a share of the coordinates both sent, not of all node 0 sent. It holds to within 2e-7 over every round measured here. A distance can therefore come from top-k churn alone, with no sign wrong. That is why #49 judges 1-bit payloads on the two apart.
 
 **Sizes.** The tool also prints the size of one node's buffer and of a round's result values.
 
@@ -381,7 +381,7 @@ Under `reveal`, the shadow starts each round from what node 0 would reveal for a
 - **It is more than a round from a zeroed buffer costs.** In round 1, where the buffer is still zero, the distance is 0.17, about what a window's first round drifts under `resync`. From a filled buffer it is larger.
 - **It is all top-k churn.** No sign was wrong in any of the 600 rounds. Up to 8% of the coordinates node 0 sent were ones the verifier did not pick, and every coordinate both picked had the same sign.
 - **The dtype may account for part of it.** The nodes' buffer is bf16, where the decay does nothing and small increments are absorbed (#90). The fp32 shadow decays and absorbs nothing.
-- **It is far above every band in force.** All 600 rounds exceed the shipped default of 0.05, and the band calibrated over unquantized values, 0.029 (`docs/BAND_CALIBRATION.md`). The same document measured a band of 1.104 over 1-bit signs. Under today's metric, an honest cross-class check would therefore convict. Even a run's first step is checked against a band today, not exactly. Checking across classes waits on #49's band and distance for 1-bit payloads.
+- **It is far above every band in force.** All 600 rounds exceed the shipped default of 0.05, and the band calibrated over unquantized values, 0.029 (`docs/BAND_CALIBRATION.md`). The same document measured a band of 1.104 over 1-bit signs. Under today's metric, an honest cross-class check would therefore convict. Even a run's first step is checked against a band, not exactly. Since #49 such checks are held to a band on churn and flips instead.
 
 ### 4. What a reveal sends
 
@@ -420,7 +420,7 @@ The values follow from the buffer, so a verifier can derive them rather than tak
 - **Training is unchanged.**
 - **Each check is one round from a revealed state:**
   - exact on a device that repeats itself;
-  - across classes, one round's drift (0.31 mean, 0.41 max) that cannot compound, and that is all top-k churn. It is still far above any band in force, so it waits on #49.
+  - across classes, one round's drift (0.31 mean, 0.41 max) that cannot compound, and that is all top-k churn. It is far above any band on the distance, so it is held to a band on churn and flips (#49).
 - **The commitment has to cover the weights.** A verifier's own replica drifts from them, as option 1's first rounds show.
 - **What it costs:**
   - **The reveal.** Twice the model, with a window of its own.
@@ -429,7 +429,7 @@ The values follow from the buffer, so a verifier can derive them rather than tak
     - Where a transition replays exactly, a verifier can check that one revealed state leads to the next committed one. That takes the state of both rounds, so it checks the audited transition only. Like any contribution, a poisoned transition is caught with the audit probability. The poison then stays in the buffer until it is sent, since a bf16 buffer does not decay (#90).
     - Across classes the next state cannot be matched by hash and needs a bound. #48 sketches the argument; it is not shown.
   - **A class has to be pinned down.** For a transition to replay exactly, a verifier has to match not only the device and dtype but also the micro-batch size and the data and tensor parallelism. The simulation used one micro-batch and no parallelism.
-- **What it leaves to #49: the band for a check across classes.** The drift there is top-k churn with no sign wrong: 0 flips in 600 rounds. A band that counts flips on the coordinates both sides sent apart from churn could therefore hold flips far tighter than the distance alone allows. The churn it tolerates, up to about 8% here, is a share of coordinates a cheater could choose freely, signs included, so #49 has to price that too.
+- **What #49 does with it: the band for a check across classes.** The drift there is top-k churn with no sign wrong: 0 flips in 600 rounds. So the verifier now counts flips on the coordinates both sides sent apart from churn, and holds each to a band of its own, which holds flips far tighter than the distance alone allows. The churn it tolerates, up to about 8% here, is a share of coordinates a cheater could choose freely, signs included, and pricing it is still open (`docs/BAND_CALIBRATION.md`).
 
 ### Option 3, leave replay at the first step: in force until option 2 is built
 
@@ -450,4 +450,4 @@ The README, `docs/FIRST_RUN.md` and the verifier daemon already say that only a 
   - The cost of a reset late in a run, at a decayed rate, or on the 350M and 1B models, is not measured. Over these 1000 rounds it only grows.
 - **Two nodes, one epoch length, no parallelism.** More nodes average more results per round, and epochs of other lengths close at other places. Neither is measured, and neither are micro-batches or data or tensor parallelism.
 - **The fidelity check ran a smaller model.** It ran the genesis rehearsal's nano Llama at sequence length 64 on the CPU. It covers the logic the measurement shares with the client, not the measured model or device.
-- **The distance metric is under revision.** The distance is the relative L2 over 1-bit signs, which #49 is redesigning. Churn and flips are reported beside it, so the drift reads the same whatever #49 picks.
+- **The distance is the relative L2 over 1-bit signs.** Since #49 the verifier judges 1-bit payloads on churn and flips, which are reported beside it here.
