@@ -577,6 +577,11 @@ pub struct Distro {
     /// change it, so every node of a run applies the same update
     /// (wienerlabs/leviathan-net#60).
     robust_aggregation: bool,
+    /// Whether the run sends its results as 1-bit signs,
+    /// `OptimizerDefinition::Distro`'s `quantize_1bit`. A peer's results have
+    /// to come in the run's encoding: packed signs, or values
+    /// (wienerlabs/leviathan-net#95).
+    quantize_1bit: bool,
     state: Vec<State>,
     transform: TransformDCT,
 }
@@ -589,6 +594,7 @@ impl Distro {
         compression_topk: i64,
         weight_decay: f64,
         robust_aggregation: bool,
+        quantize_1bit: bool,
     ) -> Self {
         let _no_grad = tch::no_grad_guard();
         let mut sgd = COptimizer::sgd(0.1, 0.0, 0.0, 0.0, false).unwrap();
@@ -612,6 +618,7 @@ impl Distro {
             compression_topk,
             weight_decay,
             robust_aggregation,
+            quantize_1bit,
             state,
             transform,
         }
@@ -753,6 +760,22 @@ impl Distro {
         }
         for (index, (var, result)) in vars.variables().zip(results).enumerate() {
             let name = var.name().to_string();
+            // A run that sends 1-bit signs packs them as booleans, and `apply`
+            // unpacks those to signs but weighs any other values as they are.
+            // So a peer of such a run that sent values would steer the update
+            // by their magnitudes, which no honest node can send; and one of a
+            // run that sends values, packed signs (wienerlabs/leviathan-net#95).
+            let packed = result.sparse_val.kind() == Kind::Bool;
+            if packed != self.quantize_1bit {
+                return Err(DistroResultMismatch::Values {
+                    index,
+                    name,
+                    reason: match self.quantize_1bit {
+                        true => "carry values, and the run sends 1-bit signs".to_string(),
+                        false => "carry packed signs, and the run sends values".to_string(),
+                    },
+                });
+            }
             let Some((expected, totalk)) = self.transform.expected_encoding(var.as_ref()) else {
                 return Err(DistroResultMismatch::Unencodable { index, name });
             };
