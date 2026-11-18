@@ -130,6 +130,14 @@ impl Variable for (String, Tensor, Option<Shard>, Option<Arc<Communicator>>) {
     }
 
     fn set_grad(&self, tensor: Tensor) {
+        // A variable no backward pass has reached has no gradient, and writing
+        // into an undefined one aborts the trainer thread. A node a run seats
+        // as a verifier round after round from its start has trained nothing,
+        // and applies its peers' results all the same: its variables get their
+        // gradients, zeros, first, as a backward pass would leave them.
+        if !self.1.grad().defined() {
+            tch::with_grad(|| self.1.multiply_scalar(0.0).sum(None).backward());
+        }
         self.1
             .grad()
             .copy_(&self.shard_other_tensor_like_me(tensor));
