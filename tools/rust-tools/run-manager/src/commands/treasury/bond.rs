@@ -11,8 +11,8 @@ use psyche_solana_rpc::utils::native_amount_to_ui_amount;
 use anchor_client::solana_sdk::instruction::AccountMeta;
 use psyche_solana_treasurer::logic::bounty_amount;
 use psyche_solana_treasurer::state::{
-    AuditVerdict, Participant, Run, WithdrawalHold, WithdrawalStanding, coordinator_slashed_points,
-    unattributed_ledger_forfeit, withdrawal_standing,
+    Participant, Run, WithdrawalHold, WithdrawalStanding, coordinator_slashed_points,
+    unattributed_ledger_forfeit, unledgered_conviction_charge, withdrawal_standing,
 };
 
 /// How `user`'s withdrawal stands, read from chain exactly the way the
@@ -36,12 +36,7 @@ async fn current_withdrawal_standing(
             user,
         ))
         .await?;
-    let verdict_address = psyche_solana_treasurer::find_audit_verdict(run_address, user);
-    let own_verdict = match backend.get_account(&verdict_address).await? {
-        Some(account) => AuditVerdict::from_pda_account(&account.owner, &account.data)
-            .map_err(|error| anyhow!("Unable to decode the audit verdict: {error}"))?,
-        None => None,
-    };
+    let own_verdict = backend.get_own_audit_verdict(run_address, user).await?;
     let now = backend.get_clock().await?.unix_timestamp;
     let standing = withdrawal_standing(
         run_state,
@@ -74,12 +69,14 @@ fn describe_withdrawal_hold(hold: WithdrawalHold) -> &'static str {
 }
 
 /// What the treasurer will count of this bond, read from chain: a conviction
-/// the bond has not paid yet already holds part of it, and a requested
-/// withdrawal is on its way out. Claims are checked against what a slash could
-/// still take; joins and votes against what stays behind new work
+/// the bond has not paid yet already holds part of it, so does a conviction of
+/// this wallet's own that stands but has not reached the ledger, and a
+/// requested withdrawal is on its way out. Claims are checked against what a
+/// slash could still take; joins and votes against what stays behind new work
 /// (wienerlabs/leviathan-net#34).
 async fn report_bond_standing(
     backend: &SolanaBackend,
+    run_address: &Pubkey,
     run_state: &Run,
     participant: &Participant,
     user: &Pubkey,
@@ -88,12 +85,25 @@ async fn report_bond_standing(
     let coordinator_account = backend
         .get_coordinator_account(&run_state.coordinator_account)
         .await?;
+    let own_verdict = backend.get_own_audit_verdict(run_address, user).await?;
     let slashed_points = coordinator_slashed_points(&coordinator_account, user);
-    let unforfeited = participant.unforfeited_bond(slashed_points);
-    let committed = participant.committed_bond(slashed_points);
+    let now = backend.get_clock().await?.unix_timestamp;
+    let unledgered = unledgered_conviction_charge(
+        run_state,
+        &coordinator_account,
+        user,
+        own_verdict.as_ref(),
+        now,
+    );
+    let unforfeited = participant.unforfeited_bond_owing(slashed_points, unledgered);
+    let committed = participant.committed_bond_owing(slashed_points, unledgered);
     println!(
         "Unsettled slashed points: {}",
         participant.unsettled_slashed_points(slashed_points)
+    );
+    println!(
+        "Ejection or conviction not yet charged to the ledger: {}",
+        native_amount_to_ui_amount(unledgered, decimals)
     );
     println!(
         "Unforfeited bond: {}",
@@ -207,7 +217,15 @@ impl Command for CommandBondDeposit {
             "Bond amount now: {}",
             native_amount_to_ui_amount(participant.bond_amount, decimals)
         );
-        report_bond_standing(&backend, &run_state, &participant, &user, decimals).await?;
+        report_bond_standing(
+            &backend,
+            &run_address,
+            &run_state,
+            &participant,
+            &user,
+            decimals,
+        )
+        .await?;
         if participant.bond_withdraw_pending_amount > 0 {
             match current_withdrawal_standing(&backend, &run_address, &run_state, &user).await?.0 {
                 WithdrawalStanding::Held(hold) => {
@@ -297,7 +315,15 @@ impl Command for CommandBondStatus {
             "Settled slashed points: {}",
             participant.bond_settled_slashed_points
         );
-        report_bond_standing(&backend, &run_state, &participant, &user, decimals).await
+        report_bond_standing(
+            &backend,
+            &run_address,
+            &run_state,
+            &participant,
+            &user,
+            decimals,
+        )
+        .await
     }
 }
 

@@ -66,6 +66,14 @@ fn layout() -> BTreeMap<String, usize> {
         "CoordinatorInstanceState.client_version",
         offset_of!(CoordinatorInstanceState, client_version),
     );
+    put(
+        "CoordinatorInstanceState.tie_breaker_nodes",
+        offset_of!(CoordinatorInstanceState, tie_breaker_nodes),
+    );
+    put(
+        "CoordinatorInstanceState.seed_commit_slot",
+        offset_of!(CoordinatorInstanceState, seed_commit_slot),
+    );
 
     put("Coordinator.run_id", offset_of!(Coordinator, run_id));
     put("Coordinator.run_state", offset_of!(Coordinator, run_state));

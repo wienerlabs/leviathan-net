@@ -69,6 +69,16 @@ pub struct CoordinatorInstanceState {
     pub is_warmup_first_tick: SmallBoolean,
     pub is_training_first_tick: SmallBoolean,
     pub client_version: FixedString<96>,
+    /// How many tie-breaker seats each round reserves, from the round that
+    /// starts after it is set (`Coordinator::seat_tie_breakers`). The program
+    /// running the run's appeals court sets it with its bench size, so that
+    /// every party draws the same committee from the round. It sits in what
+    /// was alignment padding before `seed_commit_slot`, so no other field
+    /// moved, and an account written before it reads zero here: no seats, as
+    /// before.
+    pub tie_breaker_nodes: u16,
+    /// Keeps `seed_commit_slot` where it was, and the `Pod` claim honest.
+    pub tie_breaker_nodes_padding: [u8; 4],
     /// The slot the next round's seed is committed to: the slot of the first
     /// tick that found the round due, whose hash nobody knew when it was sent
     /// (wienerlabs/leviathan-net#62). Zero when none is.
@@ -213,6 +223,14 @@ impl CoordinatorInstanceState {
             matches!(ticked, Ok(TickResult::NeedsSeed)),
             &clock,
         );
+        // A round starts only into `RoundTrain`, from the warmup or the last
+        // round's witness phase. Nobody has drawn it yet: its seed was revealed
+        // in this very tick.
+        if before != RunState::RoundTrain
+            && self.coordinator.run_state == RunState::RoundTrain
+        {
+            self.coordinator.seat_tie_breakers(self.tie_breaker_nodes);
+        }
         match ticked {
             Ok(TickResult::NeedsSeed) => {
                 msg!("A round is due and waits for its seed");
@@ -380,6 +398,18 @@ impl CoordinatorInstanceState {
             .map_err(|err| anchor_lang::error!(ProgramError::from(err)))?;
 
         self.tick(Some(slot_hashes))
+    }
+
+    /// Sets how many tie-breaker seats the rounds reserve, from the next round
+    /// to start.
+    ///
+    /// The count moves the verifier seats' window, so it is refused once the
+    /// next round's seed is committed: by then the committed slot's hash is
+    /// knowable, and choosing the count afterwards would choose who verifies.
+    pub fn set_tie_breaker_nodes(&mut self, tie_breaker_nodes: u16) -> Result<()> {
+        self.refuse_after_seed_commitment()?;
+        self.tie_breaker_nodes = tie_breaker_nodes;
+        Ok(())
     }
 
     pub fn set_future_epoch_rates(

@@ -34,6 +34,8 @@
   "CoordinatorInstanceState.clients_state": 94408,
   "CoordinatorInstanceState.coordinator": 360,
   "CoordinatorInstanceState.metadata": 0,
+  "CoordinatorInstanceState.seed_commit_slot": 119136,
+  "CoordinatorInstanceState.tie_breaker_nodes": 119130,
   "EpochClient.exited_height": 68,
   "EpochClient.id": 0,
   "EpochClient.state": 64,

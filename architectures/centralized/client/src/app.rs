@@ -22,7 +22,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::interval;
 use tokio::{select, sync::mpsc, time::Interval};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub(super) type Tabs = TabbedWidget<(ClientTUI, CoordinatorTui, NetworkTui, LoggerWidget)>;
 pub const TAB_NAMES: [&str; 4] = ["Client", "Coordinator", "Network", "Logger"];
@@ -240,32 +240,71 @@ impl App {
                     self.update_tui(client_tui_state, network_tui_state).await?;
                 }
                 res = client.finished() => {
-                    res??;
-                }
-                Some(to_send) = rx_to_server_message.recv() => {
-                    let (msg, call_type) = match to_send {
-                        ToSend::Witness(ref w) => {
-                            let ct = match **w {
-                                OpportunisticData::WitnessStep(..) => RpcCallType::Witness,
-                                OpportunisticData::WarmupStep(..) => RpcCallType::WarmupWitness,
-                            };
-                            (ClientToServerMessage::Witness(match to_send { ToSend::Witness(w) => w, _ => unreachable!() }), ct)
-                        }
-                        ToSend::HealthCheck(hc) => (ClientToServerMessage::HealthCheck(hc), RpcCallType::HealthCheck),
-                        ToSend::Checkpoint(cp) => (ClientToServerMessage::Checkpoint(cp), RpcCallType::Checkpoint),
-                    };
-                    event!(coordinator::RpcCallSubmitted { call_type });
-                    match self.server_conn.send(msg).await {
-                        Ok(()) => event!(coordinator::RpcCallResult { call_type, result: Ok(()) }),
-                        Err(e) => {
-                            event!(coordinator::RpcCallResult { call_type, result: Err(e.to_string()) });
-                            return Err(e);
+                    // The client stops on its own only once its run is over
+                    // (wienerlabs/leviathan-net#82), or on an error, and then so
+                    // does the app. Either way it first sends the server what
+                    // the client left it, such as a checkpoint it uploaded.
+                    // After the run, a witness or health check that cannot go
+                    // out no longer matters; a checkpoint does.
+                    let mut checkpoint_sent = Ok(());
+                    while let Ok(to_send) = rx_to_server_message.try_recv() {
+                        let is_checkpoint = matches!(to_send, ToSend::Checkpoint(_));
+                        if let Err(error) = self.send_to_server(to_send).await {
+                            if is_checkpoint && checkpoint_sent.is_ok() {
+                                checkpoint_sent = Err(error);
+                            } else {
+                                warn!("Could not send a message the client left: {error:#}");
+                            }
                         }
                     }
+                    res??;
+                    checkpoint_sent?;
+                    break;
+                }
+                Some(to_send) = rx_to_server_message.recv() => {
+                    self.send_to_server(to_send).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Sends the server one message the client queued.
+    async fn send_to_server(&mut self, to_send: ToSend) -> Result<()> {
+        let (msg, call_type) = match to_send {
+            ToSend::Witness(w) => {
+                let call_type = match *w {
+                    OpportunisticData::WitnessStep(..) => RpcCallType::Witness,
+                    OpportunisticData::WarmupStep(..) => RpcCallType::WarmupWitness,
+                };
+                (ClientToServerMessage::Witness(w), call_type)
+            }
+            ToSend::HealthCheck(hc) => (
+                ClientToServerMessage::HealthCheck(hc),
+                RpcCallType::HealthCheck,
+            ),
+            ToSend::Checkpoint(cp) => (
+                ClientToServerMessage::Checkpoint(cp),
+                RpcCallType::Checkpoint,
+            ),
+        };
+        event!(coordinator::RpcCallSubmitted { call_type });
+        match self.server_conn.send(msg).await {
+            Ok(()) => {
+                event!(coordinator::RpcCallResult {
+                    call_type,
+                    result: Ok(())
+                });
+                Ok(())
+            }
+            Err(e) => {
+                event!(coordinator::RpcCallResult {
+                    call_type,
+                    result: Err(e.to_string())
+                });
+                Err(e)
+            }
+        }
     }
 
     async fn update_tui(

@@ -18,6 +18,11 @@ use tokio::{
 };
 use tracing::debug;
 
+/// The stack of every thread the coordinator server runs on: its runtime's
+/// workers and the thread that drives it. The client binaries give their
+/// runtimes the same.
+const SERVER_STACK_SIZE: usize = 10 * 1024 * 1024;
+
 enum TestingQueryMsg {
     Clients {
         respond_to: oneshot::Sender<FixedVec<Client, SOLANA_MAX_NUM_CLIENTS>>,
@@ -49,6 +54,9 @@ enum TestingQueryMsg {
     Coordinator {
         respond_to: oneshot::Sender<Coordinator>,
     },
+    TogglePause {
+        respond_to: oneshot::Sender<()>,
+    },
 }
 
 struct CoordinatorServer {
@@ -64,6 +72,7 @@ impl CoordinatorServer {
         min_clients: u16,
         global_batch_size: u16,
         witness_nodes: u16,
+        total_steps: u32,
     ) -> Self {
         let coordinator_config = CoordinatorConfig {
             warmup_time: WARMUP_TIME,
@@ -77,7 +86,7 @@ impl CoordinatorServer {
             global_batch_size_warmup_tokens: 0,
             verification_percent: 0,
             witness_nodes,
-            total_steps: 100,
+            total_steps,
             waiting_for_members_extra_time: 2,
             epoch_time: 30,
         };
@@ -164,6 +173,10 @@ impl CoordinatorServer {
                 let coordinator = self.inner.get_coordinator();
                 respond_to.send(coordinator).unwrap();
             }
+            TestingQueryMsg::TogglePause { respond_to } => {
+                self.inner.toggle_pause();
+                respond_to.send(()).unwrap();
+            }
         }
     }
 
@@ -189,13 +202,23 @@ pub struct CoordinatorServerHandle {
 
 impl CoordinatorServerHandle {
     pub async fn new(init_min_clients: u16, global_batch_size: u16, witness_nodes: u16) -> Self {
+        Self::new_with_total_steps(init_min_clients, global_batch_size, witness_nodes, 100).await
+    }
+
+    /// A server whose run ends once its step reaches `total_steps`.
+    pub async fn new_with_total_steps(
+        init_min_clients: u16,
+        global_batch_size: u16,
+        witness_nodes: u16,
+        total_steps: u32,
+    ) -> Self {
         debug!("creating coordinator server...");
         let (query_chan_sender, query_chan_receiver) = mpsc::channel(64);
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_time()
             .enable_io()
-            .thread_stack_size(10 * 1024 * 1024)
+            .thread_stack_size(SERVER_STACK_SIZE)
             .max_blocking_threads(8192)
             .build()
             .unwrap();
@@ -206,6 +229,7 @@ impl CoordinatorServerHandle {
                 init_min_clients,
                 global_batch_size,
                 witness_nodes,
+                total_steps,
             ))
             .await
             .unwrap();
@@ -213,11 +237,19 @@ impl CoordinatorServerHandle {
         let server_port = server.port;
         let run_id = server.run_id.clone();
 
-        // the above line will stack overflow, for reasons best left to contemplative reflection.
-        // as a substitute to madness, we suggest the reader trust us on this point.
-        std::thread::spawn(move || {
-            rt.block_on(server.run());
-        });
+        // `block_on` polls the server on the thread that calls it, not on a
+        // runtime worker, so this thread needs the workers' stack. The server
+        // copies its ~94 KiB `Coordinator` by value as it ticks and
+        // broadcasts, which takes a little over the 2 MiB a spawned thread
+        // gets by default; the real server runs the same future on the
+        // process's main thread, which has 8 MiB.
+        std::thread::Builder::new()
+            .name("coordinator-server".to_string())
+            .stack_size(SERVER_STACK_SIZE)
+            .spawn(move || {
+                rt.block_on(server.run());
+            })
+            .expect("failed to spawn the coordinator server thread");
         debug!("coordinator server created on port {server_port}");
 
         Self {
@@ -295,6 +327,15 @@ impl CoordinatorServerHandle {
     pub async fn get_coordinator(&self) -> Coordinator {
         let (send, recv) = oneshot::channel::<Coordinator>();
         let msg = TestingQueryMsg::Coordinator { respond_to: send };
+        let _ = self.query_chan_sender.send(msg).await;
+        recv.await.expect("Coordinator actor task has been killed")
+    }
+
+    /// Pauses the run, or resumes it if it is paused, as the server's
+    /// dashboard does.
+    pub async fn toggle_pause(&self) {
+        let (send, recv) = oneshot::channel::<()>();
+        let msg = TestingQueryMsg::TogglePause { respond_to: send };
         let _ = self.query_chan_sender.send(msg).await;
         recv.await.expect("Coordinator actor task has been killed")
     }

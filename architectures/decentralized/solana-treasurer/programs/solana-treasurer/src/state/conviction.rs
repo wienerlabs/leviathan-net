@@ -4,8 +4,71 @@ use psyche_coordinator::Coordinator;
 use psyche_coordinator::RunState;
 use psyche_solana_coordinator::CoordinatorAccount;
 
+use crate::state::AuditVerdict;
 use crate::state::EjectionCharge;
+use crate::state::Run;
 use crate::ProgramError;
+
+/// Whether `user` was ejected in the epoch under way, by a conviction, an
+/// authority slash or an equivocation: the ledger charges that ejection only
+/// when the epoch ends. An epoch's roster is cleared when the next one starts,
+/// and between the two no charge is pending, so an ejection already charged
+/// is never read here.
+pub fn ejection_pending_charge(coordinator: &Coordinator, user: &Pubkey) -> bool {
+    let signer = user.to_bytes();
+    coordinator.charges_pending()
+        && coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .chain(coordinator.epoch_state.exited_clients.iter())
+            .any(|client| {
+                *client.id.signer() == signer
+                    && client.state == ClientState::Ejected
+            })
+}
+
+/// What `user`'s bond still owes to slashes the ledger in `account` has not
+/// charged yet, at `now` in `run`: an ejection in the epoch under way, and its
+/// own conviction, `own_verdict`, if that cannot be overturned any more but
+/// has not landed (`AuditVerdict::unledgered_charge`).
+///
+/// The bond checks read what the ledger charged. Neither of these reached it
+/// yet, so each used to count for nothing there, and its target joined,
+/// claimed and voted on a bond it was about to lose. An ejection is charged at
+/// the epoch's rate. A conviction that lands later is charged at the rate of
+/// the epoch it lands in, or at the withdrawal at the rate then, so it counts
+/// at the higher of this epoch's rate and the next one's.
+pub fn unledgered_conviction_charge(
+    run: &Run,
+    account: &CoordinatorAccount,
+    user: &Pubkey,
+    own_verdict: Option<&AuditVerdict>,
+    now: i64,
+) -> u64 {
+    let rates = &account.state.clients_state;
+    let epoch_rate = rates.current_epoch_rates.slashing_rate_per_client;
+    let ejection = if ejection_pending_charge(&account.state.coordinator, user)
+    {
+        epoch_rate
+    } else {
+        0
+    };
+    let landing_rate =
+        epoch_rate.max(rates.future_epoch_rates.slashing_rate_per_client);
+    let conviction = own_verdict.map_or(0, |verdict| {
+        verdict.unledgered_charge(run, now, landing_rate)
+    });
+    ejection.saturating_add(conviction)
+}
+
+/// The verdict at a participant's own verdict PDA, read from the account
+/// passed for it. The address is pinned by the caller's seeds, so an empty
+/// account there means the participant was never disputed.
+pub fn read_own_verdict(account: &AccountInfo) -> Result<Option<AuditVerdict>> {
+    let data = account.try_borrow_data()?;
+    AuditVerdict::from_pda_account(account.owner, &data)
+}
 
 /// What the ledger will charge an ejection landed now, in the epoch the
 /// coordinator in `account` is in.
@@ -190,5 +253,55 @@ mod tests {
             conviction_landing(&coordinator, &Pubkey::new_unique(), 1).unwrap(),
             Landing::Due,
         );
+    }
+
+    /// An ejection is owed from when it lands until its epoch is charged:
+    /// on the roster or among the clients that left this epoch, through
+    /// `Cooldown`. Once the epoch is over nothing is pending, and the next
+    /// epoch starts with a fresh roster.
+    #[test]
+    fn an_ejection_is_owed_until_its_epoch_is_charged() {
+        for run_state in [
+            RunState::RoundTrain,
+            RunState::RoundWitness,
+            RunState::Cooldown,
+        ] {
+            let coordinator = coordinator_with(run_state, ClientState::Ejected);
+            assert!(
+                ejection_pending_charge(&coordinator, &target()),
+                "{run_state}"
+            );
+        }
+
+        // Moved off the roster at the round's end, still this epoch's.
+        let mut left = coordinator_with(RunState::Cooldown, ClientState::Healthy);
+        let mut ejected = left.epoch_state.clients[1];
+        ejected.state = ClientState::Ejected;
+        left.epoch_state.exited_clients = FixedVec::from_iter([ejected]);
+        left.epoch_state.clients = FixedVec::from_iter([left.epoch_state.clients[0]]);
+        assert!(ejection_pending_charge(&left, &target()));
+
+        // Charged: the epoch is over.
+        for run_state in [RunState::WaitingForMembers, RunState::Paused] {
+            let coordinator = coordinator_with(run_state, ClientState::Ejected);
+            assert!(
+                !ejection_pending_charge(&coordinator, &target()),
+                "{run_state}"
+            );
+        }
+
+        // Not ejected, or someone else.
+        for state in [ClientState::Healthy, ClientState::Dropped, ClientState::Withdrawn] {
+            let coordinator = coordinator_with(RunState::RoundTrain, state);
+            assert!(
+                !ejection_pending_charge(&coordinator, &target()),
+                "{state:?}"
+            );
+        }
+        let coordinator = coordinator_with(RunState::RoundTrain, ClientState::Ejected);
+        assert!(!ejection_pending_charge(
+            &coordinator,
+            &Pubkey::new_from_array([1; 32])
+        ));
     }
 }

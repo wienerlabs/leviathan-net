@@ -16,6 +16,7 @@ use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::read_run_model;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
+use leviathan_verifier::ReplayWork;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_coordinator::model::Model;
 use psyche_coordinator::model::LLM;
@@ -36,9 +37,7 @@ use psyche_modeling::LocalTrainer;
 use psyche_modeling::ParallelModels;
 use psyche_modeling::Trainer;
 use psyche_network::SerializedDistroResult;
-use psyche_verifier::audit_round;
-use psyche_verifier::AuditOutcome;
-use psyche_verifier::Contribution;
+use psyche_verifier::audit_contribution;
 use psyche_verifier::DEFAULT_BAND;
 use tch::Device;
 use tch::Kind;
@@ -180,31 +179,26 @@ fn judged(llm: &LLM, submitted: Vec<f32>) -> psyche_verifier::BandVerdict {
         .replayable_step()
         .expect("the run's first step is replayable");
     assert_eq!(step, first_step());
+    let assignment = ReplayAssignment {
+        epoch_start: coordinator.epoch_state.start_timestamp,
+        step,
+        warmup_lr_between: coordinator.get_cold_start_warmup_bounds(),
+        batch_id: BatchId(ClosedInterval::new(0, 0)),
+        data: batch(llm),
+    };
+    let work = assignment.work();
     let engine = TrainerReplayEngine::new(
         build_replay_trainer(&config).unwrap(),
-        vec![ReplayAssignment {
-            target_index: 0,
-            step,
-            warmup_lr_between: coordinator.get_cold_start_warmup_bounds(),
-            batch_id: BatchId(ClosedInterval::new(0, 0)),
-            data: batch(llm),
-        }],
+        vec![assignment],
         Device::Cpu,
         config.quantize_1bit(),
     );
-    let outcomes = audit_round(
-        &engine,
-        &[Contribution {
-            target_index: 0,
-            submitted,
-        }],
-        DEFAULT_BAND,
-    );
-    match outcomes.into_iter().next().unwrap() {
-        AuditOutcome::Judged(report) => report.verdict,
-        AuditOutcome::ReplayFailed { error, .. } => panic!("replay failed: {error}"),
-        AuditOutcome::Malformed { error, .. } => panic!("malformed: {error}"),
-    }
+    let recomputed = engine
+        .replay_work(&work)
+        .unwrap_or_else(|error| panic!("replay failed: {error}"));
+    audit_contribution(0, &submitted, &recomputed, DEFAULT_BAND)
+        .unwrap_or_else(|error| panic!("malformed: {error}"))
+        .verdict
 }
 
 /// An honest node's first step clears the band. Replayed with the daemon's

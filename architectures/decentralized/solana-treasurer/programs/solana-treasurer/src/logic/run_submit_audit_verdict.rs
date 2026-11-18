@@ -16,10 +16,13 @@ use crate::state::transaction_proves_signature;
 use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
+use crate::state::VoteEvidence;
 use crate::state::MAX_VERDICT_VOTERS;
 use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
 use crate::state::committee_matches_roster;
+use crate::state::read_own_verdict;
+use crate::state::unledgered_conviction_charge;
 use crate::state::conviction_landing;
 use crate::state::ejection_charge;
 use crate::ProgramError;
@@ -101,6 +104,22 @@ pub struct RunSubmitAuditVerdictAccounts<'info> {
     /// precompile instruction proving the target signed the commitment.
     #[account(address = instructions_sysvar::ID)]
     pub instructions: UncheckedAccount<'info>,
+
+    /// CHECK: the verifier's own verdict, pinned to its PDA by the seeds below
+    /// and read only after this checks that it exists and belongs to this
+    /// program. A conviction there that stands but has not reached the ledger
+    /// still owes its charge, which the bond behind the vote has to cover
+    /// too. Last, so a client that passes it still works with a treasurer
+    /// that does not read it.
+    #[account(
+        seeds = [
+            AuditVerdict::SEEDS_PREFIX,
+            run.key().as_ref(),
+            verifier.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub verifier_verdict: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -121,7 +140,16 @@ pub fn run_submit_audit_verdict_processor(
     params: RunSubmitAuditVerdictParams,
 ) -> Result<()> {
     let verifier_key = context.accounts.verifier.key();
-    let tie_breaker_size = context.accounts.run.tie_breaker_committee_size;
+
+    // A later round can draw the target onto the committee judging it. Its
+    // vote is no verdict on itself: seated first, it fixed the evidence the
+    // rest of the round had to agree with.
+    if verifier_key == params.target {
+        return err!(ProgramError::VerifierIsTarget);
+    }
+    let verifier_verdict = read_own_verdict(
+        &context.accounts.verifier_verdict.to_account_info(),
+    )?;
 
     let (
         current_epoch,
@@ -136,14 +164,20 @@ pub fn run_submit_audit_verdict_processor(
 
         // A verdict that turns out wrong is paid for out of this bond, at the
         // epoch boundary after an overturn. So the bond that counts is the one
-        // still standing then: not what a conviction already charged, and not a
-        // withdrawal already requested, which could leave before the overturn
-        // reaches it (wienerlabs/leviathan-net#34).
-        if context
-            .accounts
-            .verifier_participant
-            .committed_bond(coordinator_slashed_points(&account, &verifier_key))
-            < context.accounts.run.bond_minimum_amount
+        // still standing then: not what a conviction already charged, not what
+        // a conviction of the verifier's own will charge once it reaches the
+        // ledger, and not a withdrawal already requested, which could leave
+        // before the overturn reaches it (wienerlabs/leviathan-net#34).
+        if context.accounts.verifier_participant.committed_bond_owing(
+            coordinator_slashed_points(&account, &verifier_key),
+            unledgered_conviction_charge(
+                &context.accounts.run,
+                &account,
+                &verifier_key,
+                verifier_verdict.as_ref(),
+                Clock::get()?.unix_timestamp,
+            ),
+        ) < context.accounts.run.bond_minimum_amount
         {
             return err!(ProgramError::BondBelowMinimum);
         }
@@ -162,9 +196,11 @@ pub fn run_submit_audit_verdict_processor(
             .position(|client| *client.id.signer() == verifier_key.to_bytes())
             .ok_or_else(|| error!(ProgramError::VerifierNotInEpoch))?;
 
-        let selection =
-            CommitteeSelection::from_coordinator_with_tie_breakers(coordinator, 0, tie_breaker_size)
-                .map_err(|_| error!(ProgramError::VerifierNotAssigned))?;
+        // The round's own draw, with the tie-breaker seats it reserves, which
+        // is the committee its clients train under and the audit lottery
+        // assigns from (wienerlabs/leviathan#15, finding 4).
+        let selection = CommitteeSelection::from_coordinator(coordinator, 0)
+            .map_err(|_| error!(ProgramError::VerifierNotAssigned))?;
         if selection.get_committee(verifier_index as u64).committee != Committee::Verifier {
             return err!(ProgramError::VerifierNotAssigned);
         }
@@ -244,6 +280,7 @@ pub fn run_submit_audit_verdict_processor(
     }
 
     let should_slash;
+    let recorded;
     {
         let verdict = &mut context.accounts.audit_verdict;
         let fresh_account = verdict.run == Pubkey::default();
@@ -275,43 +312,47 @@ pub fn run_submit_audit_verdict_processor(
             return err!(ProgramError::VerdictVotersFull);
         }
 
-        // The evidence is written once, by whoever votes first, and every later
-        // vote has to agree with it. Letting each vote overwrite it meant the
-        // verifier who completed the quorum decided what the on-chain record
-        // said, which is the only thing an appeal bench or an observer can check
-        // (finding 9). Two verifiers who disagree about what they replayed is
-        // information, and it belongs in a rejected transaction rather than
-        // silently in the last writer's favour.
-        if verdict.voters.is_empty() {
-            verdict.committed_hash = committed_hash;
-            verdict.evidence = params.evidence;
-            verdict.replayed_hash = params.replayed_hash;
-            verdict.target_index = params.target_index;
-            verdict.batch_start = params.batch_start;
-            verdict.batch_end = params.batch_end;
-        } else if verdict.committed_hash != committed_hash
-            || verdict.evidence != params.evidence
-            || verdict.replayed_hash != params.replayed_hash
-            || verdict.target_index != params.target_index
-            || verdict.batch_start != params.batch_start
-            || verdict.batch_end != params.batch_end
-        {
-            return err!(ProgramError::EvidenceMismatch);
-        }
-
-        verdict.voters.push(verifier_key);
-        verdict.verdict_count += 1;
+        // Votes are counted per payload the target signed, and a quorum is two
+        // thirds of the committee agreeing on one. The first vote used to fix
+        // the evidence every later vote had to match, the replayed hash
+        // included: one seat citing another of the target's payloads, all of
+        // which are broadcast, vetoed the round, and honest verifiers whose
+        // replays differ in the last bits never reached a quorum at all. The
+        // verdict records the evidence most votes are for, so the record a
+        // quorum leaves is still the one its votes agreed on (finding 9).
+        let agreeing = verdict.cast_vote(
+            verifier_key,
+            VoteEvidence {
+                committed_hash,
+                evidence: params.evidence,
+                target_index: params.target_index,
+                batch_start: params.batch_start,
+                batch_end: params.batch_end,
+                replayed_hash: params.replayed_hash,
+            },
+        );
         context.accounts.verifier_participant.open_verdict_vote()?;
 
         msg!(
-            "audit_verdict: target_index={} epoch={} round={} count={} quorum={}",
+            "audit_verdict: target_index={} epoch={} round={} count={} recorded={} quorum={}",
             params.target_index,
             current_epoch,
             current_round,
+            agreeing,
             verdict.verdict_count,
             quorum
         );
 
+        // The quorum is the recorded evidence's, and so is what a slash
+        // charges: the verdict, not the vote that happened to complete it, is
+        // what an appeal and every reader of the account see.
+        recorded = SlashClientParams {
+            index: verdict.target_index,
+            batch_start: verdict.batch_start,
+            batch_end: verdict.batch_end,
+            committed_hash: verdict.committed_hash,
+            replayed_hash: verdict.replayed_hash,
+        };
         let quorum_reached = (verdict.verdict_count as u64) >= quorum;
         if quorum_reached {
             if context.accounts.run.challenge_window_seconds > 0 {
@@ -361,13 +402,7 @@ pub fn run_submit_audit_verdict_processor(
                 },
             )
             .with_signer(run_signer_seeds),
-            SlashClientParams {
-                index: params.target_index,
-                batch_start: params.batch_start,
-                batch_end: params.batch_end,
-                committed_hash,
-                replayed_hash: params.replayed_hash,
-            },
+            recorded,
         )?;
     }
 

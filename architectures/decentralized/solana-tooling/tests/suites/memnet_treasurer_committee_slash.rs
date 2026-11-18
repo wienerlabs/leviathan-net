@@ -17,7 +17,6 @@ use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
 use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_tooling::create_memnet_endpoint::create_memnet_endpoint;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_create;
 use psyche_solana_tooling::process_authorizer_instructions::process_authorizer_authorization_grantor_update;
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_join_run;
@@ -301,14 +300,8 @@ pub async fn run() {
         .iter()
         .position(|k| k.pubkey() == target_key)
         .unwrap();
-    let tie_breakers = get_run(&mut endpoint, &run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     let commitment = signed_payload(
         &state.coordinator,
-        tie_breakers,
         &identity(&clients[cheater], &p2ps[cheater]),
         &p2ps[cheater],
         FRAUD_PAYLOAD,

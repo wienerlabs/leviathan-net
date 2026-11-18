@@ -211,6 +211,14 @@ impl Client {
                             }
 
                             run.apply_state(*new_state).await?;
+                            // A finished run has nothing left for this client to do but
+                            // wait for its last checkpoint, which the shutdown below does
+                            // (wienerlabs/leviathan-net#82).
+                            if run.is_finished() {
+                                info!(client_id = %identity, "The run is finished");
+                                wait_for_checkpoint = run.doing_checkpoint();
+                                break;
+                            }
                             {
                                 let current_step = run.coordinator_state().map(|s| s.progress.step).unwrap_or(0);
                                 let role = {
@@ -705,9 +713,26 @@ impl Client {
                     info!("All checkpoints finished, exiting main client loop");
                 }
 
-                p2p_shutdown
+                // Every upload is done once its outcome is read, so whatever
+                // checkpoint any of them left, before the wait above looked or
+                // after its last look, is in the channel by then and still goes
+                // out. Networking shuts down either way, and then the first
+                // failure fails the shutdown: an upload that failed, a
+                // checkpoint that could not be sent, or p2p
+                // (wienerlabs/leviathan-net#82).
+                let uploads = run.finish_uploads().await;
+                let mut sent = Ok(());
+                while let Ok(checkpoint) = rx_checkpoint.try_recv() {
+                    info!("Checkpoint upload completed, sending to Solana");
+                    let sending = watcher.backend_mut().send_checkpoint(checkpoint).await;
+                    if sent.is_ok() {
+                        sent = sending;
+                    }
+                }
+                let down = p2p_shutdown
                     .await
-                    .map_err(|e| anyhow!("Error shutting down p2p: {e}"))
+                    .map_err(|e| anyhow!("Error shutting down p2p: {e}"));
+                uploads.and(sent).and(down)
             }
         });
 

@@ -14,7 +14,7 @@ use psyche_coordinator::CommitteeSelection;
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::RunState;
 use psyche_core::payload_commitment_run;
-use psyche_solana_tooling::get_accounts::get_run;
+use psyche_solana_coordinator::CoordinatorInstanceState;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use psyche_solana_tooling::process_treasurer_instructions::run_slash_instruction;
 use psyche_solana_tooling::process_treasurer_instructions::run_submit_audit_verdict_instruction;
@@ -383,12 +383,12 @@ pub async fn no_payload_is_assigned_in_a_warmup() {
     let coordinator = harness.state().await.coordinator;
     let identity = harness.nodes[SUBJECT].identity();
     assert!(
-        signed_commitment::payload_header(&coordinator, 0, &identity).is_err()
+        signed_commitment::payload_header(&coordinator, &identity).is_err()
     );
     harness.advance_to(RunState::RoundTrain).await;
     let coordinator = harness.state().await.coordinator;
     assert!(
-        signed_commitment::payload_header(&coordinator, 0, &identity).is_ok()
+        signed_commitment::payload_header(&coordinator, &identity).is_ok()
     );
 }
 
@@ -413,18 +413,8 @@ async fn committee_run(index: u64, run_id: &str) -> Harness {
 
 /// The verifiers and the trainers drawn for the round under way.
 async fn committee(harness: &mut Harness) -> (Vec<usize>, Vec<usize>) {
-    let tie_breakers = get_run(&mut harness.endpoint, &harness.run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     let coordinator = harness.state().await.coordinator;
-    let selection = CommitteeSelection::from_coordinator_with_tie_breakers(
-        &coordinator,
-        0,
-        tie_breakers,
-    )
-    .unwrap();
+    let selection = CommitteeSelection::from_coordinator(&coordinator, 0).unwrap();
     let (mut verifiers, mut trainers) = (vec![], vec![]);
     for node in harness.roster().await {
         let index = harness.roster_index(node).await;
@@ -443,6 +433,19 @@ async fn vote(
     target: usize,
     commitment: &SignedCommitment,
 ) -> anyhow::Result<()> {
+    vote_replayed(harness, verifier, target, commitment, replayed_digest())
+        .await
+}
+
+/// `vote`, with the verifier's own replay of the payload hashing to
+/// `replayed_hash`.
+async fn vote_replayed(
+    harness: &mut Harness,
+    verifier: usize,
+    target: usize,
+    commitment: &SignedCommitment,
+    replayed_hash: [u8; 32],
+) -> anyhow::Result<()> {
     let target_index = harness.roster_index(target).await;
     let target_key = harness.nodes[target].wallet.pubkey();
     process_treasurer_run_submit_audit_verdict(
@@ -455,9 +458,40 @@ async fn vote(
         &target_key,
         target_index,
         commitment,
-        replayed_digest(),
+        replayed_hash,
     )
     .await
+}
+
+/// Runs the run on into the next round's training, every node rejoining
+/// when the epoch ends first.
+async fn next_round(harness: &mut Harness, nodes: usize) {
+    let at = |state: &CoordinatorInstanceState| {
+        let coordinator = &state.coordinator;
+        (
+            coordinator.progress.epoch,
+            coordinator.current_round().map(|round| round.height),
+        )
+    };
+    let start = at(&harness.state().await);
+    let mut rejoined = None;
+    for _ in 0..200 {
+        harness.step().await;
+        let state = harness.state().await;
+        match state.coordinator.run_state {
+            RunState::RoundTrain if at(&state) != start => return,
+            RunState::WaitingForMembers
+                if rejoined != Some(state.coordinator.progress.epoch) =>
+            {
+                rejoined = Some(state.coordinator.progress.epoch);
+                for node in 0..nodes {
+                    harness.join(node).await.unwrap();
+                }
+            },
+            _ => {},
+        }
+    }
+    panic!("the run never reached another round");
 }
 
 async fn verdict_of(harness: &mut Harness, target: usize) -> AuditVerdict {
@@ -564,12 +598,16 @@ pub async fn a_vote_on_a_commitment_signed_by_another_key_is_refused() {
     );
 }
 
-/// Every vote has to agree with the evidence the first one recorded, even a
-/// vote on another commitment the target really signed.
+/// Votes are counted per payload the target signed. A vote citing another
+/// payload it really signed, broadcast like every payload, is counted apart:
+/// cast first, it no longer fixes the evidence every later vote has to match,
+/// so one seat cannot veto what the rest of the committee agrees on. The
+/// verdict records the payload the quorum is for.
 #[tokio::test]
-pub async fn a_later_vote_on_other_signed_evidence_is_refused() {
+pub async fn a_vote_on_other_signed_evidence_cannot_veto_the_quorum() {
     let mut harness = committee_run(441, "Leviathan split evidence").await;
     let (verifiers, trainers) = committee(&mut harness).await;
+    assert_eq!(verifiers.len(), 3, "a committee of three, a quorum of two");
     let target = trainers[0];
     let first = harness.signed_payload(target).await;
     let other = SignedCommitment::sign(
@@ -578,18 +616,93 @@ pub async fn a_later_vote_on_other_signed_evidence_is_refused() {
         first.header(),
         payload_digest(HONEST_PAYLOAD),
     );
-    vote(&mut harness, verifiers[0], target, &first)
+    vote(&mut harness, verifiers[0], target, &other)
         .await
         .unwrap();
-    assert_eq!(
-        refusal_code(vote(&mut harness, verifiers[1], target, &other).await),
-        treasurer_refusal(ProgramError::EvidenceMismatch),
-    );
     vote(&mut harness, verifiers[1], target, &first)
         .await
         .unwrap();
     assert_eq!(
         verdict_of(&mut harness, target).await.status,
-        VerdictStatus::Upheld
+        VerdictStatus::Voting,
+        "one vote for each is no quorum"
+    );
+    vote(&mut harness, verifiers[2], target, &first)
+        .await
+        .unwrap();
+
+    let verdict = verdict_of(&mut harness, target).await;
+    assert_eq!(verdict.status, VerdictStatus::Upheld);
+    assert_eq!(verdict.committed_hash, first.committed_hash());
+    assert_eq!(verdict.evidence, first.evidence);
+    assert_eq!(verdict.verdict_count, 2);
+    assert_eq!(verdict.voters.len(), 3);
+    assert!(verdict.dissents(0));
+    let voters: Vec<_> = verifiers[1..]
+        .iter()
+        .map(|node| harness.nodes[*node].wallet.pubkey())
+        .collect();
+    assert_eq!(
+        verdict.bounty_recipients(),
+        voters,
+        "the bounty is the quorum's, not the dissenting vote's"
+    );
+}
+
+/// Verifiers replay within the tolerance band of each other, not bit for bit,
+/// so two votes on the same payload count together whatever their replays
+/// hashed to.
+#[tokio::test]
+pub async fn votes_whose_replays_hashed_apart_still_reach_a_quorum() {
+    let mut harness = committee_run(443, "Leviathan replays apart").await;
+    let (verifiers, trainers) = committee(&mut harness).await;
+    let target = trainers[0];
+    let commitment = harness.signed_payload(target).await;
+    vote_replayed(&mut harness, verifiers[0], target, &commitment, [0x11; 32])
+        .await
+        .unwrap();
+    vote_replayed(&mut harness, verifiers[1], target, &commitment, [0x22; 32])
+        .await
+        .unwrap();
+    let verdict = verdict_of(&mut harness, target).await;
+    assert_eq!(verdict.status, VerdictStatus::Upheld);
+    assert_eq!(verdict.replayed_hash, [0x11; 32]);
+}
+
+/// A later round can draw the target onto the committee judging it, with a
+/// payload it signed earlier in the epoch still open to conviction. Its vote
+/// on itself is refused: cast first, it fixed the evidence the rest of the
+/// round had to agree with.
+#[tokio::test]
+pub async fn the_target_cannot_vote_on_its_own_verdict() {
+    let mut harness = committee_run(442, "Leviathan self vote").await;
+    let (_, trainers) = committee(&mut harness).await;
+    let target = trainers[0];
+    let mut signed = (
+        harness.state().await.coordinator.progress.epoch,
+        harness.signed_payload(target).await,
+    );
+    let commitment = loop {
+        next_round(&mut harness, 6).await;
+        let epoch = harness.state().await.coordinator.progress.epoch;
+        let (verifiers, trainers) = committee(&mut harness).await;
+        if verifiers.contains(&target) && signed.0 == epoch {
+            break signed.1;
+        }
+        if trainers.contains(&target) {
+            signed = (epoch, harness.signed_payload(target).await);
+        }
+    };
+    assert_eq!(
+        refusal_code(vote(&mut harness, target, target, &commitment).await),
+        treasurer_refusal(ProgramError::VerifierIsTarget),
+    );
+    let key = find_audit_verdict(
+        &harness.run,
+        &harness.nodes[target].wallet.pubkey(),
+    );
+    assert!(
+        harness.endpoint.get_account(&key).await.unwrap().is_none(),
+        "no dispute was opened by the target's own vote"
     );
 }

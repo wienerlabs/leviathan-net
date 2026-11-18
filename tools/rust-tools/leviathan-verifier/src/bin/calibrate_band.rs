@@ -33,6 +33,7 @@ use leviathan_verifier::replay_data_layout;
 use leviathan_verifier::write_token_dataset;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
+use leviathan_verifier::ReplayWork;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_core::BatchId;
 use psyche_core::ClosedInterval;
@@ -44,7 +45,6 @@ use psyche_data_provider::TokenizedDataProvider;
 use psyche_modeling::BatchDataCPU;
 use psyche_verifier::calibrate_band;
 use psyche_verifier::relative_l2_distance;
-use psyche_verifier::ReplayEngine;
 use psyche_verifier::DEFAULT_BAND;
 use psyche_verifier::DEFAULT_SAFETY_FACTOR;
 
@@ -103,22 +103,21 @@ fn compute_delta(
     let config = ReplayTrainerConfig::for_run(llm, repo_files.to_vec(), device, kind);
     let trainer = build_replay_trainer(&config)
         .with_context(|| format!("building trainer on {} {kind:?}", device_label(device)))?;
-    let engine = TrainerReplayEngine::new(
-        trainer,
-        vec![ReplayAssignment {
-            target_index: 0,
-            step,
-            // Each sample is a fresh trainer's first step, as in a run started
-            // directly, whose first epoch has no cold-start warmup bounds.
-            warmup_lr_between: None,
-            batch_id,
-            data,
-        }],
-        device,
-        config.quantize_1bit(),
-    );
+    let assignment = ReplayAssignment {
+        // A sample is not from a run, so it has no epoch to name.
+        epoch_start: 0,
+        step,
+        // Each sample is a fresh trainer's first step, as in a run started
+        // directly, whose first epoch has no cold-start warmup bounds.
+        warmup_lr_between: None,
+        batch_id,
+        data,
+    };
+    let work = assignment.work();
+    let engine =
+        TrainerReplayEngine::new(trainer, vec![assignment], device, config.quantize_1bit());
     engine
-        .replay(0)
+        .replay_work(&work)
         .map_err(|e| anyhow!("replay on {}: {e}", device_label(device)))
 }
 

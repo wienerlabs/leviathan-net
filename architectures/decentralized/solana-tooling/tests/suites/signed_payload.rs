@@ -14,7 +14,6 @@ use psyche_coordinator::Coordinator;
 use psyche_core::sha256;
 use psyche_core::NodeIdentity;
 use psyche_solana_tooling::get_accounts::get_coordinator_account_state;
-use psyche_solana_tooling::get_accounts::get_run;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
 #[cfg(feature = "daemon")]
 use psyche_solana_tooling::signed_commitment;
@@ -59,14 +58,12 @@ pub fn identity(wallet: &Keypair, p2p: &Keypair) -> NodeIdentity {
 /// with.
 pub fn signed_payload(
     coordinator: &Coordinator,
-    tie_breaker_committee_size: u16,
     node: &NodeIdentity,
     p2p: &Keypair,
     payload: &str,
 ) -> SignedCommitment {
     SignedCommitment::for_round(
         coordinator,
-        tie_breaker_committee_size,
         node,
         p2p,
         payload_digest(payload),
@@ -78,14 +75,9 @@ pub fn signed_payload(
 #[cfg(feature = "daemon")]
 pub fn payload_header(
     coordinator: &Coordinator,
-    tie_breaker_committee_size: u16,
     node: &NodeIdentity,
 ) -> PayloadHeader {
-    signed_commitment::payload_header(
-        coordinator,
-        tie_breaker_committee_size,
-        node,
-    )
+    signed_commitment::payload_header(coordinator, node)
     .expect("the node trains a batch this round")
 }
 
@@ -210,10 +202,6 @@ pub async fn slash_on_signed_payload(
     wallet: &Keypair,
     p2p: &Keypair,
 ) -> anyhow::Result<()> {
-    let tie_breakers = get_run(endpoint, run)
-        .await?
-        .expect("the run exists")
-        .tie_breaker_committee_size;
     let coordinator =
         get_coordinator_account_state(endpoint, coordinator_account)
             .await?
@@ -221,7 +209,6 @@ pub async fn slash_on_signed_payload(
             .coordinator;
     let commitment = signed_payload(
         &coordinator,
-        tie_breakers,
         &identity(wallet, p2p),
         p2p,
         FRAUD_PAYLOAD,

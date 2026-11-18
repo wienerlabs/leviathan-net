@@ -7,6 +7,7 @@ use leviathan_verifier::replay_epoch;
 use leviathan_verifier::DumpKey;
 use leviathan_verifier::write_token_dataset;
 use leviathan_verifier::ReplayAssignment;
+use leviathan_verifier::ReplayWork;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_core::Barrier;
 use psyche_core::BatchId;
@@ -32,9 +33,9 @@ use psyche_network::distro_results_to_bytes;
 use psyche_network::SerializedDistroResult;
 use psyche_modeling::ParallelModels;
 use psyche_modeling::Trainer;
-use psyche_verifier::audit_round;
-use psyche_verifier::AuditOutcome;
-use psyche_verifier::Contribution;
+use psyche_verifier::audit_contribution;
+use psyche_verifier::AuditReport;
+use psyche_verifier::ReplayError;
 use psyche_verifier::DEFAULT_BAND;
 use tch::Device;
 use tch::Kind;
@@ -43,6 +44,8 @@ use tokio_util::sync::CancellationToken;
 const MODEL: &str = "pefontana/Nano-Llama";
 const SEQUENCE_LENGTH: usize = 64;
 const STEP: u32 = 1;
+/// When the epoch the suite's dumps were trained in started.
+const EPOCH_START: u64 = 1_700_000_000;
 
 fn distro_optimizer() -> OptimizerDefinition {
     OptimizerDefinition::Distro {
@@ -147,19 +150,53 @@ fn train_once(trainer: Trainer, data: Vec<BatchDataCPU>) -> (Trainer, Vec<f32>) 
     (output.trainer, dense)
 }
 
+/// The work the suite's dumps are for: batch `batch` of the run's first step.
+fn work(batch: u64) -> DumpKey {
+    DumpKey {
+        epoch_start: EPOCH_START,
+        step: STEP,
+        batch_id: BatchId(ClosedInterval::new(batch, batch)),
+    }
+}
+
+/// A batch of other samples than `sample_batch`'s, so its honest result is
+/// another.
+fn other_batch() -> Vec<BatchDataCPU> {
+    let input_ids: Vec<i32> = (0..SEQUENCE_LENGTH as i32).map(|i| (i * 7 + 3) % 29).collect();
+    vec![BatchDataCPU {
+        input_ids,
+        labels: None,
+        position_ids: None,
+        sequence_lengths: None,
+    }]
+}
+
+fn assignment(work: DumpKey, data: Vec<BatchDataCPU>) -> ReplayAssignment {
+    ReplayAssignment {
+        epoch_start: work.epoch_start,
+        step: work.step,
+        warmup_lr_between: None,
+        batch_id: work.batch_id,
+        data,
+    }
+}
+
 fn engine_with_assignment(trainer: Trainer) -> TrainerReplayEngine {
     TrainerReplayEngine::new(
         trainer,
-        vec![ReplayAssignment {
-            target_index: 0,
-            step: STEP,
-            warmup_lr_between: None,
-            batch_id: BatchId(ClosedInterval::new(0, 0)),
-            data: sample_batch(),
-        }],
+        vec![assignment(work(0), sample_batch())],
         Device::Cpu,
         quantize_1bit(),
     )
+}
+
+/// `submitted` judged against `engine`'s replay of `work`.
+fn judge(engine: &TrainerReplayEngine, work: DumpKey, submitted: &[f32]) -> AuditReport {
+    let recomputed = engine
+        .replay_work(&work)
+        .unwrap_or_else(|error| panic!("replay failed: {error}"));
+    audit_contribution(0, submitted, &recomputed, DEFAULT_BAND)
+        .unwrap_or_else(|error| panic!("malformed: {error}"))
 }
 
 #[test]
@@ -171,24 +208,12 @@ fn recomputed_reference_clears_an_honest_contribution() {
     );
 
     let engine = engine_with_assignment(build_trainer());
-    let outcomes = audit_round(
-        &engine,
-        &[Contribution {
-            target_index: 0,
-            submitted,
-        }],
-        DEFAULT_BAND,
+    let report = judge(&engine, work(0), &submitted);
+    assert!(
+        !report.verdict.fraud,
+        "an honestly trained delta must clear a recomputed reference, distance was {}",
+        report.verdict.distance
     );
-
-    match &outcomes[0] {
-        AuditOutcome::Judged(report) => assert!(
-            !report.verdict.fraud,
-            "an honestly trained delta must clear a recomputed reference, distance was {}",
-            report.verdict.distance
-        ),
-        AuditOutcome::ReplayFailed { error, .. } => panic!("replay failed: {error}"),
-        AuditOutcome::Malformed { error, .. } => panic!("malformed: {error}"),
-    }
 }
 
 #[test]
@@ -197,27 +222,46 @@ fn recomputed_reference_catches_a_forged_contribution() {
     let forged: Vec<f32> = honest.iter().map(|v| -5.0 * v).collect();
 
     let engine = engine_with_assignment(build_trainer());
-    let outcomes = audit_round(
-        &engine,
-        &[Contribution {
-            target_index: 0,
-            submitted: forged,
-        }],
-        DEFAULT_BAND,
+    let report = judge(&engine, work(0), &forged);
+    assert!(
+        report.verdict.fraud,
+        "a sign-flipped delta must be caught, distance was {}",
+        report.verdict.distance
     );
+    assert!(report.proof.is_some(), "a conviction must carry a fraud proof");
+}
 
-    match &outcomes[0] {
-        AuditOutcome::Judged(report) => {
-            assert!(
-                report.verdict.fraud,
-                "a sign-flipped delta must be caught, distance was {}",
-                report.verdict.distance
-            );
-            assert!(report.proof.is_some(), "a conviction must carry a fraud proof");
-        }
-        AuditOutcome::ReplayFailed { error, .. } => panic!("replay failed: {error}"),
-        AuditOutcome::Malformed { error, .. } => panic!("malformed: {error}"),
-    }
+/// An engine holding several pieces of work replays the one it is asked for,
+/// by the work's own name, in whatever order it was given them. An honest
+/// result clears the replay of its own batch and is far from another's, which
+/// is why a payload must never be paired with a replay by anything but the
+/// work it names: paired by roster position, an honest node whose seat moved
+/// would be judged against someone else's batch and convicted.
+#[test]
+fn a_replay_is_of_the_work_it_names() {
+    let (_, honest) = train_once(build_trainer(), sample_batch());
+
+    let engine = TrainerReplayEngine::new(
+        build_trainer(),
+        vec![
+            assignment(work(1), other_batch()),
+            assignment(work(0), sample_batch()),
+        ],
+        Device::Cpu,
+        quantize_1bit(),
+    );
+    let own = judge(&engine, work(0), &honest);
+    assert!(
+        !own.verdict.fraud,
+        "an honest result was convicted against the replay of its own batch, distance {}",
+        own.verdict.distance
+    );
+    let other = judge(&engine, work(1), &honest);
+    assert!(
+        other.verdict.fraud,
+        "the replay of another batch is not a reference for this one, distance {}",
+        other.verdict.distance
+    );
 }
 
 #[test]
@@ -288,7 +332,7 @@ async fn a_verifier_replays_the_exact_batch_its_target_pulled_from_the_dataset()
     let engine = TrainerReplayEngine::new(
         build_trainer(),
         vec![ReplayAssignment {
-            target_index: 0,
+            epoch_start: EPOCH_START,
             step: STEP,
             warmup_lr_between: None,
             batch_id,
@@ -351,21 +395,37 @@ fn the_epoch_replayed_is_the_only_one_or_the_one_named() {
     assert_eq!(replay_epoch(&restarted, 1, Some(190)).unwrap(), Some(190));
 }
 
+/// Work the engine was not given is refused rather than replayed from some
+/// other assignment: another batch of the step, or the same batch trained in
+/// another epoch.
 #[test]
-fn an_unassigned_target_is_refused_rather_than_convicted() {
-    let trainer = build_trainer();
-    let engine = engine_with_assignment(trainer);
-    let outcomes = audit_round(
-        &engine,
-        &[Contribution {
-            target_index: 7,
-            submitted: vec![0.0; 8],
-        }],
-        DEFAULT_BAND,
-    );
+fn unassigned_work_is_refused_rather_than_convicted() {
+    let engine = engine_with_assignment(build_trainer());
+    let elsewhere = DumpKey {
+        epoch_start: EPOCH_START + 90,
+        ..work(0)
+    };
+    for unassigned in [work(7), elsewhere] {
+        assert_eq!(
+            engine.replay_work(&unassigned),
+            Err(ReplayError::WorkNotAssigned(unassigned.to_string())),
+            "{unassigned} was not assigned and must not be judged",
+        );
+    }
+}
 
-    assert!(
-        matches!(&outcomes[0], AuditOutcome::ReplayFailed { .. }),
-        "a target this verifier was not assigned must not be judged",
-    );
+/// The work's name is the one its dump carries, so a work key read from a
+/// dump finds the assignment made for it.
+#[test]
+fn a_work_key_reads_back_from_its_name() {
+    for key in [
+        work(0),
+        work(15),
+        DumpKey {
+            batch_id: BatchId(ClosedInterval::new(12, 19)),
+            ..work(0)
+        },
+    ] {
+        assert_eq!(parse_assignment_key(&key.to_string()), Some(key));
+    }
 }

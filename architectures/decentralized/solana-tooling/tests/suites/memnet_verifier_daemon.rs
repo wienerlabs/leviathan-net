@@ -39,7 +39,6 @@ use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use solana_sdk::signature::Keypair;
-use psyche_solana_tooling::get_accounts::get_run;
 use solana_sdk::signer::Signer;
 
 use super::signed_payload::dump_name;
@@ -364,16 +363,10 @@ pub async fn run() {
     }
 
     let state = coordinator_state(&mut endpoint, &coordinator_account).await;
-    let tie_breakers = get_run(&mut endpoint, &run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     // The cheater's payload for the batch it was assigned in the round under
     // way, and the honest result for that batch the daemon compares it to.
     let header = payload_header(
         &state.coordinator,
-        tie_breakers,
         &identity(&clients[cheater], &p2ps[cheater]),
     );
     // The run every commitment here is made in, as the coordinator names it.
@@ -453,7 +446,6 @@ pub async fn run() {
     let short = (cheater + 1) % clients.len();
     let short_header = payload_header(
         &state.coordinator,
-        tie_breakers,
         &identity(&clients[short], &p2ps[short]),
     );
     keep_reference(
@@ -485,7 +477,6 @@ pub async fn run() {
     let shrunk = (cheater + 2) % clients.len();
     let shrunk_header = payload_header(
         &state.coordinator,
-        tie_breakers,
         &identity(&clients[shrunk], &p2ps[shrunk]),
     );
     keep_reference(

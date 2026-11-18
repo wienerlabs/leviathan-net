@@ -45,16 +45,19 @@ use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run
 use psyche_solana_treasurer::logic::RunBondConfigUpdateParams;
 use psyche_solana_treasurer::logic::RunCreateParams;
 use psyche_solana_treasurer::logic::RunUpdateParams;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
-use psyche_solana_tooling::get_accounts::get_run;
 use solana_sdk::signer::Signer;
+use solana_toolbox_endpoint::ToolboxEndpoint;
 
 use super::signed_payload::identity;
 use super::signed_payload::keep_signed_payload;
 use super::signed_payload::payload_header;
+use super::signed_payload::slash_on_signed_payload;
 use super::chain_state::coordinator_state;
 
 const RUN_ID: &str = "Leviathan daemon replay slash";
+const RUN_ID_MOVED: &str = "Leviathan replay moved seat";
 const BOND: u64 = 500;
 const SLASHING_RATE: u64 = 200;
 
@@ -109,6 +112,32 @@ fn first_step_payload(
     step: u32,
     batch_id: BatchId,
 ) -> Vec<DistroResult> {
+    first_step_payload_on(llm, coordinator, step, batch_id, batch_data(llm))
+}
+
+/// The samples of `batch_id` in a dataset whose batches differ from one
+/// another, so that one batch's honest result is not another's.
+fn distinct_batch_data(llm: &LLM, batch_id: BatchId) -> Vec<BatchDataCPU> {
+    let offset = batch_id.0.start as i32;
+    let input_ids: Vec<i32> = (0..llm.max_seq_len as i32)
+        .map(|i| (i * 7 + offset * 11 + 3) % 29)
+        .collect();
+    vec![BatchDataCPU {
+        input_ids,
+        labels: None,
+        position_ids: None,
+        sequence_lengths: None,
+    }]
+}
+
+/// As `first_step_payload`, trained on `data`.
+fn first_step_payload_on(
+    llm: &LLM,
+    coordinator: &Coordinator,
+    step: u32,
+    batch_id: BatchId,
+    data: Vec<BatchDataCPU>,
+) -> Vec<DistroResult> {
     let (trainer, config) = trainer_for(llm);
     let warmup = coordinator.get_cold_start_warmup_bounds();
     let output = trainer
@@ -116,7 +145,7 @@ fn first_step_payload(
             step,
             Batch {
                 id: batch_id,
-                data: BatchData::CPU(batch_data(llm)),
+                data: BatchData::CPU(data),
             },
             warmup,
             warmup.is_some(),
@@ -146,8 +175,31 @@ fn flipped(payload: &[DistroResult]) -> Vec<DistroResult> {
         .collect()
 }
 
-#[tokio::test]
-pub async fn run() {
+/// The pieces of a bonded run the replay suites drive.
+struct ReplayRun {
+    endpoint: ToolboxEndpoint,
+    payer: Keypair,
+    main_authority: Keypair,
+    ticker: Keypair,
+    run: Pubkey,
+    coordinator_instance: Pubkey,
+    coordinator_account: Pubkey,
+    clients: Vec<Keypair>,
+    p2ps: Vec<Keypair>,
+}
+
+const WARMUP_TIME: u64 = 10;
+const ROUND_WITNESS_TIME: u64 = 10;
+const COOLDOWN_TIME: u64 = 88;
+
+/// A run of the genesis rehearsal model with four clients, `bonded` of them
+/// bonded, ticked into its first round: the round that trains the run's first
+/// step, the one step a replay reproduces.
+async fn start_replay_run(
+    run_index: u64,
+    run_id: &str,
+    bonded: &[usize],
+) -> ReplayRun {
     let mut endpoint = create_memnet_endpoint().await;
 
     let payer = Keypair::new();
@@ -169,10 +221,9 @@ pub async fn run() {
         clients.push(Keypair::new());
     }
     let p2ps: Vec<Keypair> = clients.iter().map(|_| Keypair::new()).collect();
-    let cheater = 0usize;
-    let warmup_time = 10;
-    let round_witness_time = 10;
-    let cooldown_time = 88;
+    let warmup_time = WARMUP_TIME;
+    let round_witness_time = ROUND_WITNESS_TIME;
+    let cooldown_time = COOLDOWN_TIME;
 
     let collateral_mint = endpoint
         .process_spl_token_mint_new(&payer, &mint_authority.pubkey(), None, 0)
@@ -194,8 +245,8 @@ pub async fn run() {
         &collateral_mint,
         &coordinator_account,
         RunCreateParams {
-            index: 74,
-            run_id: RUN_ID.to_string(),
+            index: run_index,
+            run_id: run_id.to_string(),
             main_authority: main_authority.pubkey(),
             join_authority: join_authority.pubkey(),
             client_version: "latest".to_string(),
@@ -240,17 +291,19 @@ pub async fn run() {
             .unwrap();
     }
 
-    process_treasurer_participant_bond_deposit(
-        &mut endpoint,
-        &payer,
-        &clients[cheater],
-        &clients_collateral[cheater],
-        &collateral_mint,
-        &run,
-        BOND,
-    )
-    .await
-    .unwrap();
+    for node in bonded {
+        process_treasurer_participant_bond_deposit(
+            &mut endpoint,
+            &payer,
+            &clients[*node],
+            &clients_collateral[*node],
+            &collateral_mint,
+            &run,
+            BOND,
+        )
+        .await
+        .unwrap();
+    }
 
     process_treasurer_run_update(
         &mut endpoint,
@@ -347,19 +400,102 @@ pub async fn run() {
     .await
     .unwrap();
 
+    ReplayRun {
+        endpoint,
+        payer,
+        main_authority,
+        ticker,
+        run,
+        coordinator_instance,
+        coordinator_account,
+        clients,
+        p2ps,
+    }
+}
+
+/// Every client the round draws as a witness reports it, and the run is ticked
+/// on past its witness phase.
+async fn witness_round(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    ticker: &Keypair,
+    clients: &[Keypair],
+    coordinator_instance: &Pubkey,
+    coordinator_account: &Pubkey,
+) {
+    let state = coordinator_state(endpoint, coordinator_account).await;
+    for client in clients {
+        let position = state
+            .coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|c| *c.id.signer() == client.pubkey().to_bytes());
+        let Some(position) = position else {
+            continue;
+        };
+        let witness_proof =
+            CommitteeSelection::from_coordinator(&state.coordinator, 0)
+                .unwrap()
+                .get_witness(position as u64);
+        if witness_proof.position >= SOLANA_MAX_NUM_WITNESSES as u64 {
+            continue;
+        }
+        process_coordinator_witness(
+            endpoint,
+            payer,
+            client,
+            coordinator_instance,
+            coordinator_account,
+            &Witness {
+                proof: witness_proof,
+                participant_bloom: Default::default(),
+                broadcast_bloom: Default::default(),
+                broadcast_merkle: Default::default(),
+                metadata: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    endpoint
+        .forward_clock_unix_timestamp(ROUND_WITNESS_TIME)
+        .await
+        .unwrap();
+    process_coordinator_tick_and_reveal(
+        endpoint,
+        payer,
+        ticker,
+        coordinator_instance,
+        coordinator_account,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+pub async fn run() {
+    let cheater = 0usize;
+    let cooldown_time = COOLDOWN_TIME;
+    let ReplayRun {
+        mut endpoint,
+        payer,
+        main_authority,
+        ticker,
+        run,
+        coordinator_instance,
+        coordinator_account,
+        clients,
+        p2ps,
+    } = start_replay_run(74, RUN_ID, &[cheater]).await;
+
     // The first round trains the run's first step from the published
     // checkpoint, the one step this replay engine reproduces. What the cheater
     // trained there, and signed, is what it is judged on.
     let first_round =
         coordinator_state(&mut endpoint, &coordinator_account).await;
-    let tie_breakers = get_run(&mut endpoint, &run)
-        .await
-        .unwrap()
-        .unwrap()
-        .tie_breaker_committee_size;
     let header = payload_header(
         &first_round.coordinator,
-        tie_breakers,
         &identity(&clients[cheater], &p2ps[cheater]),
     );
     // The run every commitment here is made in, as the coordinator names it.
@@ -371,54 +507,15 @@ pub async fn run() {
     );
 
     for _ in 0..4 {
-        let state =
-            coordinator_state(&mut endpoint, &coordinator_account).await;
-        for client in &clients {
-            let position = state
-                .coordinator
-                .epoch_state
-                .clients
-                .iter()
-                .position(|c| *c.id.signer() == client.pubkey().to_bytes());
-            let Some(position) = position else {
-                continue;
-            };
-            let witness_proof = CommitteeSelection::from_coordinator(&state.coordinator, 0)
-                .unwrap()
-                .get_witness(position as u64);
-            if witness_proof.position >= SOLANA_MAX_NUM_WITNESSES as u64 {
-                continue;
-            }
-            process_coordinator_witness(
-                &mut endpoint,
-                &payer,
-                client,
-                &coordinator_instance,
-                &coordinator_account,
-                &Witness {
-                    proof: witness_proof,
-                    participant_bloom: Default::default(),
-                    broadcast_bloom: Default::default(),
-                    broadcast_merkle: Default::default(),
-                    metadata: Default::default(),
-                },
-            )
-            .await
-            .unwrap();
-        }
-        endpoint
-            .forward_clock_unix_timestamp(round_witness_time)
-            .await
-            .unwrap();
-        process_coordinator_tick_and_reveal(
+        witness_round(
             &mut endpoint,
             &payer,
             &ticker,
+            &clients,
             &coordinator_instance,
             &coordinator_account,
         )
-        .await
-        .unwrap();
+        .await;
     }
 
     let cheater_committer = clients[cheater].pubkey().to_string();
@@ -430,7 +527,6 @@ pub async fn run() {
     let honest = (cheater + 1) % clients.len();
     let honest_header = payload_header(
         &first_round.coordinator,
-        tie_breakers,
         &identity(&clients[honest], &p2ps[honest]),
     );
     let submitted_dir = scratch("submitted");
@@ -480,17 +576,6 @@ pub async fn run() {
         .replayable_step()
         .expect("the run's first epoch has a replayable step");
     assert_eq!(replay_step, step);
-    let roster_index = |node: usize| {
-        roster
-            .coordinator
-            .epoch_state
-            .clients
-            .iter()
-            .position(|client| {
-                *client.id.signer() == clients[node].pubkey().to_bytes()
-            })
-            .expect("the node is in the epoch roster") as u64
-    };
     // Timed as the daemon times a pass: building the replay engine from the
     // run's model, replaying, judging and submitting. It is the figure the
     // final round's audit window is sized against
@@ -499,10 +584,10 @@ pub async fn run() {
     let (trainer, replay_config) = trainer_for(&llm);
     let engine = TrainerReplayEngine::new(
         trainer,
-        [(cheater, batch_id), (honest, honest_header.batch_id)]
+        [batch_id, honest_header.batch_id]
             .into_iter()
-            .map(|(node, node_batch)| ReplayAssignment {
-                target_index: roster_index(node),
+            .map(|node_batch| ReplayAssignment {
+                epoch_start: header.epoch_start,
                 step: replay_step,
                 warmup_lr_between: roster
                     .coordinator
@@ -587,4 +672,171 @@ pub async fn run() {
         .unwrap();
     assert_eq!(cheater_state.slashed, SLASHING_RATE);
     assert_eq!(cheater_state.earned, 0);
+}
+
+/// A pass builds its replay engine from one read of the run and judges each
+/// payload against a later one, and the engine's first build loads the model,
+/// which takes minutes. A client that leaves the epoch in between moves
+/// everyone after it down a seat. The replay a payload is judged against is
+/// found by the work the payload is signed for, so an honest node whose seat
+/// moved is still judged against its own batch. Found by seat, it was judged
+/// against the batch of whoever held that seat when the engine was built, and
+/// convicted on its own genuine signature.
+#[tokio::test]
+pub async fn an_honest_node_whose_seat_moved_is_judged_against_its_own_batch() {
+    let mut r = start_replay_run(75, RUN_ID_MOVED, &[]).await;
+    let first_round =
+        coordinator_state(&mut r.endpoint, &r.coordinator_account).await;
+    let run_id = String::from(&first_round.coordinator.run_id);
+    let node_at = |seat: usize| {
+        let signer = *first_round.coordinator.epoch_state.clients[seat]
+            .id
+            .signer();
+        r.clients
+            .iter()
+            .position(|key| key.pubkey().to_bytes() == signer)
+            .expect("every seat is one of the suite's clients")
+    };
+    // The leaver sits ahead of the honest node, and the honest node ahead of
+    // the cheater.
+    let (leaver, honest, cheater) = (node_at(0), node_at(1), node_at(2));
+
+    // Each trained its own batch of the run's first step, on that batch's
+    // samples, and the cheater sent the opposite of what it computed.
+    let llm = genesis_model();
+    let submitted_dir = scratch("moved-submitted");
+    let staging = scratch("moved-staging");
+    let mut assignments = vec![];
+    for node in [leaver, honest, cheater] {
+        let header = payload_header(
+            &first_round.coordinator,
+            &identity(&r.clients[node], &r.p2ps[node]),
+        );
+        let data = distinct_batch_data(&llm, header.batch_id);
+        let trained = first_step_payload_on(
+            &llm,
+            &first_round.coordinator,
+            header.step,
+            header.batch_id,
+            data.clone(),
+        );
+        let payload = match node == cheater {
+            true => flipped(&trained),
+            false => trained,
+        };
+        let staged = staging.join(format!("{node}.vec-postcard"));
+        write_results_dump(&staged, &payload).unwrap();
+        keep_signed_payload(
+            &submitted_dir,
+            &staged,
+            &r.clients[node],
+            &r.p2ps[node],
+            &run_id,
+            header,
+        );
+        assignments.push(ReplayAssignment {
+            epoch_start: header.epoch_start,
+            step: header.step,
+            warmup_lr_between: first_round
+                .coordinator
+                .get_cold_start_warmup_bounds(),
+            batch_id: header.batch_id,
+            data,
+        });
+    }
+
+    // The engine, built as a pass builds it, from the run as it stands.
+    let (trainer, replay_config) = trainer_for(&llm);
+    let engine = TrainerReplayEngine::new(
+        trainer,
+        assignments,
+        tch::Device::Cpu,
+        replay_config.quantize_1bit(),
+    );
+
+    // Then the leaver is convicted out of the epoch, and the next round
+    // compacts the roster under the engine.
+    slash_on_signed_payload(
+        &mut r.endpoint,
+        &r.payer,
+        &r.main_authority,
+        &r.run,
+        &r.coordinator_account,
+        RUN_ID_MOVED,
+        0,
+        &r.clients[leaver],
+        &r.p2ps[leaver],
+    )
+    .await
+    .unwrap();
+    witness_round(
+        &mut r.endpoint,
+        &r.payer,
+        &r.ticker,
+        &r.clients,
+        &r.coordinator_instance,
+        &r.coordinator_account,
+    )
+    .await;
+    let roster =
+        coordinator_state(&mut r.endpoint, &r.coordinator_account).await;
+    let seat_of = |node: usize| {
+        roster
+            .coordinator
+            .epoch_state
+            .clients
+            .iter()
+            .position(|client| {
+                *client.id.signer() == r.clients[node].pubkey().to_bytes()
+            })
+    };
+    assert_eq!(seat_of(leaver), None, "the leaver left the roster");
+    assert_eq!(
+        (seat_of(honest), seat_of(cheater)),
+        (Some(0), Some(1)),
+        "everyone after the leaver moved down a seat"
+    );
+    assert_eq!(
+        roster.coordinator.replayable_step(),
+        Some(first_round.coordinator.progress.step),
+        "the run is still in the epoch whose first step is replayed"
+    );
+
+    // The pass that judges the payloads reads the moved roster.
+    let config = AuditConfig {
+        run_id: RUN_ID_MOVED.to_string(),
+        submitted_dir,
+        reference_dir: None,
+        band: 0.05,
+        audit_assigned: false,
+        dry_run: false,
+        verdict_mode: false,
+    };
+    let mut convicted = HashSet::new();
+    let report = audit_pass(
+        &mut r.endpoint,
+        &r.main_authority,
+        &r.coordinator_account,
+        &r.run,
+        &config,
+        Some(&engine),
+        &mut convicted,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !convicted.contains(&r.clients[honest].pubkey().to_string()),
+        "the honest node was convicted against another node's batch"
+    );
+    assert!(convicted.contains(&r.clients[cheater].pubkey().to_string()));
+    assert_eq!(
+        report,
+        PassReport {
+            cleared: 1,
+            fraud_found: 1,
+            submitted: 1,
+            ..PassReport::default()
+        }
+    );
 }

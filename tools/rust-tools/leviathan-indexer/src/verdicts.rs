@@ -228,6 +228,7 @@ mod tests {
             appeal_upheld: false,
             voters: vec![],
             appeal_voters: vec![],
+            vote_commitments: vec![],
         }
     }
 

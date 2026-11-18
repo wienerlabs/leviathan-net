@@ -136,7 +136,10 @@ and goes on with the rest.
 A verifier counts the peers it caught signing two different payloads for one
 batch (`leviathan_verifier_equivocations_found_total`). Each is a proof the
 chain takes on its own, and the verifier submits it whatever it is assigned
-(wienerlabs/leviathan-net#46). The submission is counted like a fraud proof's,
+(wienerlabs/leviathan-net#46). It does so in every pass, including a
+replaying verifier's passes past the run's first epoch, where nothing can be
+replayed, and passes whose replay could not be prepared. The daemon refuses to
+start with neither `--reference-dir` nor `--replay-data-dir`. The submission is counted like a fraud proof's,
 so `LeviathanFraudNotSubmitted` covers it as well. A proof the epoch can no
 longer charge, because the epoch ended or a pause withdrew the peer before it
 landed, fires that alert once, and the verifier's log names the peer. Records
@@ -224,6 +227,7 @@ The treasurer's own accounts grow the same way:
 | wienerlabs/leviathan-net#39: gained `released_voters`, `bench_bounty_owed` and `bench_paid` | `AuditVerdict` | 4392 |
 | wienerlabs/leviathan-net#67: evidence gained the epoch it was trained in | `AuditVerdict` | 4400 |
 | wienerlabs/leviathan-net#64: bounty fields renamed `bounty_owed` and `bounty_paid`; gained `charge`, `charge_epoch_start`, `charge_rate` and `appeal_upheld` | `AuditVerdict` | 4418 |
+| Votes counted per signed payload: gained `vote_commitments`, the commitment hash each vote convicts on | `AuditVerdict` | 6470 |
 
 An older, shorter account does not deserialize with the new layout, so the treasurer that carries them deploys under a new id too.
 
@@ -236,6 +240,18 @@ An older, shorter account does not deserialize with the new layout, so the treas
   - The verifier daemon does both, for every open dispute in the run, at the end of each pass, after its own judging, so a backlog never costs it a vote. A daemon in dry-run mode sends nothing.
   - `run-manager bond-withdraw-finalize` does both for every seat the wallet is owed before it withdraws, whether or not the wallet still has a vote open.
 - **A slash no verdict accounts for.** A `run_slash`, or an equivocation, still pays its bounty to a reporter that the withdrawal names. `bond-withdraw-finalize` asks for it with `--reporter <WALLET>` when the settlement owes one, and refuses to send without it.
+
+The appeals bench size now reaches the coordinator (wienerlabs/leviathan#15,
+finding 4). `run_set_challenge_config` names the coordinator's accounts and
+calls its new `set_tie_breaker_nodes`, which reserves the seats in every round
+from the next one to start. Upgrade the coordinator program before the
+treasurer: a treasurer on the new build cannot set a bench on a coordinator
+without the instruction. Neither account changes size or moves a field (the
+count sits in what was padding before `seed_commit_slot`, and an older account
+reads zero there), so both upgrade in place. A run that already has a bench has
+to send `run_set_challenge_config` once more after the upgrade, or its rounds
+keep reserving none. The call is refused while a round's seed is committed
+(`RoundSeedCommitted`); send it again a slot later.
 
 ## Going to mainnet
 

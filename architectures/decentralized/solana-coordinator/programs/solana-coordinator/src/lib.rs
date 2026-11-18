@@ -275,6 +275,17 @@ pub mod psyche_solana_coordinator {
         )
     }
 
+    /// How many tie-breaker seats each round reserves, from the next round to
+    /// start: the bench of the run's appeals court.
+    pub fn set_tie_breaker_nodes(
+        ctx: Context<OwnerCoordinatorAccounts>,
+        tie_breaker_nodes: u16,
+    ) -> Result<()> {
+        let mut account = ctx.accounts.coordinator_account.load_mut()?;
+        account.increment_nonce();
+        account.state.set_tie_breaker_nodes(tie_breaker_nodes)
+    }
+
     pub fn join_run(
         context: Context<JoinRunAccounts>,
         params: JoinRunParams,

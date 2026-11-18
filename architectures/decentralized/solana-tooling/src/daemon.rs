@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use leviathan_verifier::judge_payload;
 use leviathan_verifier::parse_assignment_key;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
+use leviathan_verifier::ReplayWork;
 use leviathan_verifier::VerifiedCommitment;
 use psyche_coordinator::select_audits_for_current_round;
 use psyche_coordinator::ClientState;
@@ -31,7 +33,6 @@ use tch::Device;
 
 use crate::daemon_equivocation::EquivocationPass;
 use crate::get_accounts::get_coordinator_account_state;
-use crate::get_accounts::get_run;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
 use crate::verdict_votes::settle_open_disputes;
@@ -68,10 +69,7 @@ pub fn parse_committer(path: &Path) -> Option<String> {
 
 /// The contributions this round's committee assigns for audit, as the committer
 /// named in a dump and the batch it trained.
-fn audit_assignments(
-    coordinator: &Coordinator,
-    tie_breaker_committee_size: u16,
-) -> HashSet<(String, BatchId)> {
+fn audit_assignments(coordinator: &Coordinator) -> HashSet<(String, BatchId)> {
     // In a warmup, or once the roster has moved under the last round's draw,
     // no committee stands over the roster. Drawing one over it anyway indexes
     // past the round it was drawn for.
@@ -82,10 +80,9 @@ fn audit_assignments(
         );
         return HashSet::new();
     }
-    match select_audits_for_current_round(
-        coordinator,
-        tie_breaker_committee_size,
-    ) {
+    // Drawn with the tie-breaker seats the round reserves, as the round's
+    // clients and the treasurer draw it (wienerlabs/leviathan#15, finding 4).
+    match select_audits_for_current_round(coordinator) {
         Ok(audits) => audits
             .iter()
             // The full signer, as the dump names carry it (finding 20).
@@ -226,7 +223,7 @@ pub async fn audit_pass(
     coordinator_account: &Pubkey,
     run: &Pubkey,
     config: &AuditConfig,
-    replay: Option<&(dyn psyche_verifier::ReplayEngine + Sync)>,
+    replay: Option<&(dyn ReplayWork + Sync)>,
     // What this session has settled: convicted committers by signer, and
     // contributions by file key once judged for good (within band, convicted,
     // withheld, already on chain, or malformed), so a long-running daemon
@@ -235,15 +232,6 @@ pub async fn audit_pass(
     // submitted again on the next pass.
     judged: &mut HashSet<String>,
 ) -> Result<PassReport> {
-    // The tie-breaker count comes from the run, because that is what the
-    // treasurer gates votes with. Deriving it any other way picks a different
-    // verifier set and every verdict is refused as `VerifierNotAssigned`
-    // (wienerlabs/leviathan#15, finding 4).
-    let tie_breaker_committee_size = get_run(endpoint, run)
-        .await?
-        .ok_or_else(|| anyhow!("run {} not found", run))?
-        .tie_breaker_committee_size;
-
     let state = get_coordinator_account_state(endpoint, coordinator_account)
         .await?
         .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
@@ -253,18 +241,13 @@ pub async fn audit_pass(
 
     let assigned = config
         .audit_assigned
-        .then(|| audit_assignments(coordinator, tie_breaker_committee_size));
+        .then(|| audit_assignments(coordinator));
 
     let submitted = index_dir(&config.submitted_dir)?;
     let reference = match &config.reference_dir {
         Some(dir) => Some(index_dir(dir)?),
         None => None,
     };
-    if reference.is_none() && replay.is_none() {
-        return Err(anyhow!(
-            "the daemon needs either a reference directory or a replay engine to audit against"
-        ));
-    }
     let device = Device::Cpu;
     let mut report = PassReport::default();
 
@@ -284,7 +267,20 @@ pub async fn audit_pass(
     .convict_all(&submitted)
     .await;
 
-    for (key, submitted_path) in &submitted {
+    // A daemon that replays has nothing to judge a payload against past the
+    // run's first epoch, where no step can be replayed
+    // (wienerlabs/leviathan-net#48), nor in a pass whose replay could not be
+    // prepared. Equivocation is the fraud still provable then, and it has
+    // just been judged. The rest of the pass still runs: the sweep of the
+    // run's open disputes below is what finalises and pays the convictions
+    // this daemon voted on before.
+    let nothing_to_judge_against = BTreeMap::new();
+    let to_judge = match (&reference, replay) {
+        (None, None) => &nothing_to_judge_against,
+        _ => &submitted,
+    };
+
+    for (key, submitted_path) in to_judge {
         let Some(committer) = parse_committer(submitted_path) else {
             continue;
         };
@@ -425,7 +421,13 @@ pub async fn audit_pass(
                 if !coordinator.is_replayable(record.epoch_start, record.step) {
                     continue;
                 }
-                match engine.replay(index as u64) {
+                // The replay of the work this payload is signed for, found by
+                // that work. The roster index is this pass's view of where the
+                // committer sits, and only names it to the chain: the engine
+                // was built from an earlier read, and anyone leaving the epoch
+                // in between moves the committer to a seat whose batch is
+                // someone else's.
+                match engine.replay_work(&dump) {
                     Ok(delta) => delta,
                     Err(err) => {
                         println!(

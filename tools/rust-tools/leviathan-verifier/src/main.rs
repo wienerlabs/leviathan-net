@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
                 .collect();
             let epoch = replay_epoch(&dumps, first_step, args.epoch_start)?;
             let mut assignments = Vec::new();
-            for (target_index, key) in submitted.keys().enumerate() {
+            for key in submitted.keys() {
                 let Some(DumpKey {
                     epoch_start,
                     step,
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
                     })
                     .collect();
                 assignments.push(ReplayAssignment {
-                    target_index: target_index as u64,
+                    epoch_start,
                     step,
                     warmup_lr_between: args
                         .cold_start_epoch

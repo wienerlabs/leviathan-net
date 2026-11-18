@@ -96,10 +96,12 @@ that still hold the bond (69 bytes). `AuditVerdict` gained which votes are
 released and what an overturn owes the bench (4392 bytes), then the epoch its
 evidence was trained in (4400 bytes, wienerlabs/leviathan-net#67), then how far
 a conviction has reached the target's bond and whether the bench upheld it
-(4418 bytes, wienerlabs/leviathan-net#64). Older, shorter accounts do not
-decode with the new layout and carry votes nobody counted, so these are for
-the new deployment's runs only, never a migration of the current ones. The
-dashboard decoder has to learn both lengths, 69 and 4418.
+(4418 bytes, wienerlabs/leviathan-net#64), then the commitment each vote
+convicts on, so votes are counted per payload (6470 bytes). Older, shorter
+accounts either fail to decode with the new layout or decode with no vote's
+commitment recorded, and carry votes nobody counted, so these are for the new
+deployment's runs only, never a migration of the current ones. The
+dashboard decoder has to learn both lengths, 69 and 6470.
 That deployment's nodes also sign the `v2` payload commitment, which names the
 epoch a payload was trained in (wienerlabs/leviathan-net#67). A node on an older
 build cannot train beside them.
@@ -133,7 +135,8 @@ A run that gates admission on the bond is one whose join authority is its own
 treasurer run. The client recognises it from chain state and joins it through
 the treasurer's `participant_join_run` every epoch, so no `--authorizer` is
 needed. That instruction checks the committed bond (posted, less convictions not
-yet settled and withdrawals already requested) on each join, and the coordinator
+yet settled, slashes that have not reached the ledger yet, and withdrawals
+already requested) on each join, and the coordinator
 refuses a direct join. `run-manager can-join` and `bond-status` report that
 committed bond, and whether joins, votes and claims are open to it.
 

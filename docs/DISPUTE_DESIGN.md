@@ -48,14 +48,25 @@ strictly more expensive than buying the original committee. This is the appeals
 court a court system already uses: you can appeal once, to a bigger bench.
 
 Cost as built: this was the largest change, but smaller than feared. It delays
-finalisation and adds a second-level quorum, but it did not touch the coordinator.
-The `TieBreaker` committee is already a first-class arm of the coordinator's
-`CommitteeSelection` lottery; only `start_round_train` never populated a non-zero
-count. Rather than migrate the coordinator's zero-copy state, the treasurer draws
-its own selection with `from_coordinator_with_tie_breakers`, overriding the
-tie-breaker count from a per-run config (`tie_breaker_committee_size`). One
-selection partitions the epoch into disjoint tie-breaker / verifier / trainer sets,
-so a client is never both a verifier and its own appeals judge. The whole appeals
+finalisation and adds a second-level quorum. The `TieBreaker` committee is
+already a first-class arm of the coordinator's `CommitteeSelection` lottery; only
+`start_round_train` never populated a non-zero count. The treasurer first drew
+its own selection with the per-run count (`tie_breaker_committee_size`) and left
+the coordinator's rounds at zero. The clients, though, train what the round's
+own draw assigns them, so the treasurer's verifiers were not the clients', and
+every audit the lottery handed out named a batch its target never trained
+(wienerlabs/leviathan#15, finding 4). Now `run_set_challenge_config` carries
+the count into the coordinator (`set_tie_breaker_nodes`), which seats it in
+every round it starts (`Round::tie_breaker_tasks`), and everyone draws the
+round as it is: the clients, the audit lottery and the treasurer. The count
+sits in what was alignment padding in the coordinator's account, so no field
+moved. It is refused while a round's seed is committed, since the count moves
+the verifier seats and the committed slot's hash is about to be known. One
+selection partitions each round into disjoint tie-breaker / verifier / trainer sets.
+An appeal is judged over many rounds, each drawn afresh, so disjointness within
+one draw is not enough: the treasurer also refuses an appeal vote from a verifier
+who voted on the verdict (`AppellateVotedOnVerdict`) and from the target itself
+(`AppellateIsTarget`), the two parties no draw makes neutral. The whole appeals
 court is five treasurer instructions (`run_set_challenge_config`,
 `run_open_challenge`, `run_submit_appeal_verdict`, `run_finalize_slash`,
 `run_slash_losing_verifier`) plus a lifecycle on the existing `AuditVerdict`
@@ -218,7 +229,8 @@ takes over.
 
 The trust model is unchanged from the committee vote: adjudication is a bonded
 committee, not a key, and the appeals bench is drawn by the same lottery but from
-a disjoint, separately sized set, so buying it is a second independent purchase.
+a disjoint, separately sized set, and never seats the verdict's own voters or its
+target, so buying it is a second independent purchase.
 The recursion is bounded by economics, not by another layer of code. Backward
 compatibility is preserved, so the genesis run and token launch remain unblocked
 whether or not a given run turns appeals on.
@@ -376,6 +388,17 @@ treasurer checks it (wienerlabs/leviathan-net#43):
 - **The record is self-checking.** The verdict stores the evidence alongside
   the hash, so anyone can rebuild the hash from the account and its run.
   Holding the dump, anyone can check its sha256 against the digest.
+- **Votes agree on the payload, not on the replay.** Votes are counted per
+  commitment the target signed: a quorum is two thirds of the committee voting
+  for one payload, and the verdict records the payload most votes are for. The
+  first vote used to fix the evidence for the rest of the round, its replayed
+  hash included. Every payload is broadcast, so one seat could cite another
+  payload the target signed and veto what two thirds agreed on, and honest
+  verifiers whose replays differ in the last bits, which is what the band is
+  for, never reached a quorum. A vote for evidence the verdict does not record
+  convicted nobody: it is no seat of the bounty, an overturn charges it
+  nothing, and it is released once the verdict resolves. The target never
+  votes on its own verdict (`VerifierIsTarget`).
 
 Before this, a quorum could record a hash the target never committed to, and
 the record an appeal bench or an observer reads would have been fiction. A
