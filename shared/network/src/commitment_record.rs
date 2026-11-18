@@ -29,6 +29,9 @@ pub struct CommitmentRecord {
     pub batch_id: BatchId,
     pub data_hash: [u8; 32],
     pub signature: [u8; 64],
+    /// The digest of the state the payload was trained from, which the hash
+    /// binds, if the trainer committed to one (wienerlabs/leviathan-net#89).
+    pub state_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -37,6 +40,8 @@ pub enum CommitmentRecordError {
     Length { expected: usize, actual: usize },
     #[error("the batch in this commitment record ends before it starts")]
     Batch,
+    #[error("the state digest in this commitment record is neither present nor absent")]
+    StateDigest,
     #[error("the payload is not the one this commitment's hash was built over")]
     PayloadMismatch,
     #[error("the signature on this commitment is not the committer's")]
@@ -47,8 +52,9 @@ pub enum CommitmentRecordError {
 
 impl CommitmentRecord {
     /// The epoch's start, the step and nonce, the batch bounds, the hash and
-    /// the signature, in that order and big-endian.
-    pub const SERIALIZED_SIZE: usize = 8 + 4 + 4 + 8 + 8 + 32 + 64;
+    /// the signature, in that order and big-endian; then a tag saying whether
+    /// a state digest follows, and the digest, all zeros when it does not.
+    pub const SERIALIZED_SIZE: usize = 8 + 4 + 4 + 8 + 8 + 32 + 64 + 1 + 32;
 
     /// The record of `payload`, committed to as `data_hash` and signed with
     /// `signature`.
@@ -64,6 +70,7 @@ impl CommitmentRecord {
             batch_id: payload.batch_id,
             data_hash,
             signature,
+            state_digest: payload.state_digest,
         }
     }
 
@@ -76,6 +83,10 @@ impl CommitmentRecord {
         bytes[24..32].copy_from_slice(&self.batch_id.0.end.to_be_bytes());
         bytes[32..64].copy_from_slice(&self.data_hash);
         bytes[64..128].copy_from_slice(&self.signature);
+        if let Some(digest) = &self.state_digest {
+            bytes[128] = 1;
+            bytes[129..161].copy_from_slice(digest);
+        }
         bytes
     }
 
@@ -93,6 +104,13 @@ impl CommitmentRecord {
         if end < start {
             return Err(CommitmentRecordError::Batch);
         }
+        let digest: [u8; 32] = bytes[129..161].try_into().unwrap();
+        // One encoding per record: an absent digest is all zeros.
+        let state_digest = match bytes[128] {
+            1 => Some(digest),
+            0 if digest == [0; 32] => None,
+            _ => return Err(CommitmentRecordError::StateDigest),
+        };
         Ok(Self {
             epoch_start: u64_at(0),
             step: u32_at(8),
@@ -100,6 +118,7 @@ impl CommitmentRecord {
             batch_id: BatchId(ClosedInterval::new(start, end)),
             data_hash: bytes[32..64].try_into().unwrap(),
             signature: bytes[64..128].try_into().unwrap(),
+            state_digest,
         })
     }
 
@@ -119,6 +138,7 @@ impl CommitmentRecord {
             self.batch_id.0.start,
             self.batch_id.0.end,
             &digest,
+            self.state_digest.as_ref(),
         ))
     }
 
@@ -199,6 +219,7 @@ mod tests {
             trainer_nonce: 2,
             batch_id: BatchId(ClosedInterval::new(40, 47)),
             distro_results: results,
+            state_digest: Some(psyche_core::sha256(b"the state trained from")),
         }
     }
 
@@ -303,6 +324,67 @@ mod tests {
         let key = SecretKey::generate(&mut rand::rng());
         let record = signed(&key, &payload(results(&[1.0, -2.0, 3.0])));
         assert_eq!(CommitmentRecord::from_bytes(&record.to_bytes()), Ok(record));
+        // A trainer that committed to no state.
+        let stateless = signed(
+            &key,
+            &TransmittableDistroResult {
+                state_digest: None,
+                ..payload(results(&[1.0, -2.0, 3.0]))
+            },
+        );
+        assert_eq!(stateless.state_digest, None);
+        assert_eq!(
+            CommitmentRecord::from_bytes(&stateless.to_bytes()),
+            Ok(stateless)
+        );
+    }
+
+    /// The state a payload was trained from is part of what was signed: a
+    /// record naming another state, or none, does not verify
+    /// (wienerlabs/leviathan-net#89).
+    #[test]
+    fn a_record_naming_another_state_does_not_verify() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let payload = payload(results(&[1.0, -2.0, 3.0]));
+        let record = signed(&key, &payload);
+        let public = key.public();
+        let identity = public.as_bytes();
+        assert_eq!(
+            record.verify(&payload.distro_results, RUN, identity),
+            Ok(())
+        );
+        for other in [Some(psyche_core::sha256(b"another state")), None] {
+            let claimed = CommitmentRecord {
+                state_digest: other,
+                ..record
+            };
+            assert_eq!(
+                claimed.verify(&payload.distro_results, RUN, identity),
+                Err(CommitmentRecordError::PayloadMismatch),
+                "{other:?}"
+            );
+        }
+    }
+
+    /// A record says whether a state digest follows in one way only: a tag
+    /// other than 0 or 1, or an absent digest that is not all zeros, is
+    /// refused.
+    #[test]
+    fn a_record_with_a_malformed_state_digest_is_refused() {
+        let key = SecretKey::generate(&mut rand::rng());
+        let bytes = signed(&key, &payload(results(&[1.0]))).to_bytes();
+        let mut tag = bytes;
+        tag[128] = 2;
+        assert_eq!(
+            CommitmentRecord::from_bytes(&tag),
+            Err(CommitmentRecordError::StateDigest)
+        );
+        let mut absent_but_set = bytes;
+        absent_but_set[128] = 0;
+        assert_eq!(
+            CommitmentRecord::from_bytes(&absent_but_set),
+            Err(CommitmentRecordError::StateDigest)
+        );
     }
 
     #[test]

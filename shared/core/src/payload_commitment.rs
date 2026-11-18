@@ -3,8 +3,9 @@ use crate::{sha256, sha256v};
 /// Domain tag for the hash a trainer signs over its DisTrO payload, so no
 /// other message the same key signs can stand in for it. The version moved to
 /// 2 when the epoch joined the header, so a v1 signature is never read as one
-/// over a v2 header (wienerlabs/leviathan-net#67).
-pub const PAYLOAD_COMMITMENT_DOMAIN: &[u8] = b"leviathan/payload-commitment/v2";
+/// over a v2 header (wienerlabs/leviathan-net#67), and to 3 when the state the
+/// trainer trained from joined it (wienerlabs/leviathan-net#89).
+pub const PAYLOAD_COMMITMENT_DOMAIN: &[u8] = b"leviathan/payload-commitment/v3";
 
 /// The run a payload commitment is bound to: the sha256 of the run id.
 ///
@@ -39,6 +40,14 @@ pub fn payload_commitment_run(run_id: &str) -> [u8; 32] {
 /// back, no two epochs of a run id share a start, and a signature over one
 /// round's work can never be read as one over another's
 /// (wienerlabs/leviathan-net#67).
+///
+/// It also binds `state_digest`, the digest of the state the trainer trained
+/// the payload from: its weights and its error-feedback buffer as the round
+/// began. A verifier that audits the round later replays it from that state,
+/// which the trainer reveals and which has to be the one it signed here
+/// (wienerlabs/leviathan-net#89, `docs/ROUND_AUDIT.md`). A trainer that
+/// committed to no state, as one training through Python does, binds `None`,
+/// which no state digest can stand in for.
 #[allow(clippy::too_many_arguments)]
 pub fn payload_commitment_hash(
     run: &[u8; 32],
@@ -48,7 +57,12 @@ pub fn payload_commitment_hash(
     batch_start: u64,
     batch_end: u64,
     results_digest: &[u8; 32],
+    state_digest: Option<&[u8; 32]>,
 ) -> [u8; 32] {
+    let (state_tag, state): (&[u8], &[u8]) = match state_digest {
+        Some(digest) => (&[1], digest),
+        None => (&[0], &[]),
+    };
     sha256v(&[
         PAYLOAD_COMMITMENT_DOMAIN,
         run,
@@ -58,6 +72,8 @@ pub fn payload_commitment_hash(
         &batch_start.to_be_bytes(),
         &batch_end.to_be_bytes(),
         results_digest,
+        state_tag,
+        state,
     ])
 }
 
@@ -87,17 +103,31 @@ mod tests {
         end: u64,
         digest: &[u8; 32],
     ) -> [u8; 32] {
-        payload_commitment_hash(&run(), epoch_start, step, nonce, start, end, digest)
+        payload_commitment_hash(
+            &run(),
+            epoch_start,
+            step,
+            nonce,
+            start,
+            end,
+            digest,
+            Some(&state()),
+        )
     }
 
-    /// The layout is the domain tag, the run, the big-endian header and the
-    /// digest. A program, the client and the verifier all rebuild it, so it is
-    /// pinned against the concatenation itself.
+    fn state() -> [u8; 32] {
+        sha256(b"the state trained from")
+    }
+
+    /// The layout is the domain tag, the run, the big-endian header, the
+    /// results' digest, and the state's digest behind a tag that says whether
+    /// there is one. A program, the client and the verifier all rebuild it, so
+    /// it is pinned against the concatenation itself.
     #[test]
-    fn the_hash_is_over_the_domain_run_header_and_digest() {
+    fn the_hash_is_over_the_domain_run_header_and_digests() {
         assert_eq!(
             PAYLOAD_COMMITMENT_DOMAIN,
-            b"leviathan/payload-commitment/v2"
+            b"leviathan/payload-commitment/v3"
         );
         let mut bytes = PAYLOAD_COMMITMENT_DOMAIN.to_vec();
         bytes.extend_from_slice(&sha256(b"a run"));
@@ -107,9 +137,73 @@ mod tests {
         bytes.extend_from_slice(&START.to_be_bytes());
         bytes.extend_from_slice(&END.to_be_bytes());
         bytes.extend_from_slice(&digest());
+        let mut with_state = bytes.clone();
+        with_state.push(1);
+        with_state.extend_from_slice(&state());
         assert_eq!(
             hash(EPOCH_START, STEP, NONCE, START, END, &digest()),
-            sha256(&bytes)
+            sha256(&with_state)
+        );
+        let mut without_state = bytes;
+        without_state.push(0);
+        assert_eq!(
+            payload_commitment_hash(
+                &run(),
+                EPOCH_START,
+                STEP,
+                NONCE,
+                START,
+                END,
+                &digest(),
+                None
+            ),
+            sha256(&without_state)
+        );
+    }
+
+    /// The state a trainer trained from is part of what it signs: another
+    /// state, or none, is another commitment (wienerlabs/leviathan-net#89).
+    #[test]
+    fn the_state_changes_the_hash() {
+        let base = hash(EPOCH_START, STEP, NONCE, START, END, &digest());
+        let other_state = sha256(b"another state");
+        for other in [Some(&other_state), None] {
+            assert_ne!(
+                base,
+                payload_commitment_hash(
+                    &run(),
+                    EPOCH_START,
+                    STEP,
+                    NONCE,
+                    START,
+                    END,
+                    &digest(),
+                    other
+                )
+            );
+        }
+        // A missing state is not the state of all zeros.
+        assert_ne!(
+            payload_commitment_hash(
+                &run(),
+                EPOCH_START,
+                STEP,
+                NONCE,
+                START,
+                END,
+                &digest(),
+                None
+            ),
+            payload_commitment_hash(
+                &run(),
+                EPOCH_START,
+                STEP,
+                NONCE,
+                START,
+                END,
+                &digest(),
+                Some(&[0; 32])
+            )
         );
     }
 
@@ -157,7 +251,8 @@ mod tests {
                 NONCE,
                 START,
                 END,
-                &digest()
+                &digest(),
+                Some(&state())
             )
         );
     }

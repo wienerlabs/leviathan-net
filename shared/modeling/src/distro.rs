@@ -1109,6 +1109,13 @@ impl Distro {
         }
     }
 
+    /// The error-feedback buffer as variables, one per model variable in the
+    /// model's order, sharded as the model is. With the weights, it is the
+    /// state a node commits to each round (wienerlabs/leviathan-net#89).
+    pub fn error_feedback_variables(&self) -> impl Iterator<Item = &dyn Variable> {
+        self.state.iter().map(|state| state.delta.as_ref())
+    }
+
     /// A copy of the error-feedback buffer on the CPU: what this optimizer
     /// has computed and not yet sent, one tensor per model variable in the
     /// model's order. With the node's weights, it is the state a node would

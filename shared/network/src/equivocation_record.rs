@@ -116,6 +116,7 @@ impl EquivocationRecord {
                 record.batch_id.0.start,
                 record.batch_id.0.end,
                 digest,
+                record.state_digest.as_ref(),
             );
             if rebuilt != record.data_hash {
                 return Err(EquivocationError::HashMismatch);
@@ -161,6 +162,7 @@ mod tests {
                 xshape: vec![values.len() as u16],
                 totalk: values.len() as u32,
             }],
+            state_digest: Some(psyche_core::sha256(b"the state trained from")),
         }
     }
 

@@ -335,6 +335,9 @@ async fn main() -> Result<()> {
             &cheater_identity,
             &p2ps[cheater],
             cheater_payload,
+            // The demo's node trains nothing, so it commits to no state
+            // (wienerlabs/leviathan-net#89).
+            None,
         );
         if let (false, Some(live_index), Ok(signed)) =
             (slashed_done, cheater_index, signed)

@@ -410,6 +410,9 @@ async fn run() -> Result<()> {
         ),
         &p2ps[target_node],
         target_payload,
+        // The demo's node trains nothing, so it commits to no state
+        // (wienerlabs/leviathan-net#89).
+        None,
     )?;
 
     for (i, verifier) in verifiers.iter().take(quorum as usize).enumerate() {

@@ -19,6 +19,7 @@ mod python_distributed_causal_lm;
 mod python_distributed_trainer;
 mod rms_norm;
 mod rope;
+mod round_state;
 mod safetensor_utils;
 mod sampling;
 mod token_output_stream;
@@ -58,6 +59,7 @@ pub use python_distributed_trainer::{
 };
 pub use rms_norm::RMSNorm;
 pub use rope::{RoPECache, RoPEConfig, RoPEType, default_rope, rotate_half, yarn_get_mscale};
+pub use round_state::{ROUND_STATE_DOMAIN, RoundStateError, round_state_digest, write_round_state};
 pub use safetensor_utils::{
     LoadSafetensorsError, SaveSafetensorsError, load_safetensors_into_variables,
     save_tensors_into_safetensors,

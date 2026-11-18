@@ -32,6 +32,12 @@ pub struct TransmittableDistroResult {
     pub trainer_nonce: u32,
     pub batch_id: BatchId,
     pub distro_results: Vec<SerializedDistroResult>,
+    /// The digest of the state the trainer trained these results from: its
+    /// weights and error-feedback buffer as the round began. The commitment
+    /// binds it, so an audit can replay the round from the state the trainer
+    /// reveals (wienerlabs/leviathan-net#89). None from a trainer that
+    /// committed to no state.
+    pub state_digest: Option<[u8; 32]>,
 }
 
 impl TransmittableDistroResult {
@@ -55,6 +61,7 @@ impl TransmittableDistroResult {
             trainer_nonce,
             batch_id,
             distro_results,
+            state_digest,
         } = self;
         Ok(payload_commitment_hash(
             &payload_commitment_run(run_id),
@@ -64,6 +71,7 @@ impl TransmittableDistroResult {
             batch_id.0.start,
             batch_id.0.end,
             &results_digest(distro_results)?,
+            state_digest.as_ref(),
         ))
     }
 
@@ -483,6 +491,7 @@ mod commitment_binding_tests {
             trainer_nonce: 1,
             batch_id: BatchId(ClosedInterval::new(0, 3)),
             distro_results: results,
+            state_digest: Some(psyche_core::sha256(b"the state trained from")),
         }
     }
 
@@ -624,9 +633,25 @@ mod commitment_binding_tests {
                 payload.batch_id.0.start,
                 payload.batch_id.0.end,
                 &digest,
+                payload.state_digest.as_ref(),
             )
         );
         assert_eq!(payload.results_digest().unwrap(), digest);
+    }
+
+    /// The state the payload was trained from is part of what a sender signs
+    /// (wienerlabs/leviathan-net#89).
+    #[test]
+    fn the_state_trained_from_changes_the_commitment() {
+        let payload = one_result(&[4], vec![2, 2], 4);
+        let base = payload.comptue_hash(RUN).unwrap();
+        for other in [Some(psyche_core::sha256(b"another state")), None] {
+            let claimed = TransmittableDistroResult {
+                state_digest: other,
+                ..payload.clone()
+            };
+            assert_ne!(claimed.comptue_hash(RUN).unwrap(), base, "{other:?}");
+        }
     }
 
     /// The same payload committed in another run is another commitment.

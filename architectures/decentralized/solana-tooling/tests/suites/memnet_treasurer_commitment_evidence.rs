@@ -389,12 +389,14 @@ pub async fn no_payload_is_assigned_in_a_warmup() {
     let coordinator = harness.state().await.coordinator;
     let identity = harness.nodes[SUBJECT].identity();
     assert!(
-        signed_commitment::payload_header(&coordinator, &identity).is_err()
+        signed_commitment::payload_header(&coordinator, &identity, None)
+            .is_err()
     );
     harness.advance_to(RunState::RoundTrain).await;
     let coordinator = harness.state().await.coordinator;
     assert!(
-        signed_commitment::payload_header(&coordinator, &identity).is_ok()
+        signed_commitment::payload_header(&coordinator, &identity, None)
+            .is_ok()
     );
 }
 
