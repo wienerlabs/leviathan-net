@@ -13,13 +13,15 @@ use crate::logic::SlashRecord;
 use crate::state::commitment_run;
 use crate::state::conviction_landing;
 use crate::state::ejection_charge;
-use crate::state::Participant;
-use crate::state::SlashKind;
-use crate::state::SlashReport;
 use crate::state::transaction_proves_signature;
 use crate::state::CommitmentEvidence;
+use crate::state::EquivocationClaim;
+use crate::state::EquivocationCommitment;
 use crate::state::Landing;
+use crate::state::Participant;
 use crate::state::Run;
+use crate::state::SlashKind;
+use crate::state::SlashReport;
 use crate::ProgramError;
 
 #[derive(Accounts)]
@@ -29,7 +31,9 @@ pub struct RunSlashEquivocationAccounts<'info> {
     pub payer: Signer<'info>,
 
     /// Anyone: the proof needs no committee and no authority. Whoever signs it
-    /// is recorded as its reporter (wienerlabs/leviathan-net#72).
+    /// is recorded as its reporter (wienerlabs/leviathan-net#72), if it
+    /// committed to the proof in an earlier slot
+    /// (wienerlabs/leviathan-net#92).
     #[account()]
     pub reporter: Signer<'info>,
 
@@ -86,6 +90,22 @@ pub struct RunSlashEquivocationAccounts<'info> {
     )]
     pub slash_report: Box<Account<'info, SlashReport>>,
 
+    /// The reporter's commitment to this proof, made in an earlier slot
+    /// through `run_commit_equivocation`. Taking the proof closes it, and its
+    /// rent goes to the payer (wienerlabs/leviathan-net#92).
+    #[account(
+        mut,
+        close = payer,
+        seeds = [
+            EquivocationCommitment::SEEDS_PREFIX,
+            run.key().as_ref(),
+            reporter.key().as_ref(),
+            params.commitment.as_ref(),
+        ],
+        bump = equivocation_commitment.bump,
+    )]
+    pub equivocation_commitment: Box<Account<'info, EquivocationCommitment>>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -103,6 +123,36 @@ pub struct RunSlashEquivocationParams {
     /// with the target's p2p key signing its commitment hash.
     pub first: CommitmentEvidence,
     pub second: CommitmentEvidence,
+    /// The reporter's commitment to this proof, `EquivocationClaim::commitment`
+    /// for its key, which it made in an earlier slot.
+    pub commitment: [u8; 32],
+}
+
+/// Whether `reporter` may reveal the proof in `params` in `slot`, against its
+/// commitment `committed`: the commitment is to exactly this proof and this
+/// reporter, and was made in an earlier slot (wienerlabs/leviathan-net#92).
+pub fn check_equivocation_reveal(
+    run: &Pubkey,
+    params: &RunSlashEquivocationParams,
+    reporter: &Pubkey,
+    committed: &EquivocationCommitment,
+    slot: u64,
+) -> Result<()> {
+    let claim = EquivocationClaim {
+        run,
+        target: &params.target,
+        batch_start: params.batch_start,
+        batch_end: params.batch_end,
+        first: &params.first,
+        second: &params.second,
+    };
+    if claim.commitment(reporter) != committed.commitment {
+        return err!(ProgramError::EquivocationNotCommitted);
+    }
+    if !committed.revealable_in(slot) {
+        return err!(ProgramError::EquivocationCommittedTooRecently);
+    }
+    Ok(())
 }
 
 /// Whether `first` and `second` are two different commitments to the same
@@ -136,6 +186,15 @@ pub fn run_slash_equivocation_processor(
     params: RunSlashEquivocationParams,
 ) -> Result<()> {
     check_reporter(&params.target, Some(&context.accounts.reporter.key()))?;
+    // The proof is the reporter's only if it committed to it before the proof
+    // was public: a copier would need a commitment from before it saw it.
+    check_equivocation_reveal(
+        &context.accounts.run.key(),
+        &params,
+        &context.accounts.reporter.key(),
+        &context.accounts.equivocation_commitment,
+        Clock::get()?.slot,
+    )?;
     let (target_p2p, run, index, ejection) = {
         let account = context.accounts.coordinator_account.load()?;
         let coordinator = &account.state.coordinator;
@@ -272,5 +331,120 @@ mod tests {
     #[test]
     fn commitments_for_different_steps_are_not_equivocation() {
         assert!(!equivocates(&[1; 32], &[2; 32], 7, 8));
+    }
+
+    fn proof_params() -> RunSlashEquivocationParams {
+        RunSlashEquivocationParams {
+            target: Pubkey::new_unique(),
+            target_index: 3,
+            batch_start: 4,
+            batch_end: 5,
+            first: CommitmentEvidence {
+                step: 7,
+                results_digest: [1; 32],
+                ..CommitmentEvidence::default()
+            },
+            second: CommitmentEvidence {
+                step: 7,
+                results_digest: [2; 32],
+                ..CommitmentEvidence::default()
+            },
+            commitment: [0; 32],
+        }
+    }
+
+    fn committed(
+        run: &Pubkey,
+        params: &RunSlashEquivocationParams,
+        reporter: &Pubkey,
+        slot: u64,
+    ) -> EquivocationCommitment {
+        let claim = EquivocationClaim {
+            run,
+            target: &params.target,
+            batch_start: params.batch_start,
+            batch_end: params.batch_end,
+            first: &params.first,
+            second: &params.second,
+        };
+        EquivocationCommitment {
+            bump: 0,
+            run: *run,
+            reporter: *reporter,
+            commitment: claim.commitment(reporter),
+            slot,
+        }
+    }
+
+    #[test]
+    fn a_reporter_reveals_the_proof_it_committed_to_in_an_earlier_slot() {
+        let run = Pubkey::new_unique();
+        let reporter = Pubkey::new_unique();
+        let params = proof_params();
+        let commitment = committed(&run, &params, &reporter, 10);
+        assert!(check_equivocation_reveal(
+            &run,
+            &params,
+            &reporter,
+            &commitment,
+            11
+        )
+        .is_ok());
+        // Not in the slot it committed in.
+        assert_eq!(
+            check_equivocation_reveal(
+                &run,
+                &params,
+                &reporter,
+                &commitment,
+                10
+            )
+            .unwrap_err(),
+            error!(ProgramError::EquivocationCommittedTooRecently)
+        );
+    }
+
+    #[test]
+    fn a_copier_cannot_reveal_against_a_commitment_that_is_not_its_own() {
+        let run = Pubkey::new_unique();
+        let honest = Pubkey::new_unique();
+        let copier = Pubkey::new_unique();
+        let params = proof_params();
+        // The honest reporter's commitment does not name the copier.
+        let honest_commitment = committed(&run, &params, &honest, 10);
+        assert_eq!(
+            check_equivocation_reveal(
+                &run,
+                &params,
+                &copier,
+                &honest_commitment,
+                11
+            )
+            .unwrap_err(),
+            error!(ProgramError::EquivocationNotCommitted)
+        );
+        // A commitment to another proof does not cover this one.
+        let mut other = proof_params();
+        other.target = params.target;
+        other.second.results_digest = [3; 32];
+        let other_commitment = committed(&run, &other, &copier, 10);
+        assert_eq!(
+            check_equivocation_reveal(
+                &run,
+                &params,
+                &copier,
+                &other_commitment,
+                11
+            )
+            .unwrap_err(),
+            error!(ProgramError::EquivocationNotCommitted)
+        );
+        // Nor does one made for another run.
+        let elsewhere = committed(&Pubkey::new_unique(), &params, &copier, 10);
+        assert_eq!(
+            check_equivocation_reveal(&run, &params, &copier, &elsewhere, 11)
+                .unwrap_err(),
+            error!(ProgramError::EquivocationNotCommitted)
+        );
     }
 }

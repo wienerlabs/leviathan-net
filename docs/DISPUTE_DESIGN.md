@@ -185,22 +185,40 @@ out of reach for good (wienerlabs/leviathan-net#39). Two rules now close that:
   It used to pay the bounty to whatever token account the withdrawal named.
   The withdrawal is signed by the slashed participant itself, so the bounty
   could go to a second wallet it controlled (wienerlabs/leviathan-net#72).
-- **An equivocator can still report itself.** An equivocation proof is
-  permissionless, so a target that signed two payloads can send its own proof
-  from a second wallet, if it lands before anyone else's.
-  - The proof is public once anyone sends it: both payloads and both
-    signatures are in the transaction. So the target can also copy an honest
-    reporter's transaction, put its own wallet in as the reporter, and land it
-    first.
-  - Either way it gets the bounty back and loses only
-    `1 - slash_bounty_bps / 10000` of the charge, and nothing at 10000.
-  - The chain cannot tell that wallet from an honest reporter.
+- **An equivocation's reporter commits before it reveals, and its bounty is
+  the run's own share.** An equivocation proof is permissionless, and its
+  reporter is paid out of the target's forfeit. That left two routes for the
+  target to take the bounty back (wienerlabs/leviathan-net#92):
+  - **Copying.** The proof is public once anyone sends it: both payloads and
+    both signatures are in the transaction. Anyone could copy an honest
+    reporter's, put its own wallet in as the reporter, and land it first,
+    taking the bounty from whoever found the fraud. Now a reporter first sends
+    `run_commit_equivocation` with a hash of the proof and its own key
+    (`EquivocationClaim::commitment`). It reveals the proof through
+    `run_slash_equivocation` in a later slot, against that commitment
+    (`EquivocationCommittedTooRecently` in the same slot,
+    `EquivocationNotCommitted` against another proof or another reporter's).
+    A copier sees only the hash until the reveal, and by then it is too late
+    to commit: the honest reporter's proof is already in flight and lands
+    first. A reporter that loses the race closes its commitment
+    (`run_close_equivocation_commitment`) and takes its rent back; a reveal
+    closes its own.
+  - **Reporting itself.** A target can still commit and reveal its own proof
+    from a second wallet, which the chain cannot tell from an honest
+    reporter. So an equivocation's bounty is a share of its own, set by the
+    run's main authority with its bond economics
+    (`run_set_equivocation_bounty`). It is refused at the whole forfeit
+    (`EquivocationBountyTooHigh`, at most 9999 bps), and at the charge it is
+    also held to the run's `slash_bounty_bps`. A run that set none gives an
+    equivocation's reporter nothing.
 
-  So a run's bounty share sets a floor on what equivocating costs, and it has
-  to stay below 10000 for equivocation to cost anything. Closing the route
-  needs a different reporting scheme, such as a commitment to the proof before
-  it is revealed (wienerlabs/leviathan-net#92). A `run_slash` is not exposed
-  this way: the run authority names its reporter.
+  What remains: a target that reports itself loses
+  `slashing_rate * (1 - bounty_bps / 10000)` of the charge, more than
+  nothing whatever the run sets. A higher share pays honest reporters more and
+  self-reporting targets more alike. It is kept in an account of its own,
+  `EquivocationBounty`, rather than in `Run`, whose length tells the
+  dashboard's decoders its generations apart. A `run_slash` is not exposed to
+  either route: the run authority names its reporter.
 - **A target with no participant account when it is slashed owes its reporter
   nothing.** It has no bond then, so its report is charged at nothing. If it
   posts a bond later, the ledger's charge is taken from that bond at its
@@ -500,10 +518,11 @@ in nonce or results are equivocation (wienerlabs/leviathan-net#46).
   record is written then reads it whole, and a crash leaves no partial record
   holding the name. Either used to lose the proof.
 - **The proof convicts on its own.** `run_slash_equivocation` takes the two
-  commitments, the batch and the target's roster index. The same transaction
-  carries an ed25519 precompile instruction for each, both signed by the
-  target's roster p2p key. The treasurer rebuilds both hashes as above and
-  refuses the proof unless:
+  commitments, the batch and the target's roster index, and reveals them
+  against the reporter's commitment from an earlier slot (above). The same
+  transaction carries an ed25519 precompile instruction for each, both signed
+  by the target's roster p2p key. The treasurer rebuilds both hashes as above
+  and refuses the proof unless:
   - both are from the current epoch (`CommitmentOutsideEpoch`);
   - the steps are the same and the hashes differ (`EquivocationNotProven`);
   - both signatures are the key of the client at that roster index
@@ -526,9 +545,10 @@ in nonce or results are equivocation (wienerlabs/leviathan-net#46).
   (wienerlabs/leviathan-net#40).
 - **Every verifier submits it.** Each pass, the daemon looks beside every kept
   payload for an equivocation record, whatever batches its committee assigns
-  it. It checks both commitments against the target's roster key and submits
-  the proof. The first proof to land ejects the target, and the next daemon
-  finds it ejected (`already_on_chain`).
+  it. It checks both commitments against the target's roster key, commits to
+  the proof, and reveals it on a later pass, once the slot has moved on. The
+  first proof to land ejects the target, and the next daemon finds it ejected
+  (`already_on_chain`) and closes its own commitment.
   - **Refused.** A proof the chain did not take counts as a failed
     submission, which the uncaught-fraud kill switch fires on, and is sent
     again every pass.

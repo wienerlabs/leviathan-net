@@ -2,11 +2,14 @@ use anchor_lang::prelude::*;
 use psyche_coordinator::Coordinator;
 use psyche_solana_coordinator::CoordinatorAccount;
 
-use crate::logic::bounty_amount;
+use crate::logic::bounty_share;
 use crate::state::coordinator_slashed_points;
+use crate::state::equivocation_bounty_bps;
 use crate::state::ConvictionCharge;
+use crate::state::EquivocationBounty;
 use crate::state::Participant;
 use crate::state::Run;
+use crate::state::SlashKind;
 use crate::state::SlashReport;
 use crate::ProgramError;
 
@@ -58,6 +61,16 @@ pub struct RunChargeSlashReportAccounts<'info> {
         bump,
     )]
     pub target_participant: UncheckedAccount<'info>,
+
+    /// CHECK: the run's equivocation bounty at its own PDA, read only after
+    /// this checks that it exists and belongs to this program. A run that set
+    /// none gives an equivocation's reporter nothing
+    /// (wienerlabs/leviathan-net#92).
+    #[account(
+        seeds = [EquivocationBounty::SEEDS_PREFIX, run.key().as_ref()],
+        bump,
+    )]
+    pub equivocation_bounty: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -66,15 +79,31 @@ pub struct RunChargeSlashReportParams {
     pub charge_epoch_start: u64,
 }
 
+/// The share of the forfeit `report`'s reporter is owed in `run`: a slash's
+/// bounty for the run authority's `run_slash`, and the run's equivocation
+/// bounty, `equivocation`, for an equivocation, whose reporter can be the
+/// target itself (wienerlabs/leviathan-net#92).
+pub fn report_bounty_bps(
+    report: &SlashReport,
+    run: &Run,
+    equivocation: Option<&EquivocationBounty>,
+) -> u16 {
+    match report.kind {
+        SlashKind::AuthoritySlash => run.slash_bounty_bps,
+        SlashKind::Equivocation => equivocation_bounty_bps(run, equivocation),
+    }
+}
+
 /// Charges `report`'s slash against `participant`, the target's account if
-/// it has one, out of `slashed_points` the ledger charged it. Returns what the
-/// bond paid.
+/// it has one, out of `slashed_points` the ledger charged it, and records
+/// `bounty_bps` of what the bond paid as owed to the reporter. Returns what
+/// the bond paid.
 pub fn charge_slash_report(
     report: &mut SlashReport,
     participant: Option<&mut Participant>,
-    run: &Run,
     coordinator: &Coordinator,
     slashed_points: u64,
+    bounty_bps: u16,
 ) -> Result<u64> {
     if report.charge != ConvictionCharge::Ejected {
         return err!(ProgramError::ConvictionNotChargeable);
@@ -94,7 +123,7 @@ pub fn charge_slash_report(
         },
         None => 0,
     };
-    report.record_charge(bounty_amount(run, forfeit));
+    report.record_charge(bounty_share(forfeit, bounty_bps));
     Ok(forfeit)
 }
 
@@ -107,14 +136,24 @@ pub fn run_charge_slash_report_processor(
         let data = info.try_borrow_data()?;
         Participant::from_pda_account(info.owner, &data)?
     };
+    let equivocation = {
+        let info = context.accounts.equivocation_bounty.to_account_info();
+        let data = info.try_borrow_data()?;
+        EquivocationBounty::from_pda_account(info.owner, &data)?
+    };
+    let bounty_bps = report_bounty_bps(
+        &context.accounts.slash_report,
+        &context.accounts.run,
+        equivocation.as_ref(),
+    );
     let forfeit = {
         let account = context.accounts.coordinator_account.load()?;
         charge_slash_report(
             &mut context.accounts.slash_report,
             participant.as_mut(),
-            &context.accounts.run,
             &account.state.coordinator,
             coordinator_slashed_points(&account, &params.target),
+            bounty_bps,
         )?
     };
     if let Some(participant) = participant.as_ref() {

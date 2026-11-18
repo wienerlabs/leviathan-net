@@ -6,12 +6,18 @@
 //! and no committee. So every daemon looks for them in every pass, whatever
 //! batches its committee assigns it, and submits the proof. The first proof
 //! to land ejects the peer, and the daemons after it find the peer ejected.
+//!
+//! A proof is taken only from a reporter that committed to it in an earlier
+//! slot, so that nobody who sees it can copy it and land it as its own
+//! (wienerlabs/leviathan-net#92). A daemon commits to a proof in one pass and
+//! reveals it in the next.
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anchor_lang::AccountDeserialize;
 use leviathan_telemetry::verifier::PassReport;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::check_equivocation;
@@ -23,10 +29,13 @@ use leviathan_verifier::VerifiedCommitment;
 use psyche_coordinator::ClientState;
 use psyche_coordinator::Coordinator;
 use psyche_network::equivocation_record_path;
+use psyche_solana_treasurer::find_equivocation_commitment;
 use psyche_solana_treasurer::state::conviction_landing;
+use psyche_solana_treasurer::state::EquivocationCommitment;
 use psyche_solana_treasurer::state::Landing;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
 
 use crate::daemon::hex8;
@@ -34,6 +43,9 @@ use crate::daemon::parse_committer;
 use crate::daemon::signed_commitment_of;
 use crate::daemon::target_ejected;
 use crate::daemon::AuditConfig;
+use crate::equivocation::equivocation_commitment;
+use crate::equivocation::process_treasurer_run_close_equivocation_commitment;
+use crate::equivocation::process_treasurer_run_commit_equivocation;
 use crate::equivocation::process_treasurer_run_slash_equivocation;
 use crate::signed_commitment::SignedCommitment;
 
@@ -268,6 +280,7 @@ impl EquivocationPass<'_> {
             println!("  {committer} is already ejected, the chain holds a conviction of it");
             self.report.already_on_chain += 1;
             self.judged.insert(committer.to_string());
+            self.withdraw_commitment(proof).await;
             return Judgement::Settled;
         }
         // The treasurer lands the proof only as an ejection the epoch will
@@ -284,6 +297,7 @@ impl EquivocationPass<'_> {
                     proof.state, self.coordinator.run_state
                 );
                 self.report.submission_failures += 1;
+                self.withdraw_commitment(proof).await;
                 return Judgement::Settled;
             },
         };
@@ -293,6 +307,37 @@ impl EquivocationPass<'_> {
             );
             self.report.withheld += 1;
             return Judgement::Settled;
+        }
+        // The proof is the daemon's only once it committed to it in an
+        // earlier slot: commit now, and reveal on a later pass, once the slot
+        // has moved on.
+        match self.committed(proof).await {
+            Ok(Some(commitment)) => {
+                match self.endpoint.get_sysvar_clock().await {
+                    Ok(clock) if commitment.revealable_in(clock.slot) => {},
+                    Ok(_) => {
+                        println!(
+                        "  the commitment to the equivocation proof for {committer} is from this slot, revealing it next pass"
+                    );
+                        return Judgement::Retry;
+                    },
+                    Err(err) => {
+                        println!(
+                        "  could not read the slot to reveal the equivocation proof for {committer}, retrying next pass: {err:#}"
+                    );
+                        self.report.submission_failures += 1;
+                        return Judgement::Retry;
+                    },
+                }
+            },
+            Ok(None) => return self.commit(proof).await,
+            Err(err) => {
+                println!(
+                    "  could not read the commitment to the equivocation proof for {committer}, retrying next pass: {err:#}"
+                );
+                self.report.submission_failures += 1;
+                return Judgement::Retry;
+            },
         }
         let result = process_treasurer_run_slash_equivocation(
             self.endpoint,
@@ -320,6 +365,102 @@ impl EquivocationPass<'_> {
         }
     }
 
+    /// The daemon's commitment to `proof`, the hash it reveals it against.
+    fn commitment(&self, proof: &Proof<'_>) -> [u8; 32] {
+        equivocation_commitment(
+            self.run,
+            &self.authority.pubkey(),
+            &proof.signer,
+            &proof.first,
+            &proof.second,
+        )
+    }
+
+    /// The daemon's commitment to `proof` on chain, if it made one.
+    async fn committed(
+        &mut self,
+        proof: &Proof<'_>,
+    ) -> anyhow::Result<Option<EquivocationCommitment>> {
+        let address = find_equivocation_commitment(
+            self.run,
+            &self.authority.pubkey(),
+            &self.commitment(proof),
+        );
+        let Some(account) = self.endpoint.get_account(&address).await? else {
+            return Ok(None);
+        };
+        let commitment =
+            EquivocationCommitment::try_deserialize(&mut &account.data[..])
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Unable to decode the equivocation commitment {address}: {error}"
+                    )
+                })?;
+        Ok(Some(commitment))
+    }
+
+    /// Commits to `proof`, to reveal it on a later pass, once the commitment
+    /// is on chain from a slot before anyone could see the proof.
+    async fn commit(&mut self, proof: &Proof<'_>) -> Judgement {
+        let committer = proof.committer;
+        match process_treasurer_run_commit_equivocation(
+            self.endpoint,
+            self.authority,
+            self.authority,
+            self.run,
+            &proof.signer,
+            &proof.first,
+            &proof.second,
+        )
+        .await
+        {
+            Ok(_) => {
+                println!(
+                    "  committed to the equivocation proof for {committer}, to reveal it next pass"
+                );
+                Judgement::Retry
+            },
+            Err(err) => {
+                println!(
+                    "  could not commit to the equivocation proof for {committer}, retrying next pass: {err:#}"
+                );
+                self.report.submission_failures += 1;
+                Judgement::Retry
+            },
+        }
+    }
+
+    /// Closes the daemon's commitment to `proof`, which another reporter's
+    /// proof made moot, so its rent comes back. A failure costs only the rent.
+    async fn withdraw_commitment(&mut self, proof: &Proof<'_>) {
+        let commitment = self.commitment(proof);
+        match self.committed(proof).await {
+            Ok(Some(_)) => {},
+            Ok(None) => return,
+            Err(err) => {
+                println!(
+                    "  could not read the commitment to the equivocation proof for {}: {err:#}",
+                    proof.committer
+                );
+                return;
+            },
+        }
+        if let Err(err) = process_treasurer_run_close_equivocation_commitment(
+            self.endpoint,
+            self.authority,
+            self.authority,
+            self.run,
+            &commitment,
+        )
+        .await
+        {
+            println!(
+                "  could not close the commitment to the equivocation proof for {}: {err:#}",
+                proof.committer
+            );
+        }
+    }
+
     /// What a refused submission of `proof` comes to: the chain already
     /// ejected its committer, or a failure retried on the next pass.
     async fn refused(
@@ -342,6 +483,7 @@ impl EquivocationPass<'_> {
                 );
                 self.report.already_on_chain += 1;
                 self.judged.insert(committer.to_string());
+                self.withdraw_commitment(proof).await;
                 Judgement::Settled
             },
             Ok(false) => {
