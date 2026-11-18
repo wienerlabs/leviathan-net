@@ -244,8 +244,9 @@ An older, shorter account does not deserialize with the new layout, so the treas
 - **A conviction's bounty.**
   - It is no longer paid at the convicted target's withdrawal. It is recorded on the verdict when the target's bond is charged.
   - That charge is made either by `run_charge_conviction` once the epoch has been charged, or by the withdrawal itself.
+  - A conviction recorded as `Due` is charged by `run_charge_conviction`'s counterpart, `run_charge_due_conviction`, once the target is on no roster an epoch will still charge, or by the withdrawal. It used to wait for the target to come back or withdraw (wienerlabs/leviathan-net#74).
   - Each recipient's bond is then credited through `run_pay_verdict_bounty`.
-  - The verifier daemon does both, for every open dispute in the run, at the end of each pass, after its own judging, so a backlog never costs it a vote. A daemon in dry-run mode sends nothing.
+  - The verifier daemon does all of it, for every open dispute in the run, at the end of each pass, after its own judging, so a backlog never costs it a vote. A daemon in dry-run mode sends nothing.
   - `run-manager bond-withdraw-finalize` does both for every seat the wallet is owed before it withdraws, whether or not the wallet still has a vote open.
 - **A slash no verdict accounts for.** Since wienerlabs/leviathan-net#72, the withdrawal no longer names who is paid for it. A `run_slash` or an equivocation records its reporter on a `SlashReport` when it ejects its target:
   - A `run_slash` takes the target and an optional reporter. `run_slash_instruction` and `process_treasurer_run_slash` in the tooling take both.

@@ -11,13 +11,18 @@
 //! A share the wallet is owed out of a verdict's losing side is credited to its
 //! bond: a tie-breaker's share of an overturn's forfeits, or a voter's, or an
 //! upholding tie-breaker's, share of a convicted target's forfeit, charging
-//! the target first if nobody has (wienerlabs/leviathan-net#64).
+//! the target first if nobody has (wienerlabs/leviathan-net#64). A due
+//! conviction is landed first where it can be, and charged against the
+//! target's bond where it never can (wienerlabs/leviathan-net#74).
 
 use anchor_client::solana_sdk::instruction::Instruction;
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use anyhow::Result;
 use psyche_coordinator::Coordinator;
-use psyche_solana_treasurer::state::{appeal_window_open, AuditVerdict, Run, VerdictStatus};
+use psyche_solana_treasurer::state::{
+    appeal_window_open, conviction_landing, on_charging_roster, AuditVerdict, Landing, Run,
+    VerdictStatus,
+};
 
 use crate::{instructions, SolanaBackend};
 
@@ -45,6 +50,10 @@ pub enum VoteStep {
     /// Charge the convicted target's bond for the conviction that ejected it,
     /// now that the ledger has charged the ejection, so its bounty is owed.
     ChargeConviction { target: Pubkey },
+    /// Charge the convicted target's bond for the conviction its verdict
+    /// records as due, now that the target is on no roster an epoch will still
+    /// charge, so its bounty is owed.
+    ChargeDueConviction { target: Pubkey },
     /// Credit the wallet's seat its share of the verdict's bounty.
     CreditSeat { target: Pubkey, seat: u16 },
     /// The vote can still cost this wallet and nothing can be done yet.
@@ -154,9 +163,33 @@ fn seat_step(verdict: &AuditVerdict, seat: usize, context: &PlanContext) -> Opti
             .ejection_charged(context.coordinator)
             .then_some(VoteStep::ChargeConviction { target });
     }
+    if verdict.status == VerdictStatus::Due {
+        return due_step(verdict, context);
+    }
     (verdict.bounty_final().is_ok() && verdict.bounty_share() > 0).then_some(VoteStep::CreditSeat {
         target,
         seat: seat as u16,
+    })
+}
+
+/// What a due conviction calls for before its recipients can be credited. On
+/// the roster of an epoch the ledger will still charge, it lands there as an
+/// ejection if it can, and otherwise waits for that epoch's charge. Off every
+/// such roster it could land only if the target came back, so the target's
+/// bond is charged for it directly.
+fn due_step(verdict: &AuditVerdict, context: &PlanContext) -> Option<VoteStep> {
+    let target = verdict.target;
+    if !on_charging_roster(context.coordinator, &target) {
+        return Some(VoteStep::ChargeDueConviction { target });
+    }
+    let target_index = roster_index(context.coordinator, &target)?;
+    matches!(
+        conviction_landing(context.coordinator, &target, target_index),
+        Ok(Landing::Eject(_))
+    )
+    .then_some(VoteStep::Finalize {
+        target,
+        target_index,
     })
 }
 
@@ -252,6 +285,14 @@ fn step_instructions(
         }
         VoteStep::ChargeConviction { target } => {
             vec![instructions::treasurer_run_charge_conviction(
+                treasurer_index,
+                &run_state.coordinator_account,
+                user,
+                target,
+            )]
+        }
+        VoteStep::ChargeDueConviction { target } => {
+            vec![instructions::treasurer_run_charge_due_conviction(
                 treasurer_index,
                 &run_state.coordinator_account,
                 user,
@@ -472,12 +513,15 @@ mod tests {
         let mut released = verdict(VerdictStatus::Due, &[user], 0);
         released.released_voters = 1;
         let steps = plan(
-            &[upheld.clone(), due.clone(), released],
+            &[upheld.clone(), due.clone(), released.clone()],
             &coordinator_in_round(0),
             0,
             &user,
             false,
         );
+        // The wallet is owed a share of each due conviction, whose target is
+        // on no roster an epoch will still charge, so each is charged too
+        // (wienerlabs/leviathan-net#74).
         assert_eq!(
             steps,
             vec![
@@ -485,6 +529,10 @@ mod tests {
                     target: upheld.target
                 },
                 VoteStep::Release { target: due.target },
+                VoteStep::ChargeDueConviction { target: due.target },
+                VoteStep::ChargeDueConviction {
+                    target: released.target
+                },
             ]
         );
     }
@@ -698,6 +746,104 @@ mod tests {
         );
         upheld.bounty_paid = 0b10;
         assert!(plan(std::slice::from_ref(&upheld), &ended, 0, &user, false).is_empty());
+    }
+
+    /// A conviction reached by `voters` with no appeal, recorded as due.
+    fn due(voters: &[Pubkey]) -> AuditVerdict {
+        let mut due = verdict(VerdictStatus::Due, voters, 0);
+        due.appeal_voters = vec![];
+        due
+    }
+
+    /// `coordinator` in `run_state`, with `target` on its roster in `state`.
+    fn with_target(
+        mut coordinator: Coordinator,
+        run_state: RunState,
+        target: &Pubkey,
+        state: psyche_coordinator::ClientState,
+    ) -> Coordinator {
+        coordinator.run_state = run_state;
+        coordinator.epoch_state.clients =
+            psyche_core::FixedVec::from_iter([psyche_coordinator::Client {
+                id: psyche_core::NodeIdentity::from_single_key(target.to_bytes()),
+                state,
+                exited_height: 0,
+            }]);
+        coordinator
+    }
+
+    #[test]
+    fn a_due_conviction_whose_target_is_gone_is_charged_and_its_voter_credited() {
+        let user = Pubkey::new_unique();
+        let mut conviction = due(&[user]);
+        conviction.released_voters = 1;
+        // Between epochs: the last one has been charged, so nothing will ever
+        // land the conviction unless the target comes back.
+        let ended = coordinator_in_round(0);
+        assert_eq!(
+            plan(std::slice::from_ref(&conviction), &ended, 0, &user, false),
+            vec![VoteStep::ChargeDueConviction {
+                target: conviction.target
+            }]
+        );
+        // Charged: the wallet's seat is credited.
+        conviction.settle_unlanded(100);
+        assert_eq!(
+            plan(std::slice::from_ref(&conviction), &ended, 0, &user, false),
+            vec![VoteStep::CreditSeat {
+                target: conviction.target,
+                seat: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_due_conviction_whose_target_is_back_lands_there_or_waits() {
+        use psyche_coordinator::ClientState;
+        let user = Pubkey::new_unique();
+        let mut conviction = due(&[user]);
+        conviction.released_voters = 1;
+        let target = conviction.target;
+        // Back on the roster of an epoch under way: it lands as an ejection.
+        let training = with_target(
+            coordinator_in_round(0),
+            RunState::RoundTrain,
+            &target,
+            ClientState::Healthy,
+        );
+        assert_eq!(
+            plan(
+                std::slice::from_ref(&conviction),
+                &training,
+                0,
+                &user,
+                false
+            ),
+            vec![VoteStep::Finalize {
+                target,
+                target_index: 0,
+            }]
+        );
+        // In a warmup, or ejected by another conviction already, it cannot
+        // land, and the epoch's charge is still to come: nothing yet.
+        for (run_state, state) in [
+            (RunState::Warmup, ClientState::Healthy),
+            (RunState::RoundTrain, ClientState::Ejected),
+            (RunState::Cooldown, ClientState::Withdrawn),
+        ] {
+            let coordinator = with_target(coordinator_in_round(0), run_state, &target, state);
+            assert!(
+                plan(
+                    std::slice::from_ref(&conviction),
+                    &coordinator,
+                    0,
+                    &user,
+                    false
+                )
+                .is_empty(),
+                "{run_state} {state:?}"
+            );
+        }
     }
 
     #[test]
