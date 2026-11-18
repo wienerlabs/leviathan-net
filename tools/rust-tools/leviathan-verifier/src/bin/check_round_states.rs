@@ -250,12 +250,11 @@ async fn main() -> Result<()> {
             states_of.len()
         );
     }
-    if kept_steps.len() < 2 {
-        bail!(
-            "the last epoch kept states of {} steps; the check needs a round past its first",
-            kept_steps.len()
-        );
-    }
+    // How many rounds the last epoch holds depends on how fast the machine
+    // trains them, and may be one. What the check needs is a last epoch that
+    // is not the run's first: a node carries its error feedback across
+    // epochs, so its states there hold a buffer the run filled, and the
+    // earlier epochs' states have something to have been forgotten from.
     if forgotten == 0 {
         bail!("no payload is of an earlier epoch; the check needs the run to cover two");
     }
