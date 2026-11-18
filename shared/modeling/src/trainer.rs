@@ -1,13 +1,14 @@
 use crate::{
     AllReduce, CausalLM, Communicator, CommunicatorId, CudaSynchronize, Distro, DistroResult,
     EosToks, Fp32GradientAccumulator, Optimizer, ReduceType, StableVariableIterator,
-    round_state_digest, unsharded_cpu_variables, write_round_state,
+    keep_round_state, round_state_digest, unsharded_cpu_variables, write_round_state,
 };
 use anyhow::{Error, Result};
 use psyche_core::{Barrier, BatchId, LearningRateSchedule, OptimizerDefinition};
 use std::{
     collections::HashMap,
     ops::ControlFlow,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -260,7 +261,7 @@ enum ParallelAssignment {
         rollback: Vec<(u32, Vec<DistroResults>)>,
         cancel_training: CancellationToken,
         prev_self_distro_results: Option<Vec<DistroResults>>,
-        commit_state: bool,
+        state_commitment: StateCommitment,
     },
     Optimize {
         distro_results: Option<Vec<DistroResults>>,
@@ -494,10 +495,23 @@ pub struct LocalTrainer {
     barrier: Arc<dyn Barrier>,
     data_parallel: Option<Vec<DataParallel>>,
     can_do_inferences: Vec<Arc<AtomicBool>>,
-    /// Whether each round's training commits to the state it trains from
-    /// (wienerlabs/leviathan-net#89). A trainer driven from Python cannot:
-    /// its ranks there do not join the gathers the digest needs.
-    commit_state: bool,
+    /// What each round's training commits to, and keeps, of the state it
+    /// trains from (wienerlabs/leviathan-net#89).
+    state_commitment: StateCommitment,
+}
+
+/// What each round's training commits to, and keeps, of the state it trains
+/// from (wienerlabs/leviathan-net#89, `docs/ROUND_AUDIT.md`).
+#[derive(Debug, Clone)]
+pub enum StateCommitment {
+    /// Nothing: a trainer driven from Python, whose ranks there do not join
+    /// the gathers the digest needs.
+    None,
+    /// The state's digest, with the state kept nowhere.
+    Digest,
+    /// The state's digest, with the state kept in this directory, in a file
+    /// named by the digest, so the node can reveal it to an audit.
+    Keep(PathBuf),
 }
 
 #[derive(Debug, Error)]
@@ -600,7 +614,7 @@ impl LocalTrainer {
             barrier,
             data_parallel,
             can_do_inferences,
-            commit_state: true,
+            state_commitment: StateCommitment::Digest,
         }
     }
 
@@ -609,24 +623,56 @@ impl LocalTrainer {
     /// digest needs (wienerlabs/leviathan-net#89).
     pub fn without_state_commitment(self) -> Self {
         Self {
-            commit_state: false,
+            state_commitment: StateCommitment::None,
+            ..self
+        }
+    }
+
+    /// This trainer, keeping each state it commits to in `dir`, in a file
+    /// named by the state's digest (`round_state_file`), so the node can
+    /// reveal it to an audit (wienerlabs/leviathan-net#89).
+    pub fn keeping_round_states_in(self, dir: PathBuf) -> Self {
+        Self {
+            state_commitment: StateCommitment::Keep(dir),
             ..self
         }
     }
 
     /// The digest of the state `model` and `optimizer` train round `step`
-    /// from, on the model thread at `index`. The first thread hashes it. The
-    /// others of a sharded model only join the gathers it needs, and those of
-    /// an unsharded one do nothing. A state that cannot be encoded is logged
-    /// and committed to as none, which an audit then finds unrevealable.
+    /// from, on the model thread at `index`, as `commitment` asks. The first
+    /// thread hashes it, and keeps it where it is kept. The others of a
+    /// sharded model only join the gathers it needs, and those of an
+    /// unsharded one do nothing. A state that cannot be encoded is logged and
+    /// committed to as none, which an audit then finds unrevealable. A state
+    /// that cannot be kept is logged and still committed to: it is the state
+    /// the round trains from, which the node then cannot reveal.
     fn commit_round_state(
+        commitment: &StateCommitment,
         model: &dyn CausalLM,
         optimizer: &Distro,
         index: usize,
         step: u32,
     ) -> Option<[u8; 32]> {
+        let keep_in = match commitment {
+            StateCommitment::None => return None,
+            StateCommitment::Digest => None,
+            StateCommitment::Keep(dir) => Some(dir.as_path()),
+        };
         if index == 0 {
-            return match round_state_digest(model, optimizer) {
+            let digest = match keep_in {
+                Some(dir) => keep_round_state(dir, model, optimizer).map(|kept| {
+                    if let Err(err) = &kept.file {
+                        error!(
+                            step,
+                            dir = %dir.display(),
+                            "Cannot keep the state this round trains from, so it cannot be revealed: {err}"
+                        );
+                    }
+                    kept.digest
+                }),
+                None => round_state_digest(model, optimizer),
+            };
+            return match digest {
                 Ok(digest) => Some(digest),
                 Err(err) => {
                     error!(
@@ -738,7 +784,7 @@ impl LocalTrainer {
                 rollback: rollback.clone(),
                 prev_self_distro_results: prev_self_distro_results.clone(),
                 cancel_training: cancel_training.clone(),
-                commit_state: self.commit_state,
+                state_commitment: self.state_commitment.clone(),
             })
             .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
         }
@@ -1058,7 +1104,7 @@ impl LocalTrainer {
                     rollback: _,
                     prev_self_distro_results,
                     cancel_training,
-                    commit_state,
+                    state_commitment,
                 }) => {
                     // this needs even more work for overlapped
                     // for (step, result) in rollback.iter().rev() {
@@ -1171,14 +1217,13 @@ impl LocalTrainer {
                             // The state this round trains from, committed to
                             // before the lookahead moves the weights
                             // (wienerlabs/leviathan-net#89).
-                            if commit_state {
-                                state_digest = Self::commit_round_state(
-                                    model.as_ref(),
-                                    optimizer,
-                                    index,
-                                    step,
-                                );
-                            }
+                            state_digest = Self::commit_round_state(
+                                &state_commitment,
+                                model.as_ref(),
+                                optimizer,
+                                index,
+                                step,
+                            );
                             match &prev_self_distro_results {
                                 Some(_) => optimizer.error_correction(model.as_ref(), prev_lr),
                                 None => {

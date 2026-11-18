@@ -31,6 +31,10 @@ path = "src/bin/check_error_feedback_fidelity.rs"
 name = "measure-round-state"
 path = "src/bin/measure_round_state.rs"
 
+[[bin]]
+name = "check-round-states"
+path = "src/bin/check_round_states.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -44,6 +48,9 @@ psyche-coordinator.workspace = true
 psyche-data-provider.workspace = true
 psyche-network.workspace = true
 psyche-modeling.workspace = true
+psyche-metrics.workspace = true
+blake3 = "1.8.3"
+tempfile = "3"
 psyche-verifier.workspace = true
 
 [dev-dependencies]

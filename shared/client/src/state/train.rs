@@ -15,9 +15,9 @@ use psyche_modeling::{
     TrainerThreadCommunicationError,
 };
 use psyche_network::{
-    CommitmentRecord, EquivocationRecord, Hash, SerializeDistroResultError, SerializedDistroResult,
-    TransmittableDistroResult, commitment_record_path, distro_results_to_bytes,
-    equivocation_record_path, payload_dump_name,
+    CommitmentRecord, EquivocationRecord, Hash, RoundStates, SerializeDistroResultError,
+    SerializedDistroResult, TransmittableDistroResult, commitment_record_path,
+    distro_results_to_bytes, equivocation_record_path, payload_dump_name,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -102,6 +102,10 @@ pub struct TrainingStepMetadata {
     pub tx_distro_result: mpsc::UnboundedSender<DistroBroadcastAndPayload>,
 
     pub write_gradients_dir: Option<PathBuf>,
+
+    /// The states this node keeps of the rounds it trains, to reveal one to
+    /// an audit (wienerlabs/leviathan-net#89).
+    pub round_states: Option<RoundStates>,
 
     pub model_task_runner: ModelTaskRunner,
 }
@@ -299,6 +303,7 @@ impl TrainingStepMetadata {
                 let epoch_start = state.epoch_state.start_timestamp;
                 let cancel_training = cancel_training.clone();
                 let write_gradients_dir = self.write_gradients_dir.clone();
+                let round_states = self.round_states.clone();
                 let tx_distro_result = self.tx_distro_result.clone();
                 let quantize = match &state.model {
                     model::Model::LLM(llm) => match llm.optimizer {
@@ -430,6 +435,18 @@ impl TrainingStepMetadata {
                                 let write_gradients_dir = write_gradients_dir.clone();
                                 let tx_distro_result = tx_distro_result.clone();
                                 let run_id = run_id.clone();
+                                // The state this payload commits to, kept to be revealed
+                                // until its epoch ends (wienerlabs/leviathan-net#89).
+                                if let (Some(round_states), Some(digest)) =
+                                    (round_states.clone(), state_digest)
+                                {
+                                    tokio::spawn(keep_round_state(
+                                        round_states,
+                                        epoch_start,
+                                        step,
+                                        digest,
+                                    ));
+                                }
                                 let res: Result<(), TrainError> = tokio::task::spawn_blocking(move || {
                                     if cancelled {
                                         trace!("However, we were cancelled, so we're throwing away this result.");
@@ -824,6 +841,26 @@ fn inject_fake_delta(results: Vec<DistroResult>) -> Vec<DistroResult> {
             result
         })
         .collect()
+}
+
+/// Keeps the state the round at `step` of the epoch that started at
+/// `epoch_start` trained from, named by `digest`, which the trainer wrote, so
+/// the node serves it to an audit until the epoch ends. It is kept beside the
+/// payload's transmission, not before it: a verifier fetching it first finds
+/// it missing, and asks again within the reveal window.
+async fn keep_round_state(
+    round_states: RoundStates,
+    epoch_start: u64,
+    step: u32,
+    digest: [u8; 32],
+) {
+    match round_states.keep(epoch_start, digest).await {
+        Ok(()) => debug!(step, "Kept the state this round trained from"),
+        Err(err) => error!(
+            step,
+            "Cannot keep the state this round trained from, so it cannot be revealed: {err}"
+        ),
+    }
 }
 
 /// Writes `distro_result` to disk, as a payload dump the verifier daemon reads.

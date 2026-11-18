@@ -16,6 +16,9 @@ FAKE="${FAKE:-sign_flip}"
 AUTHORIZER="${AUTHORIZER:-11111111111111111111111111111111}"
 LOGDIR="${LOGDIR:-$HOME/leviathan-swarm/logs}"
 DUMPROOT="${DUMPROOT:-$HOME/leviathan-swarm/dumps}"
+# Each node keeps the state it trains each round from here, to reveal it to an audit
+# (wienerlabs/leviathan-net#89).
+STATEROOT="${STATEROOT:-$HOME/leviathan-swarm/states}"
 
 TORCH_LIB="$HOME/.leviathan-torch/lib/python3.13/site-packages/torch/lib"
 PYLIB="/opt/homebrew/opt/python@3.13/Frameworks/Python.framework/Versions/3.13/lib"
@@ -27,7 +30,7 @@ cd "$REPO_ROOT"
 BIN="target/debug/psyche-solana-client"
 [[ -x "$BIN" ]] || { echo "error: build $BIN first" >&2; exit 1; }
 
-mkdir -p "$LOGDIR" "$DUMPROOT"
+mkdir -p "$LOGDIR" "$DUMPROOT" "$STATEROOT"
 pids=()
 cleanup() { echo "[swarm] stopping ${#pids[@]} nodes"; kill "${pids[@]}" 2>/dev/null || true; }
 trap cleanup INT TERM EXIT
@@ -50,6 +53,7 @@ for ((i = 0; i < NODES; i++)); do
     --authorizer "$AUTHORIZER" --logs console \
     --iroh-discovery local \
     --write-gradients-dir "$dump" \
+    --round-state-dir "$STATEROOT/node$i" \
     > "$LOGDIR/node$i.log" 2>&1 &
   pids+=("$!")
   sleep 4

@@ -69,32 +69,57 @@ and hashes them. That is about twice the model, every round, on every node.
 | about 1B | about 3.7 GiB | about 3.7 GiB |
 
 Measured with `measure-round-state` on the FineWeb rehearsal's 19.1M Llama in
-bf16, on an M1 Pro, after a real step filled the buffer (20 rounds each):
+bf16, on an M1 Pro, after a real step filled the buffer, as the workspace's
+dev profile builds it (20 rounds each, means):
 
-| Where the node trains | State | Copied off the device, encoded and hashed |
-|---|---|---|
-| CPU | 73.0 MiB | 0.045 s per round |
-| M1 GPU (`mps`) | 73.0 MiB | 0.082 s per round |
+| Where the node trains | State | Copied off the device, encoded and hashed | Also written to disk | The client's import |
+|---|---|---|---|---|
+| CPU | 73.0 MiB | 0.044 s per round | 0.080 s per round | 0.082 s |
+| M1 GPU (`mps`) | 73.0 MiB | 0.094 s per round | 0.117 s per round | 0.079 s |
 
-That is about 0.9 GiB/s from the GPU. The trainer takes the digest on its
-thread before the round's forward pass, so the round waits for it. At that
-rate a 350M state would take about 1.5 s a round and a 1B state about 4 s;
-those are extrapolated, not measured, and a CUDA node's copy rate is its
-own.
+That is about 0.8 GiB/s from the GPU, and writing the state as it is hashed
+adds 0.02 to 0.04 s. The trainer takes the digest on its thread before the
+round's forward pass, so the round waits for it. The client's import runs
+beside the round (below). At the GPU's rates, a node keeping its states would
+spend about 2 s a round at 350M and about 6 s at 1B, and about 1.7 s and 5 s
+on the digest alone; those are extrapolated, not measured, and a CUDA node's
+copy rate and disk are its own.
 
 ## Retention, and serving a state
 
-A node writes `S_h` to a state store of its own, one file per round named by
-its digest. It keeps every round still inside the audit window, which is
-`audit_rounds`, a run parameter:
+A node started with `--round-state-dir` keeps every state it commits to
+there. Without it, the node commits to each round's state but keeps none,
+and cannot reveal one; it says so when it starts.
 
-- **The disk this takes:** `audit_rounds` times the state, about 3.7 GiB a
-  round at 1B.
-- **When a round leaves the window** its file is deleted.
+- **Where.** The trainer writes `S_h` into `rounds/`, in a file named by its
+  digest, in the pass that hashes it. The encoding goes under a temporary
+  name first and is renamed once whole, so a file under a digest's name holds
+  that state. A state that cannot be written is logged, and still committed
+  to: it is the state the round trains from.
+- **Served from its own store.** The client imports the file, in place, into
+  an iroh blob store of the node's own under `store/`, on disk. The store the
+  run's results go through is in memory, and a state is about twice the model.
+  The store hashes the file as it imports it and refuses one that is not the
+  state it is named by, as a disk would leave one it damaged.
+- **For how long: the epoch.** The treasurer convicts only on a commitment
+  from the epoch under way (`CommitmentEvidence::is_from_current_epoch`). So
+  an audit can name any round of the current epoch, and none of an earlier
+  one. A state is kept until the node keeps the first state of a later epoch,
+  which forgets every earlier one: its tag, so the store drops it, and its
+  file. This replaces the `audit_rounds` parameter this design first had: the
+  bound is already on chain, and the coordinator's config has no room for one.
+- **The disk this takes:** one state per batch the node trains, for every
+  round of an epoch: `epoch_time - warmup_time` divided by how long a round
+  takes. At the bondless mainnet config's 300 s epochs and 75 s rounds, that
+  is four rounds: about 15 GiB at 1B.
+- **Across a restart.** The store is on disk, so a node that restarts still
+  serves the states of the epoch under way. When it opens them, it removes
+  any file it wrote and never kept, or never made whole.
 
-The node imports each file into its iroh blob store when it writes it. It
-serves it on request, never by broadcast: everyone downloading every state
-would cost the run twice the model per node per round.
+The node serves a state on request, never by broadcast: everyone downloading
+every state would cost the run twice the model per node per round. It serves
+over iroh's blob protocol under its own ALPN, `/leviathan/round-state/1`, and
+only to the peers on its roster, as it serves everything else.
 
 ## Revealing to a verifier
 
@@ -106,6 +131,10 @@ reaches it at that key.
 - **The fetch checks itself.** iroh verifies a blob against its hash as it
   arrives, and the hash is the digest the trainer signed. A state that does
   not match cannot be served under it.
+- **Its size first.** The verifier works out the length of a state of the
+  run's model from its shapes and dtypes alone (`round_state_len`), and
+  checks it against the size the trainer proves before anything else is
+  downloaded. A trainer cannot make a verifier download more than that.
 - **Where it goes.** The verifier's node writes it beside the payload dump, as
   `<dump>.state`, for the verifier daemon.
 - **The reveal window.** The download has `reveal_seconds`, a run parameter,
@@ -178,8 +207,8 @@ does, and it fails against a target that serves its state on appeal.
 1. **This design** (docs).
 2. **The state commitment:** v3, the digest taken in the trainer thread, the
    payload's `state_digest`, the treasurer's evidence, and the cost measured.
-3. **Retention and serving:** the state store, the audit window, and serving
-   a state by its digest.
+3. **Retention and serving:** the state store, kept for the epoch under way,
+   serving a state by its digest, and the fetch a verifier makes.
 4. **The verifier:** the reveal fetch, and the daemon's replay of a later
    round from the revealed state, with continuity on classes that repeat
    themselves. Tests run real clients on the CPU, at a round past the first:

@@ -59,7 +59,11 @@ pub use python_distributed_trainer::{
 };
 pub use rms_norm::RMSNorm;
 pub use rope::{RoPECache, RoPEConfig, RoPEType, default_rope, rotate_half, yarn_get_mscale};
-pub use round_state::{ROUND_STATE_DOMAIN, RoundStateError, round_state_digest, write_round_state};
+pub use round_state::{
+    KeptRoundState, PARTIAL_ROUND_STATE_EXTENSION, ROUND_STATE_DOMAIN, ROUND_STATE_EXTENSION,
+    RoundStateError, keep_round_state, round_state_digest, round_state_file, round_state_len,
+    write_round_state,
+};
 pub use safetensor_utils::{
     LoadSafetensorsError, SaveSafetensorsError, load_safetensors_into_variables,
     save_tensors_into_safetensors,
@@ -68,7 +72,8 @@ pub use sampling::{LogitsProcessor, Sampling};
 pub use token_output_stream::TokenOutputStream;
 pub use trainer::{
     ApplyDistroResultError, Batch, BatchData, BatchDataCPU, BatchDataGPU, DataParallel,
-    LocalTrainer, ParallelModels, TrainOutput, Trainer, TrainerThreadCommunicationError,
+    LocalTrainer, ParallelModels, StateCommitment, TrainOutput, Trainer,
+    TrainerThreadCommunicationError,
 };
 pub use variable::{StableVarStoreIterator, StableVariableIterator, Variable};
 

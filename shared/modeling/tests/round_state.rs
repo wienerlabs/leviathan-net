@@ -4,20 +4,15 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use common::{Recipe, batch, distro, genesis_recipe, load};
-use psyche_core::{
-    BatchId, CancellableBarrier, ClosedInterval, ConstantLR, LearningRateSchedule,
-    OptimizerDefinition,
-};
+use common::{Recipe, batch, distro, genesis_recipe, load, load_in, round_trainer, train_round};
 use psyche_modeling::{
-    Batch, BatchData, BatchDataCPU, CausalLM, Distro, LocalTrainer, ParallelModels,
-    ROUND_STATE_DOMAIN, Trainer, round_state_digest, write_round_state,
+    CausalLM, Distro, ROUND_STATE_DOMAIN, keep_round_state, round_state_digest, round_state_file,
+    round_state_len, write_round_state,
 };
-use tch::Tensor;
-use tokio_util::sync::CancellationToken;
+use tch::{Kind, Tensor};
 
 /// A step of `distro` on the batch for `seed`: what fills the buffer.
 fn step(recipe: &Recipe, model: &dyn CausalLM, distro: &mut Distro, seed: i64) {
@@ -119,64 +114,6 @@ fn the_digest_names_the_state_and_follows_it() {
     assert_ne!(round_state_digest(&*one, &one_distro).unwrap(), stepped);
 }
 
-/// The genesis rehearsal's DisTrO, at a constant rate.
-fn trainer(recipe: &Recipe) -> Trainer {
-    let model = load(recipe);
-    model.prepare_for_training();
-    LocalTrainer::new(
-        ParallelModels {
-            models: vec![model],
-            barrier: Arc::new(CancellableBarrier::new(1)),
-            data_parallel: None,
-        },
-        LearningRateSchedule::Constant(ConstantLR::new(recipe.lr, 0, 0.0)),
-        OptimizerDefinition::Distro {
-            clip_grad_norm: None,
-            weight_decay: None,
-            compression_decay: recipe.compression_decay as f32,
-            compression_topk: recipe.compression_topk as u16,
-            compression_chunk: recipe.compression_chunk as u16,
-            quantize_1bit: recipe.quantize_1bit,
-            robust_aggregation: recipe.robust_aggregation,
-        },
-        1,
-        None,
-        false,
-    )
-    .into()
-}
-
-/// Trains `trainer` on the batch for `seed` at `step`, taking `sent_before`
-/// out of its buffer, and returns what it reports.
-fn train(
-    recipe: &Recipe,
-    trainer: Trainer,
-    step: u32,
-    seed: i64,
-    sent_before: Vec<Vec<psyche_modeling::DistroResult>>,
-) -> psyche_modeling::TrainOutput {
-    let tokens: Vec<i32> = batch(recipe, seed).iter().map(|&t| t as i32).collect();
-    trainer
-        .train(
-            step,
-            Batch {
-                id: BatchId(ClosedInterval::new(0, 0)),
-                data: BatchData::CPU(vec![BatchDataCPU {
-                    labels: Some(tokens.clone()),
-                    input_ids: tokens,
-                    position_ids: None,
-                    sequence_lengths: None,
-                }]),
-            },
-            None,
-            false,
-            vec![],
-            Some(sent_before),
-            CancellationToken::new(),
-        )
-        .unwrap()
-}
-
 /// A trainer commits each round to the state the round trains from. Its first
 /// round trains from the checkpoint and a zeroed buffer, which anyone can
 /// rebuild, and the digest it reports is that state's. Its next round trains
@@ -191,15 +128,124 @@ fn a_trainer_commits_to_the_state_each_round_trains_from() {
 
     let mut digests = vec![];
     for _ in 0..2 {
-        let first = train(&recipe, trainer(&recipe), 1, 1, vec![]);
+        let first = train_round(&recipe, round_trainer(&recipe, None), 1, 1, vec![]);
         assert_eq!(first.state_digest, Some(first_state));
         let sent = first.distro_results.clone().unwrap();
-        let second = train(&recipe, first.trainer, 2, 2, vec![sent]);
+        let second = train_round(&recipe, first.trainer, 2, 2, vec![sent]);
         let second_state = second.state_digest.expect("the trainer commits");
         assert_ne!(second_state, first_state);
         digests.push(second_state);
     }
     assert_eq!(digests[0], digests[1]);
+}
+
+/// The files in `dir`, by name.
+fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// A kept state is its encoding, whole, in a file named by its digest, and
+/// the digest is the one the round commits to. Nothing else is left beside
+/// it.
+#[test]
+fn a_kept_state_is_its_encoding_in_a_file_named_by_its_digest() {
+    let recipe = genesis_recipe();
+    let model = load(&recipe);
+    let mut node = distro(&recipe, &*model);
+    step(&recipe, &*model, &mut node, 1);
+    let mut bytes = vec![];
+    write_round_state(&mut bytes, &*model, &node).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let kept = keep_round_state(dir.path(), &*model, &node).unwrap();
+    assert_eq!(kept.digest, round_state_digest(&*model, &node).unwrap());
+    let file = kept.file.unwrap();
+    assert_eq!(file, round_state_file(dir.path(), &kept.digest));
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    assert_eq!(files_in(dir.path()), vec![file]);
+}
+
+/// A state that cannot be kept is still committed to, by the digest of the
+/// state the round trains from, and the failure is reported, not hidden.
+#[test]
+fn a_state_that_cannot_be_kept_is_still_committed_to() {
+    let recipe = genesis_recipe();
+    let model = load(&recipe);
+    let mut node = distro(&recipe, &*model);
+    step(&recipe, &*model, &mut node, 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    let kept = keep_round_state(&missing, &*model, &node).unwrap();
+    assert_eq!(kept.digest, round_state_digest(&*model, &node).unwrap());
+    let err = kept.file.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(!missing.exists());
+    assert!(files_in(dir.path()).is_empty());
+}
+
+/// The length of a state follows from the model's shapes and dtypes alone:
+/// for a model trained in fp32, one in bf16, and one in bf16 whose buffer is
+/// kept in fp32 (wienerlabs/leviathan-net#90).
+#[test]
+fn a_states_length_is_known_from_its_shapes_alone() {
+    let recipe = genesis_recipe();
+    for (kind, buffer_kind) in [
+        (Kind::Float, None),
+        (Kind::BFloat16, None),
+        (Kind::BFloat16, Some(Kind::Float)),
+    ] {
+        let model = load_in(&recipe, kind);
+        let mut node = distro(&recipe, &*model);
+        if let Some(buffer_kind) = buffer_kind {
+            node.set_error_feedback_kind(buffer_kind).unwrap();
+        }
+        step(&recipe, &*model, &mut node, 1);
+        let mut bytes = vec![];
+        write_round_state(&mut bytes, &*model, &node).unwrap();
+        assert_eq!(
+            round_state_len(&*model, &node).unwrap(),
+            bytes.len() as u64,
+            "{kind:?} with its buffer in {buffer_kind:?}"
+        );
+    }
+}
+
+/// A trainer keeping its states writes each round's into a file named by the
+/// digest it reports, holding the state that digest names: the checkpoint
+/// and a zeroed buffer first, then the next round's state.
+#[test]
+fn a_trainer_keeps_the_state_each_round_trains_from() {
+    let recipe = genesis_recipe();
+    let checkpoint = load(&recipe);
+    let zeroed = distro(&recipe, &*checkpoint);
+    let mut first_bytes = vec![];
+    write_round_state(&mut first_bytes, &*checkpoint, &zeroed).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let trainer = round_trainer(&recipe, Some(dir.path().to_path_buf()));
+    let first = train_round(&recipe, trainer, 1, 1, vec![]);
+    let first_state = first.state_digest.expect("the trainer commits");
+    let first_file = round_state_file(dir.path(), &first_state);
+    assert_eq!(std::fs::read(&first_file).unwrap(), first_bytes);
+
+    let sent = first.distro_results.clone().unwrap();
+    let second = train_round(&recipe, first.trainer, 2, 2, vec![sent]);
+    let second_state = second.state_digest.expect("the trainer commits");
+    assert_ne!(second_state, first_state);
+    let second_file = round_state_file(dir.path(), &second_state);
+    let second_bytes = std::fs::read(&second_file).unwrap();
+    assert_eq!(*blake3::hash(&second_bytes).as_bytes(), second_state);
+    assert_eq!(second_bytes.len(), first_bytes.len());
+
+    let mut expected = vec![first_file, second_file];
+    expected.sort();
+    assert_eq!(files_in(dir.path()), expected);
 }
 
 /// What committing costs a node every round on the genesis rehearsal's model:
