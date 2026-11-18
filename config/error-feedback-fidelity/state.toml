@@ -1,0 +1,61 @@
+# The run `scripts/error-feedback-fidelity.sh` trains with two real clients
+# against a local centralized server, to check that `measure-error-feedback`
+# trains a run the way the client does (wienerlabs/leviathan-net#48).
+#
+# It is the genesis rehearsal's model, data and DisTrO, with short epochs, so
+# that a few minutes cover several of them and the rounds that close them, and
+# a schedule that changes the learning rate at every step, so that a round
+# trained or applied at another step's rate sends something else. No verifier
+# is drawn, so both clients train every round. The warmup is the rehearsal's: the
+# clients find each other over gossip before the first round, or a payload the
+# other never receives gets its sender dropped from the run.
+run_id = "error-feedback-fidelity"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 20
+cooldown_time = 5
+epoch_time = 45
+max_round_train_time = 10
+round_witness_time = 2
+min_clients = 2
+init_min_clients = 2
+verification_percent = 0
+witness_nodes = 1
+global_batch_size_start = 8
+global_batch_size_end = 8
+global_batch_size_warmup_tokens = 0
+total_steps = 40
+waiting_for_members_extra_time = 3
+
+[model.LLM]
+architecture = "HfLlama"
+data_type = "Pretraining"
+max_seq_len = 64
+cold_start_warmup_steps = 0
+
+[model.LLM.checkpoint.Hub]
+repo_id = "pefontana/Nano-Llama"
+revision = "cf48eac4944f6e954a3d9c9c30e8c865e64e7d03"
+
+[model.LLM.data_location.Http]
+token_size_in_bytes = "TwoBytes"
+shuffle = "DontShuffle"
+
+[model.LLM.data_location.Http.location]
+SingleUrl = "https://huggingface.co/pefontana/Nano-Llama/resolve/main/tiny-ci-dataset/000_tiny-test.ds"
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 4.0e-4
+warmup_steps = 10
+warmup_init_lr = 0.0
+total_steps = 40
+final_lr = 4.0e-5
+
+[model.LLM.optimizer.Distro]
+clip_grad_norm = 1.0
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 8
+quantize_1bit = true
+robust_aggregation = true

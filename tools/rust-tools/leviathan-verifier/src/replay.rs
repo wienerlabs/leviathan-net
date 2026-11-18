@@ -253,6 +253,53 @@ pub fn read_run_model(path: &Path) -> Result<LLM> {
     Ok(llm)
 }
 
+/// The global batch a run trains, in sequences, as its configuration states it
+/// (`config/leviathan/*.toml`). A run whose batch ramps up is refused: the
+/// offline tools train a fixed one.
+pub fn read_run_global_batch(path: &Path) -> Result<usize> {
+    #[derive(serde::Deserialize)]
+    struct Batches {
+        global_batch_size_start: u16,
+        global_batch_size_end: u16,
+    }
+    #[derive(serde::Deserialize)]
+    struct RunFile {
+        config: Batches,
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read run config {}", path.display()))?;
+    let run: RunFile = toml::from_str(&text)
+        .with_context(|| format!("cannot parse run config {}", path.display()))?;
+    let Batches {
+        global_batch_size_start: start,
+        global_batch_size_end: end,
+    } = run.config;
+    if start != end || end == 0 {
+        return Err(anyhow!(
+            "the run's global batch goes from {start} to {end}; the offline tools train a fixed, non-empty one"
+        ));
+    }
+    Ok(end as usize)
+}
+
+/// The share of a round's nodes a run seats as verifiers, in percent, as its
+/// configuration states it.
+pub fn read_run_verification_percent(path: &Path) -> Result<u8> {
+    #[derive(serde::Deserialize)]
+    struct Committee {
+        verification_percent: u8,
+    }
+    #[derive(serde::Deserialize)]
+    struct RunFile {
+        config: Committee,
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read run config {}", path.display()))?;
+    let run: RunFile = toml::from_str(&text)
+        .with_context(|| format!("cannot parse run config {}", path.display()))?;
+    Ok(run.config.verification_percent)
+}
+
 /// A trainer to replay with, built from the checkpoint as the client builds
 /// its own.
 ///

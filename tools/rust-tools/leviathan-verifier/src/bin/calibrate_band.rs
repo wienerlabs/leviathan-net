@@ -24,6 +24,9 @@ use anyhow::Result;
 use clap::Parser;
 use leviathan_verifier::build_replay_trainer;
 use leviathan_verifier::checkpoint_repo_files;
+use leviathan_verifier::device_label;
+use leviathan_verifier::parse_device;
+use leviathan_verifier::parse_dtype;
 use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::read_run_model;
 use leviathan_verifier::replay_data_layout;
@@ -83,37 +86,6 @@ struct Args {
     class: String,
     #[arg(long)]
     json_out: Option<PathBuf>,
-}
-
-fn parse_device(s: &str) -> Result<tch::Device> {
-    match s.trim().to_lowercase().as_str() {
-        "cpu" => Ok(tch::Device::Cpu),
-        "mps" => Ok(tch::Device::Mps),
-        "cuda" => Ok(tch::Device::Cuda(0)),
-        "auto" => Ok(tch::Device::cuda_if_available()),
-        other => other
-            .strip_prefix("cuda:")
-            .and_then(|n| n.parse::<usize>().ok())
-            .map(tch::Device::Cuda)
-            .ok_or_else(|| anyhow!("unknown device '{other}': expected cpu, mps, cuda, cuda:N, or auto")),
-    }
-}
-
-fn parse_dtype(s: &str) -> Result<tch::Kind> {
-    match s.trim().to_lowercase().as_str() {
-        "fp32" | "f32" | "float" => Ok(tch::Kind::Float),
-        "bf16" | "bfloat16" => Ok(tch::Kind::BFloat16),
-        "fp16" | "f16" | "half" => Ok(tch::Kind::Half),
-        other => Err(anyhow!("unknown dtype '{other}': expected fp32, bf16, or fp16")),
-    }
-}
-
-fn device_label(d: tch::Device) -> String {
-    match d {
-        tch::Device::Cpu => "cpu".to_string(),
-        tch::Device::Cuda(i) => format!("cuda:{i}"),
-        other => format!("{other:?}").to_lowercase(),
-    }
 }
 
 /// Compute one honest one-step delta for `batch` in the given device+dtype,
@@ -314,37 +286,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn devices_parse() {
-        assert!(matches!(parse_device("cpu").unwrap(), tch::Device::Cpu));
-        assert!(matches!(parse_device("CPU").unwrap(), tch::Device::Cpu));
-        assert!(matches!(parse_device("cuda").unwrap(), tch::Device::Cuda(0)));
-        assert!(matches!(parse_device("cuda:2").unwrap(), tch::Device::Cuda(2)));
-        assert!(matches!(parse_device("mps").unwrap(), tch::Device::Mps));
-        assert!(parse_device("auto").is_ok());
-        assert!(parse_device("gpu").is_err());
-        assert!(parse_device("cuda:x").is_err());
-    }
-
-    #[test]
-    fn dtypes_parse() {
-        assert!(matches!(parse_dtype("fp32").unwrap(), tch::Kind::Float));
-        assert!(matches!(parse_dtype("float").unwrap(), tch::Kind::Float));
-        assert!(matches!(parse_dtype("bf16").unwrap(), tch::Kind::BFloat16));
-        assert!(matches!(parse_dtype("BFloat16").unwrap(), tch::Kind::BFloat16));
-        assert!(matches!(parse_dtype("fp16").unwrap(), tch::Kind::Half));
-        assert!(parse_dtype("int8").is_err());
-    }
-
-    #[test]
-    fn device_labels_are_stable() {
-        assert_eq!(device_label(tch::Device::Cpu), "cpu");
-        assert_eq!(device_label(tch::Device::Cuda(1)), "cuda:1");
-    }
 }

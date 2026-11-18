@@ -23,12 +23,22 @@ use psyche_verifier::verify_within_band;
 use psyche_verifier::BandVerdict;
 use psyche_verifier::FraudProof;
 
+pub mod error_feedback;
+pub mod fidelity;
+pub mod hardware;
 pub mod replay;
+pub mod run_data;
+
+pub use hardware::device_label;
+pub use hardware::parse_device;
+pub use hardware::parse_dtype;
 
 pub use replay::build_replay_trainer;
 pub use replay::checkpoint_repo_files;
 pub use replay::cold_start_warmup_bounds;
 pub use replay::published_checkpoint;
+pub use replay::read_run_global_batch;
+pub use replay::read_run_verification_percent;
 pub use replay::read_run_model;
 pub use replay::replay_data_layout;
 pub use replay::parse_assignment_key;

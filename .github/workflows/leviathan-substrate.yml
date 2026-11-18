@@ -17,7 +17,10 @@ on:
       - "shared/client/**"
       - "shared/data-provider/**"
       - "config/leviathan/**"
+      - "config/error-feedback-fidelity/**"
       - "scripts/replay-smoke.sh"
+      - "scripts/error-feedback-fidelity.sh"
+      - "architectures/centralized/**"
       - "tools/rust-tools/leviathan-telemetry/**"
       - "telemetry/**"
       - ".github/workflows/leviathan-substrate.yml"
@@ -37,7 +40,10 @@ on:
       - "shared/client/**"
       - "shared/data-provider/**"
       - "config/leviathan/**"
+      - "config/error-feedback-fidelity/**"
       - "scripts/replay-smoke.sh"
+      - "scripts/error-feedback-fidelity.sh"
+      - "architectures/centralized/**"
       - "tools/rust-tools/leviathan-telemetry/**"
       - "telemetry/**"
       - ".github/workflows/leviathan-substrate.yml"
@@ -181,3 +187,12 @@ jobs:
         run: |
           cargo build --locked -p leviathan-verifier --bins
           bash scripts/replay-smoke.sh
+
+      # The error-feedback measurement of wienerlabs/leviathan-net#48 has to
+      # train a run the way the client does: two real clients train a short
+      # run, and the simulation has to send each of their payloads byte for
+      # byte.
+      - name: Error-feedback simulation against real clients
+        run: |
+          cargo build --locked --bin psyche-centralized-server --bin psyche-centralized-client --bin check-error-feedback-fidelity
+          bash scripts/error-feedback-fidelity.sh

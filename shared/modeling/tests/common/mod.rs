@@ -4,15 +4,15 @@
 
 #![allow(dead_code)]
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
-use psyche_coordinator::model::{Checkpoint, Model};
 use psyche_coordinator::CoordinatorConfig;
+use psyche_coordinator::model::{Checkpoint, Model};
 use psyche_core::OptimizerDefinition;
 use psyche_data_provider::download_model_repo_sync;
 use psyche_modeling::{
-    auto_model_for_causal_lm_from_pretrained, CausalLM, Distro, DistroResult, Trainer,
+    CausalLM, Distro, DistroResult, Trainer, auto_model_for_causal_lm_from_pretrained,
 };
 use psyche_network::SerializedDistroResult;
 use tch::{Device, Kind, Tensor};
