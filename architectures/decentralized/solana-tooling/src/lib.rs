@@ -3,6 +3,8 @@ pub mod create_memnet_endpoint;
 #[cfg(feature = "daemon")]
 pub mod daemon;
 #[cfg(feature = "daemon")]
+pub mod daemon_continuity;
+#[cfg(feature = "daemon")]
 pub mod daemon_equivocation;
 pub mod distributor;
 pub mod equivocation;

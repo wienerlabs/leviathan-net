@@ -106,6 +106,7 @@ fn config(
         audit_assigned: true,
         dry_run,
         verdict_mode: true,
+        continuity: false,
     }
 }
 

@@ -283,6 +283,7 @@ pub async fn run() {
         audit_assigned: true,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
     assert_eq!(
         audit_pass(
@@ -387,6 +388,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
 
     // A fraudulent payload kept with no signed commitment, or with one signed

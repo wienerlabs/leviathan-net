@@ -32,7 +32,7 @@ use super::{
     cooldown::{CooldownError, CooldownStep, CooldownStepMetadata},
     evals::{EvalError, MaybeRunningEvals, RunningEvals},
     init::InitRunError,
-    reveal::{RoundDraw, StateToReveal, previous_training, reveal_audited_state},
+    reveal::{RoundDraw, StateToReveal, previous_training, reveal_audited_state, round_training},
     round_state::RoundState,
     stats::StatsLogger,
     train::{
@@ -660,6 +660,7 @@ impl StepStateMachine {
                     expected_len,
                     dump: PathBuf::new(),
                     previous,
+                    trained: round_training(round_state, &from),
                     retry_every,
                     time_to_reveal,
                 })

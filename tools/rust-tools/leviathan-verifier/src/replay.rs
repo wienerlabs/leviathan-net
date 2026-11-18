@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::decompress_results;
 use crate::read_dump;
-use crate::revealed::RevealedRound;
+use crate::revealed::{NextRound, RevealedRound};
 use psyche_modeling::{read_round_state, DistroResult};
 use tch::Tensor;
 
@@ -384,7 +384,23 @@ pub trait ReplayWork {
         work: &DumpKey,
         round: &RevealedRound,
     ) -> Result<Vec<f32>, ReplayError>;
+
+    /// The digest of the state `work`'s round leaves, replayed from the state
+    /// its trainer revealed, once the results the round after applied first
+    /// are applied: the state the trainer's next round trains from
+    /// (wienerlabs/leviathan-net#89).
+    fn replay_continuity(
+        &self,
+        work: &DumpKey,
+        round: &RevealedRound,
+        next: &NextRound,
+    ) -> Result<[u8; 32], ReplayError>;
 }
+
+/// What a replay of a round from its revealed state returns: the results it
+/// sent, and, if it went on to the round after, the digest of the state that
+/// leaves.
+type RevealedStep = (Option<Vec<DistroResult>>, Option<[u8; 32]>);
 
 pub struct TrainerReplayEngine {
     trainer: Mutex<Option<Trainer>>,
@@ -523,6 +539,44 @@ impl TrainerReplayEngine {
         assignment: &ReplayAssignment,
         round: &RevealedRound,
     ) -> Result<Vec<f32>, ReplayError> {
+        let (results, _) = self.train_revealed(assignment, round, None)?;
+        let results = results.ok_or_else(|| {
+            ReplayError::Backend(
+                "replay produced no distro results, the run is not using DisTrO".to_string(),
+            )
+        })?;
+        let results = match self.quantize_1bit {
+            true => Trainer::quantize_results(&results),
+            false => results,
+        };
+        decompress_results(&results, self.device)
+            .map_err(|e| ReplayError::Backend(format!("cannot decompress replay: {e}")))
+    }
+
+    /// The state the round `assignment` trained leaves, replayed from the
+    /// state its trainer revealed, once `next`'s applied results are applied.
+    fn recompute_continuity(
+        &self,
+        assignment: &ReplayAssignment,
+        round: &RevealedRound,
+        next: &NextRound,
+    ) -> Result<[u8; 32], ReplayError> {
+        let (_, digest) = self.train_revealed(assignment, round, Some(next))?;
+        digest.ok_or_else(|| {
+            ReplayError::Backend("the replay trainer commits to no state".to_string())
+        })
+    }
+
+    /// Trains the round `assignment` from the state its trainer revealed, and
+    /// returns its results; given `next`, then applies what the round after
+    /// applied first, as the client does, and returns the digest of the state
+    /// that leaves.
+    fn train_revealed(
+        &self,
+        assignment: &ReplayAssignment,
+        round: &RevealedRound,
+        next: Option<&NextRound>,
+    ) -> Result<RevealedStep, ReplayError> {
         let backend = |what: &str, err: &dyn std::fmt::Display| {
             ReplayError::Backend(format!("{what}: {err}"))
         };
@@ -554,6 +608,22 @@ impl TrainerReplayEngine {
                     )
                 })?,
             None => vec![],
+        };
+        let applied = match next.and_then(|next| next.applied.as_ref()) {
+            Some(paths) => Some(
+                paths
+                    .iter()
+                    .map(|path| {
+                        read_dump(path)
+                            .map_err(|err| backend("cannot read an applied payload", &err))?
+                            .iter()
+                            .map(DistroResult::try_from)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|err| backend("an applied payload does not decode", &err))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
         };
 
         let mut slot = self
@@ -606,20 +676,25 @@ impl TrainerReplayEngine {
             }
         };
         let results = output.distro_results.clone();
-        *slot = Some(output.trainer);
-        drop(slot);
-
-        let results = results.ok_or_else(|| {
-            ReplayError::Backend(
-                "replay produced no distro results, the run is not using DisTrO".to_string(),
-            )
-        })?;
-        let results = match self.quantize_1bit {
-            true => Trainer::quantize_results(&results),
-            false => results,
+        let Some(next) = next else {
+            *slot = Some(output.trainer);
+            return Ok((results, None));
         };
-        decompress_results(&results, self.device)
-            .map_err(|e| ReplayError::Backend(format!("cannot decompress replay: {e}")))
+        // The round after opens by applying the results it names, at its
+        // own step, as the client's apply does; an epoch's first two apply
+        // nothing.
+        let mut trainer = match applied {
+            Some(applied) => output
+                .trainer
+                .optimize(next.step, assignment.warmup_lr_between, Some(applied))
+                .map_err(|err| backend("cannot apply what the round after applied", &err))?,
+            None => output.trainer,
+        };
+        let digest = trainer.round_state_digest();
+        *slot = Some(trainer);
+        let digest =
+            digest.map_err(|err| backend("cannot hash the state the round leaves", &err))?;
+        Ok((results, digest))
     }
 }
 
@@ -644,5 +719,19 @@ impl ReplayWork for TrainerReplayEngine {
             .ok_or_else(|| ReplayError::WorkNotAssigned(work.to_string()))?
             .clone();
         self.recompute_revealed(&assignment, round)
+    }
+
+    fn replay_continuity(
+        &self,
+        work: &DumpKey,
+        round: &RevealedRound,
+        next: &NextRound,
+    ) -> Result<[u8; 32], ReplayError> {
+        let assignment = self
+            .assignments
+            .get(work)
+            .ok_or_else(|| ReplayError::WorkNotAssigned(work.to_string()))?
+            .clone();
+        self.recompute_continuity(&assignment, round, next)
     }
 }

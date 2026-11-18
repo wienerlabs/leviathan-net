@@ -215,6 +215,37 @@ respect to it.
   replay of round `h` from `S_h` is exact. The verifier then derives `S_{h+1}`
   from it and the public results, and compares its digest with the one the
   node committed to at `h + 1`. A mismatch convicts the node of a forged state.
+
+How the daemon checks it, with `--continuity`:
+
+1. **What the node trained in round `h`.** The verifier keeps beside the dump
+   the batches the node was assigned in the payload's own round
+   (`<dump>.round`). Only a round where it trained this batch alone leaves
+   `S_{h+1}` from this payload's step; one with several batches is skipped.
+2. **What round `h + 1` applied.** Every node keeps, beside its dumps, what it
+   applied at the start of each round (`applied-epoch{E}-step{S}.list`):
+   nothing, in an epoch's first two rounds, or the dumps of the consensus
+   payloads of round `h - 1`, in the order applied. Honest nodes apply the
+   same results, so the verifier uses its own node's list, never the
+   target's.
+3. **The replay on.** It replays round `h` from `S_h` (as above), applies
+   those results at step `h + 1` (`Trainer::optimize`, as the client does),
+   and takes the digest of the state that leaves (`Trainer::round_state_digest`).
+4. **The judgement.** It compares the digest with the one the node's payload
+   of round `h + 1` commits to, checked against the node's signature. A
+   mismatch convicts that payload, with the digest the verifier derived as
+   the replayed hash. Replayed from the state it commits to, that payload
+   would pass the band, so continuity is what catches it.
+
+The check waits for the node's next payload until the epoch is over. A node
+that verified, or did not train, at `h + 1` commits to no next state, and its
+round is not checked.
+
+On three real clients on the CPU, every round checked leaves, to the bit, the
+state the node committed to next, whether the round after applied results or
+not. On the chain's test validator, a node that trains its second round from
+its state with the buffer halved, as consistently as a replay would, passes
+the band and is convicted and slashed by continuity; the honest node is not.
 - **Across classes it is not.** The next state cannot be matched by hash
   there, and no bound is shown to hold (#48). A verifier of another class
   checks the round, not the transition.
@@ -262,7 +293,9 @@ does, and it fails against a target that serves its state on appeal.
      state, and judges it by the band. Tests run real clients on the CPU, at
      a round past the first: an honest node cleared, a forged result
      convicted;
-   - **continuity** on classes that repeat themselves: a forged state caught.
+   - **continuity** on classes that repeat themselves: a forged state caught
+     and slashed on the test validator, and every round of three real
+     clients on the CPU leaving the state its node committed to next.
 5. **A node that does not reveal:** the verdict's kind, the reveal window,
    and the crank passing an overturned non-reveal. Then `ERROR_FEEDBACK.md`,
    the README and `FIRST_RUN.md` say later rounds are checked, and #89 and #48
