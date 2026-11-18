@@ -27,6 +27,7 @@ pub(crate) fn spawn_router<P: ProtocolHandler + Clone>(
     endpoint: Endpoint,
     protocols: SupportedProtocols,
     additional_protocol: Option<(&'static [u8], P)>,
+    round_states: Option<BlobsProtocol>,
     iroh_services_host: Option<iroh_services::ClientHost>,
 ) -> Result<Arc<Router>> {
     let mut builder = Router::builder(endpoint.clone())
@@ -37,6 +38,12 @@ pub(crate) fn spawn_router<P: ProtocolHandler + Clone>(
     // add optional custom protocol if provided
     if let Some((alpn, handler)) = additional_protocol {
         builder = builder.accept(alpn, handler);
+    }
+
+    // The states this node trained its rounds from, served by their digest
+    // to a verifier auditing one (wienerlabs/leviathan-net#89).
+    if let Some(round_states) = round_states {
+        builder = builder.accept(crate::ROUND_STATE_ALPN, round_states);
     }
 
     if let Some(host) = iroh_services_host {
@@ -83,6 +90,7 @@ mod tests {
         let router = spawn_router::<iroh_gossip::net::Gossip>(
             endpoint.clone(),
             SupportedProtocols::new(gossip.clone(), blobs_protocol, p2p_model_sharing),
+            None,
             None,
             None,
         )?;

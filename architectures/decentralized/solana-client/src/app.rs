@@ -103,6 +103,8 @@ pub async fn build_app(
 
     let allowlist = allowlist::AllowDynamic::new();
 
+    let round_states = p.round_states().await?;
+
     let p2p = NC::init(
         &p.run_id,
         p.bind_p2p_port,
@@ -114,6 +116,7 @@ pub async fn build_app(
         allowlist.clone(),
         metrics.clone(),
         Some(cancel.clone()),
+        round_states.clone(),
     )
     .await?;
 
@@ -122,6 +125,7 @@ pub async fn build_app(
         tensor_parallelism: p.tensor_parallelism,
         micro_batch_size: p.micro_batch_size,
         write_gradients_dir: p.write_gradients_dir,
+        round_states,
         eval_tasks,
         eval_task_max_docs: p.eval_task_max_docs,
         prompt_task: p.prompt_task,

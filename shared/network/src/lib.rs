@@ -65,6 +65,7 @@ mod equivocation_record;
 mod latency_sorted;
 mod local_discovery;
 mod p2p_model_sharing;
+mod round_states;
 pub mod router;
 mod serde;
 mod serializable_kind;
@@ -97,6 +98,9 @@ pub use iroh::{Endpoint, EndpointId, PublicKey, SecretKey};
 use iroh_relay::{RelayMap, RelayQuicConfig};
 use rustls_pki_types::CertificateDer;
 pub use latency_sorted::LatencySorted;
+pub use round_states::{
+    FetchRoundStateError, ROUND_STATE_ALPN, RoundStates, RoundStatesError, fetch_round_state,
+};
 pub use p2p_model_sharing::{
     ALPN, ModelRequestType, SharableModel, SharableModelError, TransmittableModelConfig,
 };
@@ -264,6 +268,7 @@ where
         allowlist: A,
         metrics: Arc<ClientMetrics>,
         cancel: Option<CancellationToken>,
+        round_states: Option<RoundStates>,
     ) -> Result<Self> {
         Self::init_internal::<A, iroh_gossip::net::Gossip>(
             run_id,
@@ -277,6 +282,7 @@ where
             metrics,
             cancel,
             None,
+            round_states,
         )
         .await
     }
@@ -310,6 +316,7 @@ where
             metrics,
             cancel,
             Some(additional_protocol),
+            None,
         )
         .await
     }
@@ -330,6 +337,7 @@ where
         metrics: Arc<ClientMetrics>,
         cancel: Option<CancellationToken>,
         additional_protocol: Option<(&'static [u8], P)>,
+        round_states: Option<RoundStates>,
     ) -> Result<Self> {
         let secret_key = match secret_key {
             None => SecretKey::generate(&mut rand::rng()),
@@ -485,14 +493,9 @@ where
 
         trace!("creating blobs store...");
 
-        let gc_interval: u64 = std::env::var("BLOBS_GC_INTERVAL_MILLIS")
-            .ok()
-            .and_then(|gc_interval_str| gc_interval_str.parse().ok())
-            .unwrap_or(10000);
-
         let store = MemStore::new_with_opts(MemStoreOptions {
             gc_config: Some(GcConfig {
-                interval: Duration::from_millis(gc_interval),
+                interval: blobs_gc_interval(),
                 add_protected: None,
             }),
         });
@@ -536,6 +539,7 @@ where
             endpoint.clone(),
             SupportedProtocols::new(gossip.clone(), blobs_protocol, model_parameter_sharing),
             additional_protocol,
+            round_states.as_ref().map(RoundStates::protocol),
             iroh_services_client
                 .as_ref()
                 .map(|_| iroh_services::ClientHost::new(&endpoint)),
@@ -766,6 +770,20 @@ where
 
     pub async fn endpoint_addr(&self) -> EndpointAddr {
         self.router.endpoint().addr()
+    }
+
+    /// Fetches from `node` the state named by `digest`, `expected_len` bytes
+    /// long, into `dest` (`fetch_round_state`, wienerlabs/leviathan-net#89).
+    /// A node is reached at its id alone, through discovery, or at the
+    /// addresses given with it.
+    pub async fn fetch_round_state(
+        &self,
+        node: impl Into<EndpointAddr>,
+        digest: [u8; 32],
+        expected_len: u64,
+        dest: &std::path::Path,
+    ) -> std::result::Result<(), FetchRoundStateError> {
+        fetch_round_state(self.router.endpoint(), node, digest, expected_len, dest).await
     }
 
     pub fn remote_infos(&self) -> Vec<P2PEndpointInfo> {
@@ -1031,6 +1049,16 @@ async fn on_update_stats(
 }
 
 /// Get the Psyche [`RelayMap`].
+/// How often a blob store drops the blobs no tag keeps: every
+/// `BLOBS_GC_INTERVAL_MILLIS` milliseconds, or every ten seconds.
+pub fn blobs_gc_interval() -> Duration {
+    let millis: u64 = std::env::var("BLOBS_GC_INTERVAL_MILLIS")
+        .ok()
+        .and_then(|gc_interval_str| gc_interval_str.parse().ok())
+        .unwrap_or(10000);
+    Duration::from_millis(millis)
+}
+
 pub fn psyche_relay_map() -> RelayMap {
     RelayMap::from_iter([psyche_use_relay_node(), psyche_usw_relay_node()])
 }

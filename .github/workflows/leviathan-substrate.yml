@@ -191,8 +191,10 @@ jobs:
       # The error-feedback measurement of wienerlabs/leviathan-net#48 has to
       # train a run the way the client does: two real clients train a short
       # run, and the simulation has to send each of their payloads byte for
-      # byte.
-      - name: Error-feedback simulation against real clients
+      # byte. The same clients keep the state each round trains from, and
+      # have to keep and serve the one each payload commits to
+      # (wienerlabs/leviathan-net#89).
+      - name: Error-feedback simulation and kept states against real clients
         run: |
-          cargo build --locked --bin psyche-centralized-server --bin psyche-centralized-client --bin check-error-feedback-fidelity
+          cargo build --locked --bin psyche-centralized-server --bin psyche-centralized-client --bin check-error-feedback-fidelity --bin check-round-states
           bash scripts/error-feedback-fidelity.sh

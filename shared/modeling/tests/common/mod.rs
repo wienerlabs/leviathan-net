@@ -6,17 +6,22 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::model::{Checkpoint, Model};
-use psyche_core::OptimizerDefinition;
+use psyche_core::{
+    BatchId, CancellableBarrier, ClosedInterval, ConstantLR, LearningRateSchedule,
+    OptimizerDefinition,
+};
 use psyche_data_provider::download_model_repo_sync;
 use psyche_modeling::{
-    CausalLM, Distro, DistroResult, Trainer, auto_model_for_causal_lm_from_pretrained,
+    Batch, BatchData, BatchDataCPU, CausalLM, Distro, DistroResult, LocalTrainer, ParallelModels,
+    TrainOutput, Trainer, auto_model_for_causal_lm_from_pretrained,
 };
 use psyche_network::SerializedDistroResult;
 use tch::{Device, Kind, Tensor};
+use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Deserialize)]
 pub struct RunConfig {
@@ -226,4 +231,68 @@ pub fn rebuilt(result: &DistroResult, sparse_idx: Tensor, sparse_val: Tensor) ->
         totalk: result.totalk,
         stats: None,
     }
+}
+
+/// A trainer of the genesis rehearsal's model with its DisTrO, at a constant
+/// rate, committing to the state each round trains from and, given
+/// `keep_in`, keeping it there (wienerlabs/leviathan-net#89).
+pub fn round_trainer(recipe: &Recipe, keep_in: Option<PathBuf>) -> Trainer {
+    let model = load(recipe);
+    model.prepare_for_training();
+    let trainer = LocalTrainer::new(
+        ParallelModels {
+            models: vec![model],
+            barrier: Arc::new(CancellableBarrier::new(1)),
+            data_parallel: None,
+        },
+        LearningRateSchedule::Constant(ConstantLR::new(recipe.lr, 0, 0.0)),
+        OptimizerDefinition::Distro {
+            clip_grad_norm: None,
+            weight_decay: None,
+            compression_decay: recipe.compression_decay as f32,
+            compression_topk: recipe.compression_topk as u16,
+            compression_chunk: recipe.compression_chunk as u16,
+            quantize_1bit: recipe.quantize_1bit,
+            robust_aggregation: recipe.robust_aggregation,
+        },
+        1,
+        None,
+        false,
+    );
+    match keep_in {
+        Some(dir) => trainer.keeping_round_states_in(dir),
+        None => trainer,
+    }
+    .into()
+}
+
+/// Trains `trainer` on the batch for `seed` at `step`, taking `sent_before`
+/// out of its buffer, and returns what it reports.
+pub fn train_round(
+    recipe: &Recipe,
+    trainer: Trainer,
+    step: u32,
+    seed: i64,
+    sent_before: Vec<Vec<DistroResult>>,
+) -> TrainOutput {
+    let tokens: Vec<i32> = batch(recipe, seed).iter().map(|&t| t as i32).collect();
+    trainer
+        .train(
+            step,
+            Batch {
+                id: BatchId(ClosedInterval::new(0, 0)),
+                data: BatchData::CPU(vec![BatchDataCPU {
+                    labels: Some(tokens.clone()),
+                    input_ids: tokens,
+                    position_ids: None,
+                    sequence_lengths: None,
+                }]),
+            },
+            None,
+            false,
+            vec![],
+            Some(sent_before),
+            CancellationToken::new(),
+        )
+        .unwrap()
 }

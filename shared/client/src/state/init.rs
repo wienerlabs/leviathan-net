@@ -19,7 +19,7 @@ use psyche_modeling::{
     DataParallel, DeepseekForCausalLM, Devices, DummyModel, LlamaConfig, LlamaForCausalLM,
     LocalTrainer, ModelLoadError, ParallelModels, PretrainedSource, Trainer, auto_tokenizer,
 };
-use psyche_network::{BlobTicket, SecretKey};
+use psyche_network::{BlobTicket, RoundStates, SecretKey};
 use psyche_watcher::OpportunisticData;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tch::{Kind, Tensor};
@@ -68,6 +68,10 @@ pub struct RunInitConfig {
     // debugging
     pub write_gradients_dir: Option<PathBuf>,
 
+    /// The states this node keeps of the rounds it trains, to reveal one to an audit
+    /// (wienerlabs/leviathan-net#89).
+    pub round_states: Option<RoundStates>,
+
     // checkpointing
     pub checkpoint_config: Option<CheckpointConfig>,
 
@@ -75,6 +79,15 @@ pub struct RunInitConfig {
     pub dummy_training_delay_secs: Option<u64>,
 
     pub sidecar_port: Option<u16>,
+}
+
+/// `trainer`, keeping each state it commits to where `round_states` keeps
+/// them, or keeping none without them (wienerlabs/leviathan-net#89).
+fn keeping_round_states(trainer: LocalTrainer, round_states: Option<&RoundStates>) -> LocalTrainer {
+    match round_states {
+        Some(states) => trainer.keeping_round_states_in(states.rounds_dir().to_path_buf()),
+        None => trainer,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -816,7 +829,7 @@ impl RunInitConfigAndIO {
                         let barrier =
                             Arc::new(CancellableBarrier::new(init_config.tensor_parallelism))
                                 as Arc<dyn Barrier>;
-                        LocalTrainer::new(
+                        let trainer = LocalTrainer::new(
                             ParallelModels {
                                 models,
                                 barrier,
@@ -827,25 +840,28 @@ impl RunInitConfigAndIO {
                             init_config.micro_batch_size,
                             init_config.optim_stats_every_n_steps,
                             init_config.grad_accum_in_fp32,
-                        )
-                        .into()
+                        );
+                        keeping_round_states(trainer, init_config.round_states.as_ref()).into()
                     })
                     .collect()
             }
             #[cfg(feature = "python")]
             RawLoadedModelType::Python(model) => {
                 vec![
-                    psyche_modeling::LocalTrainer::new(
-                        ParallelModels {
-                            models: vec![Box::new(model) as Box<dyn CausalLM>],
-                            barrier: Arc::new(psyche_modeling::NopBarrier) as Arc<dyn Barrier>,
-                            data_parallel: None,
-                        },
-                        llm.lr_schedule,
-                        llm.optimizer,
-                        init_config.micro_batch_size,
-                        init_config.optim_stats_every_n_steps,
-                        init_config.grad_accum_in_fp32,
+                    keeping_round_states(
+                        psyche_modeling::LocalTrainer::new(
+                            ParallelModels {
+                                models: vec![Box::new(model) as Box<dyn CausalLM>],
+                                barrier: Arc::new(psyche_modeling::NopBarrier) as Arc<dyn Barrier>,
+                                data_parallel: None,
+                            },
+                            llm.lr_schedule,
+                            llm.optimizer,
+                            init_config.micro_batch_size,
+                            init_config.optim_stats_every_n_steps,
+                            init_config.grad_accum_in_fp32,
+                        ),
+                        init_config.round_states.as_ref(),
                     )
                     .into(),
                 ]
@@ -884,6 +900,7 @@ impl RunInitConfigAndIO {
             data_fetcher,
             identity: init_config.identity,
             write_gradients_dir: init_config.write_gradients_dir,
+            round_states: init_config.round_states,
             tx_health_check,
             tx_distro_result,
 

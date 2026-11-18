@@ -5,8 +5,12 @@
 # simulation has to send each payload byte for byte from the same checkpoint,
 # data and rounds.
 #
+# The clients also keep the state each round trains from, and the same run
+# checks that they kept and serve the state each payload of its last epoch
+# commits to, and forgot those of earlier epochs (wienerlabs/leviathan-net#89).
+#
 #   cargo build --bin psyche-centralized-server --bin psyche-centralized-client \
-#     --bin check-error-feedback-fidelity
+#     --bin check-error-feedback-fidelity --bin check-round-states
 #   ./scripts/error-feedback-fidelity.sh
 #
 # Requires the libtorch environment (see docs/OPS_RUNBOOK.md) and the network,
@@ -74,6 +78,7 @@ for node in 0 1; do
         --server-addr "localhost:$PORT" --device cpu --logs console \
         --iroh-relay disabled --iroh-discovery local \
         --write-gradients-dir "$WORK/dumps$node" \
+        --round-state-dir "$WORK/states$node" \
         > "$WORK/client$node.log" 2>&1 &
     PIDS+=($!)
     CLIENTS+=($!)
@@ -119,3 +124,8 @@ done
 echo "[fidelity] replaying the run in the simulation"
 "$BIN/check-error-feedback-fidelity" --run-config "$RUN_CONFIG" --dumps "$WORK/dumps0"
 echo "[fidelity] passed: the simulation sent every payload the clients sent"
+
+echo "[fidelity] checking the states the clients kept"
+"$BIN/check-round-states" --run-config "$RUN_CONFIG" \
+    --dumps "$WORK/dumps0" "$WORK/dumps1" --states "$WORK/states0" "$WORK/states1"
+echo "[fidelity] passed: each client kept and serves the state each payload of the last epoch commits to"

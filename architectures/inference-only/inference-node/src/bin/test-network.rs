@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
         allowlist::AllowAll,
         metrics.clone(),
         Some(cancel.clone()),
+        None, // an inference node trains no rounds, so keeps no round states
     )
     .await
     .context("Failed to initialize P2P network")?;

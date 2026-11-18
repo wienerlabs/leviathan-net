@@ -6,9 +6,10 @@ use clap::Args;
 use psyche_data_provider::{GcsUploadInfo, HubUploadInfo};
 use psyche_eval::tasktype_from_name;
 use psyche_modeling::Devices;
-use psyche_network::{DiscoveryMode, RelayKind, SecretKey};
+use psyche_network::{DiscoveryMode, RelayKind, RoundStates, SecretKey, blobs_gc_interval};
 use psyche_tui::LogOutput;
 use std::{path::PathBuf, time::Duration};
+use tracing::warn;
 
 pub fn read_identity_secret_key(
     identity_secret_key_path: Option<&PathBuf>,
@@ -132,6 +133,14 @@ pub struct TrainArgs {
     #[clap(long, env)]
     pub write_gradients_dir: Option<PathBuf>,
 
+    /// The directory this node keeps the state it trained each round from in, and serves it
+    /// from to a verifier auditing that round (wienerlabs/leviathan-net#89). A state is about
+    /// twice the model, and the states of the whole epoch under way are kept: an audit can name
+    /// any round of it, and none of an earlier one. Without it, this node commits to each round's
+    /// state but keeps none, and cannot reveal one when audited.
+    #[clap(long, env)]
+    pub round_state_dir: Option<PathBuf>,
+
     #[clap(long, env)]
     pub eval_tasks: Option<String>,
 
@@ -220,6 +229,22 @@ pub struct TrainArgs {
 }
 
 impl TrainArgs {
+    /// The states this node keeps of the rounds it trains, under `--round-state-dir`, or none
+    /// without it (wienerlabs/leviathan-net#89).
+    pub async fn round_states(&self) -> Result<Option<RoundStates>> {
+        let Some(dir) = &self.round_state_dir else {
+            warn!(
+                "No --round-state-dir: this node commits to the state it trains each round from, \
+                 but keeps none, so it cannot reveal one to an audit"
+            );
+            return Ok(None);
+        };
+        let states = RoundStates::open(dir, blobs_gc_interval())
+            .await
+            .map_err(|err| anyhow!("Cannot open the round states at {}: {err}", dir.display()))?;
+        Ok(Some(states))
+    }
+
     pub fn wandb_info(&self, run_name: String) -> Result<Option<WandBInfo>> {
         let wandb_info = match std::env::var("WANDB_API_KEY") {
             Ok(wandb_api_key) => Some(WandBInfo {

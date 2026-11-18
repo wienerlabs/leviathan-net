@@ -323,6 +323,7 @@ async fn main() -> Result<()> {
         allowlist::AllowAll,
         Arc::new(ClientMetrics::new(None, None)),
         Some(cancel.clone()),
+        None,
     )
     .await?;
 

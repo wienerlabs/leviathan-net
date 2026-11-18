@@ -10,6 +10,8 @@ psyche-modeling.workspace = true
 psyche-metrics.workspace = true
 iroh.workspace = true
 iroh-blobs.workspace = true
+# The verified pieces a state is fetched in (wienerlabs/leviathan-net#89); iroh-blobs' own.
+bao-tree = "0.16"
 iroh-gossip.workspace = true
 iroh-relay.workspace = true
 tokio-util.workspace = true

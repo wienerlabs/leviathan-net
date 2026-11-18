@@ -24,6 +24,9 @@ FAKE="sign_flip"
 WALLETS=""
 LOGDIR="${LOGDIR:-/tmp/leviathan-swarm}"
 DUMPROOT="${DUMPROOT:-/tmp/leviathan-swarm/dumps}"
+# Each node keeps the state it trains each round from here, to reveal it to an audit
+# (wienerlabs/leviathan-net#89).
+STATEROOT="${STATEROOT:-/tmp/leviathan-swarm/states}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,7 +67,7 @@ if [[ ! -x "target/debug/psyche-solana-client" ]]; then
   cargo build -p psyche-solana-client
 fi
 
-mkdir -p "$LOGDIR" "$DUMPROOT"
+mkdir -p "$LOGDIR" "$DUMPROOT" "$STATEROOT"
 pids=()
 cleanup() { echo "[swarm] stopping ${#pids[@]} nodes"; kill "${pids[@]}" 2>/dev/null || true; }
 trap cleanup INT TERM EXIT
@@ -92,6 +95,7 @@ for ((i = 0; i < NODES; i++)); do
     --data-parallelism 1 --tensor-parallelism 1 --micro-batch-size 1 \
     --authorizer "$AUTHORIZER" --logs console \
     --write-gradients-dir "$dump" \
+    --round-state-dir "$STATEROOT/node$i" \
     > "$LOGDIR/node$i.log" 2>&1 &
   pids+=("$!")
   sleep 3

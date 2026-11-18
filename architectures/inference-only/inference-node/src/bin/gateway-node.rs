@@ -407,6 +407,7 @@ async fn run_gateway() -> Result<()> {
         allowlist::AllowAll,
         metrics.clone(),
         Some(cancel.clone()),
+        None, // a gateway trains no rounds, so keeps no round states
     )
     .await
     .context("Failed to initialize P2P network")?;
