@@ -277,6 +277,9 @@ enum ParallelAssignment {
         weights: HashMap<String, Tensor>,
         error_feedback: Option<Vec<Tensor>>,
     },
+    SetErrorFeedbackKind {
+        kind: Kind,
+    },
 }
 
 #[derive(Debug)]
@@ -299,6 +302,9 @@ enum ParallelResult {
         buffer: Option<Vec<Tensor>>,
     },
     Load {
+        error: Option<String>,
+    },
+    SetErrorFeedbackKind {
         error: Option<String>,
     },
 }
@@ -388,6 +394,21 @@ impl Trainer {
             #[cfg(feature = "python")]
             Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
                 "hand out its error feedback",
+            )),
+        }
+    }
+
+    /// Keeps every model thread's DisTrO error-feedback buffer in `kind`
+    /// from here on, starting from zeros (wienerlabs/leviathan-net#90).
+    pub fn set_error_feedback_kind(
+        &mut self,
+        kind: Kind,
+    ) -> Result<(), TrainerThreadCommunicationError> {
+        match self {
+            Trainer::Local(local_trainer) => local_trainer.set_error_feedback_kind(kind),
+            #[cfg(feature = "python")]
+            Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
+                "move its error feedback to another dtype",
             )),
         }
     }
@@ -488,6 +509,9 @@ pub enum TrainerThreadCommunicationError {
 
     #[error("Could not load the trainer's state: {0}")]
     Load(String),
+
+    #[error("Could not keep the error feedback in another dtype: {0}")]
+    ErrorFeedbackKind(String),
 
     #[cfg(feature = "python")]
     #[error("Python error: {0}")]
@@ -812,6 +836,42 @@ impl LocalTrainer {
             }
         }
         Ok(buffers)
+    }
+
+    /// Keeps each model thread's DisTrO error-feedback buffer in `kind` from
+    /// here on, starting from zeros (wienerlabs/leviathan-net#90). A thread
+    /// whose optimizer keeps none, or whose model is sharded, refuses.
+    pub fn set_error_feedback_kind(
+        &mut self,
+        kind: Kind,
+    ) -> Result<(), TrainerThreadCommunicationError> {
+        self.barrier.reset();
+        for (tx, _) in &self.models {
+            tx.send(ParallelAssignment::SetErrorFeedbackKind { kind })
+                .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
+        }
+        let mut first_error = None;
+        for (_, rx) in &self.models {
+            match rx
+                .recv()
+                .map_err(|_| TrainerThreadCommunicationError::RecvResult)?
+            {
+                ParallelResult::SetErrorFeedbackKind { error } => {
+                    if first_error.is_none() {
+                        first_error = error;
+                    }
+                }
+                result => {
+                    return Err(TrainerThreadCommunicationError::UnexpectedResult(format!(
+                        "{result:?}"
+                    )));
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(TrainerThreadCommunicationError::ErrorFeedbackKind(error)),
+            None => Ok(()),
+        }
     }
 
     /// Loads `weights`, as [`Self::extract`] returns them, into every model
@@ -1292,6 +1352,23 @@ impl LocalTrainer {
                     };
                     if submission
                         .send(ParallelResult::ErrorFeedback { buffer })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ParallelAssignment::SetErrorFeedbackKind { kind }) => {
+                    let error = match &mut optimizer {
+                        Optimizer::Distro { optimizer, .. } => optimizer
+                            .set_error_feedback_kind(kind)
+                            .err()
+                            .map(|error| error.to_string()),
+                        Optimizer::Torch { .. } | Optimizer::Null => {
+                            Some("the optimizer keeps no error feedback".to_string())
+                        }
+                    };
+                    if submission
+                        .send(ParallelResult::SetErrorFeedbackKind { error })
                         .is_err()
                     {
                         return;

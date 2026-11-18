@@ -431,14 +431,31 @@ pub fn mean_loss(step: u32, losses: &[f32]) -> Result<f32> {
 /// each of the model's variables, in the dtype it trains in. Revealing the
 /// buffer on audit sends this much, and each node keeps it.
 pub fn error_feedback_bytes(config: &ReplayTrainerConfig) -> Result<u64> {
+    Ok(reveal_bytes(config)?.1)
+}
+
+/// What a node trained under `config` holds that a reveal sends: the bytes of
+/// its weights, in the training dtype, and of its error-feedback buffer, in
+/// the dtype it is kept in (wienerlabs/leviathan-net#90).
+pub fn reveal_bytes(config: &ReplayTrainerConfig) -> Result<(u64, u64)> {
     let mut trainer = build_replay_trainer(config)?;
-    let variables = trainer
+    let weights = trainer
         .extract()
-        .map_err(|error| anyhow!("reading the model's variables: {error}"))?;
-    Ok(variables
+        .map_err(|error| anyhow!("reading the model's variables: {error}"))?
         .values()
         .map(|tensor| tensor.numel() as u64 * config.kind.elt_size_in_bytes() as u64)
-        .sum())
+        .sum();
+    let buffer = trainer
+        .error_feedback()
+        .map_err(|error| anyhow!("reading the error feedback: {error}"))?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| anyhow!("the trainer keeps no error feedback"))?
+        .iter()
+        .map(|tensor| tensor.numel() as u64 * tensor.kind().elt_size_in_bytes() as u64)
+        .sum();
+    Ok((weights, buffer))
 }
 
 /// Writes `trainer`'s weights to `dir` as a checkpoint of the model whose

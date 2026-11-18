@@ -18,6 +18,8 @@ two pieces of state that the node holds privately:
   buffer is kept in the training dtype. On a bf16 node, as the client is, a
   0.999 decay leaves every value unchanged, and small increments are absorbed
   (#90). So on a real node the formula holds only up to that rounding.
+  Measured, keeping it in fp32 instead makes no difference that shows over
+  1000 rounds (section 5), so the client keeps it as it is.
 - **Its weights.** A running node keeps its model through cooldown, warmup and
   pauses (the #50 comment on #48). Replicas that apply the same updates on
   different hardware drift apart.
@@ -150,6 +152,7 @@ It runs in the CI libtorch job.
 - **Resync.** It hands the shadow node 0's weights. A shadow started from other weights replays node 0 exactly from the first resync on.
 - **Reveal.** It hands the shadow everything a round depends on. A shadow on other weights replays node 0 exactly at every round.
 - **State transfer.** A trainer takes another's weights and buffer across dtypes. A state that does not fit is refused and changes nothing.
+- **A buffer kept in fp32.** A bf16 trainer told to keep its buffer in fp32 starts it from zeros in fp32, beside bf16 weights, and a reveal of it counts fp32 for the buffer. A trainer without DisTrO refuses.
 
 ## Running it
 
@@ -171,6 +174,8 @@ cargo build --release -p leviathan-verifier --bin measure-error-feedback
   does.
 - Leave out `--shadow-device` to measure convergence alone, which is much
   faster.
+- `--error-feedback-dtype fp32` keeps the nodes' buffer in fp32 rather than
+  in the training dtype (section 5).
 
 The fidelity check runs on its own:
 
@@ -217,6 +222,10 @@ nodes' own class.
 | `drift-resync-mps-bf16.csv` | GPU, bf16 | `resync` | 600 | 10 |
 | `reveal-cpu-fp32.csv` | CPU, fp32 | `reveal` | 600 | 0 |
 | `reveal-mps-bf16.csv` | GPU, bf16 | `reveal` | 600 | 0 |
+| `convergence-mps-bf16-fp32-buffer.csv` | none | | 1000 | 0 |
+| `reveal-cpu-fp32-fp32-buffer.csv` | CPU, fp32 | `reveal` | 300 | 0 |
+
+The nodes keep their error-feedback buffer in bf16, as the client does, except in the two `fp32-buffer` runs, where they keep it in fp32 (`--error-feedback-dtype fp32`, section 5).
 
 Every range in the tables below is a mean, or a mean and a maximum, over the CSV's rows in that range.
 
@@ -380,7 +389,7 @@ Under `reveal`, the shadow starts each round from what node 0 would reveal for a
 - **It cannot compound, but it grows with the run.** Nothing carries from one checked round to the next. Still, the mean rises in every range, from 0.26 in rounds 1–100 to 0.35 in rounds 501–600. How it behaves later in a run, or at a decayed learning rate, is not measured.
 - **It is more than a round from a zeroed buffer costs.** In round 1, where the buffer is still zero, the distance is 0.17, about what a window's first round drifts under `resync`. From a filled buffer it is larger.
 - **It is all top-k churn.** No sign was wrong in any of the 600 rounds. Up to 8% of the coordinates node 0 sent were ones the verifier did not pick, and every coordinate both picked had the same sign.
-- **The dtype may account for part of it.** The nodes' buffer is bf16, where the decay does nothing and small increments are absorbed (#90). The fp32 shadow decays and absorbs nothing.
+- **The buffer's dtype accounts for little of it.** The nodes' buffer is bf16, where the decay does nothing and small increments are absorbed (#90), while the fp32 shadow's buffer decays and absorbs nothing. With the nodes' buffer in fp32 as well, the mean distance is about 1% lower (section 5).
 - **It is far above every band in force.** All 600 rounds exceed the shipped default of 0.05, and the band calibrated over unquantized values, 0.029 (`docs/BAND_CALIBRATION.md`). The same document measured a band of 1.104 over 1-bit signs. Under today's metric, an honest cross-class check would therefore convict. Even a run's first step is checked against a band, not exactly. Since #49 such checks are held to a band on churn and flips instead.
 
 ### 4. What a reveal sends
@@ -404,7 +413,65 @@ The values follow from the buffer, so a verifier can derive them rather than tak
 - **It needs a window of its own.** At 100 Mbit/s of upload, a 1B reveal takes over five minutes. The final round's audit window is sized in tens of seconds (`docs/FIRST_RUN.md`, section 3).
 - **Every node pays for the commitment every round.** Committing to the state means copying the weights and the buffer off the device and hashing about twice the model, each round.
 - **A node has to keep its state** for every round still inside its audit window: that many reveals' worth of storage, about 3.7 GiB a round at 1B.
-- **A buffer kept in fp32**, should #90 move it there, makes a reveal three times the model in bf16: about 5.6 GiB at 1B.
+- **A buffer kept in fp32** makes a reveal three times the model in bf16: 109.5 MiB for this run, by the tool's printout, and about 5.6 GiB at 1B. Section 5 finds no reason to keep it there.
+
+### 5. A buffer kept in fp32 makes no difference that shows (#90)
+
+The client keeps each node's buffer in the dtype of the parameter it belongs to, so a bf16 node's buffer is bf16. There, DisTrO's update loses two things:
+- **The decay does nothing.** Multiplying a bf16 value by 0.999 moves it by less than half the gap to the next bf16 value, so it rounds back to itself.
+- **Small increments are absorbed.** An increment under half that gap, which is 2⁻⁹ to 2⁻⁸ of the value, leaves the value as it was.
+
+`shared/modeling/tests/distro_error_feedback.rs` shows both on the genesis rehearsal's model, and that a buffer kept in fp32 does neither:
+- In bf16, a step at a decay of 0.999 and a learning rate of 0 leaves the buffer as it was. A step that adds about 10⁻⁵ of each value leaves every one of those values as it was.
+- In fp32, the same steps decay every value, and move every one of those values by its increment.
+
+`Distro::set_error_feedback_kind` keeps the buffer in another dtype, and `measure-error-feedback --error-feedback-dtype fp32` trains the nodes with it in fp32. The buffer is cast to the parameter's dtype only to be encoded, so a node still sends the run's encoding.
+
+**Convergence.** The nodes of section 1's run, never resetting, trained the same 1000 rounds from the same checkpoint on the same data, with the buffer in fp32 (`convergence-mps-bf16-fp32-buffer.csv`):
+
+| Training rounds | bf16 buffer | fp32 buffer | fp32 against bf16 |
+|---|---|---|---|
+| 1-50 | 10.1352 | 10.1348 | -0.00% |
+| 51-100 | 9.4383 | 9.4425 | +0.04% |
+| 101-200 | 8.1065 | 8.1079 | +0.02% |
+| 201-300 | 7.2765 | 7.2715 | -0.07% |
+| 301-400 | 6.8354 | 6.8318 | -0.05% |
+| 401-500 | 6.6777 | 6.6691 | -0.13% |
+| 501-600 | 6.5359 | 6.5310 | -0.08% |
+| 601-700 | 6.3691 | 6.3639 | -0.08% |
+| 701-800 | 6.2234 | 6.2212 | -0.03% |
+| 801-900 | 6.2052 | 6.2065 | +0.02% |
+| 901-1000 | 6.0770 | 6.0762 | -0.01% |
+
+- **The two are level within the GPU's own noise, or close to it.** Repeated runs with the bf16 buffer stayed within 0.08% of the first run in every range (section 1). The fp32 buffer's gap is above that once, at 0.13% in rounds 401–500.
+- **The fp32 buffer is slightly ahead in rounds 201–800, and level by the end.** It is ahead in every range there, by 0.03% to 0.13%. In the last two ranges the gaps are +0.02% and −0.01%.
+- **Over the last 100 rounds the difference is 0.01%.** A reset costs between 1.6% and 12.5% of the loss there (section 1).
+
+**Drift across classes.** The same nodes, with the buffer in fp32, were checked by section 3's verifier of another class: on the CPU in fp32, starting each round from what node 0 reveals. This covers the first 300 rounds (`reveal-cpu-fp32-fp32-buffer.csv`). The bf16 rows are section 3's run:
+
+| Training rounds | Nodes' buffer | distance mean / max | churn mean / max | flips max |
+|---|---|---|---|---|
+| 1-100 | bf16 | 0.2608 / 0.4084 | 0.0345 / 0.0834 | 0 |
+| 1-100 | fp32 | 0.2575 / 0.3478 | 0.0335 / 0.0605 | 0 |
+| 101-200 | bf16 | 0.2785 / 0.3908 | 0.0390 / 0.0764 | 0 |
+| 101-200 | fp32 | 0.2767 / 0.4345 | 0.0386 / 0.0944 | 0 |
+| 201-300 | bf16 | 0.2870 / 0.3377 | 0.0414 / 0.0570 | 0 |
+| 201-300 | fp32 | 0.2830 / 0.3284 | 0.0402 / 0.0539 | 0 |
+
+- **The buffer's dtype accounts for little of the drift.**
+  - With the buffer in fp32, the mean distance is 0.6% to 1.4% lower in each range, 1.1% over the 300 rounds, and lower in 72% of the rounds.
+  - The maxima move both ways.
+  - The rest comes from what else differs between the nodes and the verifier: the device, and the dtype of the weights and gradients.
+- **It is still all top-k churn.** No sign was wrong in any round.
+
+**So the client keeps the buffer in the parameter's dtype.** An fp32 buffer would:
+- cost every node 2 more bytes per parameter, about 1.9 GiB at 1B;
+- make a reveal three times the model instead of twice (section 4);
+- have to change on every node of a run at once, since it changes what a node sends.
+
+In return, over these rounds it buys no loss that shows, and about 1% of the drift across classes. The issue's other remedy is stochastic rounding of a bf16 buffer. It is not built: it would add randomness that a replay has to reproduce, and nothing measured here calls for it. `Distro::set_error_feedback_kind` and `--error-feedback-dtype` stay, so this can be measured again where it may come out otherwise:
+- **Later in a run.** These rounds are steps 1 to 1198, with the learning rate at or near its peak. As the rate decays, to a tenth of its peak in this run's schedule, each step adds less relative to the buffer, so more of it is absorbed.
+- **Elsewhere.** The limits below apply here too: one machine, one small model, two nodes.
 
 ## What it means for the options
 
@@ -442,6 +509,7 @@ The README, `docs/FIRST_RUN.md` and the verifier daemon already say that only a 
   - **Exactness on the GPU was measured within one process.** On the CPU, the fidelity check reproduces whole epochs byte for byte across processes. The M1's GPU does not repeat itself across processes:
     - Runs of the same nodes on the same data agree for the first rounds. They then diverge, at training round 4, 21, 33 or 48, depending on the pair compared.
     - Within one process, identical work agrees.
+    - One pair of runs did agree across processes: the nodes of the two runs that keep the buffer in fp32 (section 5) trained identically in all 300 rounds the two share. One pair is too few to say whether the buffer's dtype is the reason.
     - So a verifier in its own process on this GPU would most likely not replay a node's round exactly. Whether CUDA classes repeat themselves across machines is the measurement #89 has to make before it relies on exact checks.
   - **The cross-class pair differs in device and dtype at once.** A CPU shadow in bf16 would separate the two, and was not measured.
 - **One small model, early in its run.**

@@ -565,6 +565,8 @@ pub enum ErrorFeedbackMismatch {
         expected: Vec<i64>,
         given: Vec<i64>,
     },
+    #[error("variable {index} is sharded, and its buffer cannot be moved to another dtype")]
+    Sharded { index: usize },
 }
 
 pub struct Distro {
@@ -705,7 +707,14 @@ impl Distro {
             // Compress delta
             let full_delta = delta_var.gather_full_tensor();
             let (sparse_idx, sparse_val, xshape, totalk) =
-                CompressDCT::compress(&self.transform.encode(&full_delta), self.compression_topk);
+                // Encoded in the parameter's dtype, whatever the buffer is kept
+                // in, so what is sent goes through the same arithmetic
+                // (wienerlabs/leviathan-net#90). For a buffer kept in the
+                // parameter's dtype this casts nothing.
+                CompressDCT::compress(
+                    &self.transform.encode(&full_delta.to_kind(variable.kind())),
+                    self.compression_topk,
+                );
 
             let delta_energy: Option<f64> = match stats {
                 true => Some(
@@ -1110,6 +1119,35 @@ impl Distro {
             .iter()
             .map(|state| state.delta.local_tensor().to_device(Device::Cpu).copy())
             .collect()
+    }
+
+    /// Keeps the error-feedback buffer in `kind` from here on, starting it from
+    /// zeros, rather than in each parameter's own dtype
+    /// (wienerlabs/leviathan-net#90). In bf16 a 0.999 decay leaves every value
+    /// as it was, and an increment far smaller than a value is absorbed; a
+    /// buffer kept in fp32 does neither. It is cast to the parameter's dtype
+    /// only to be encoded. Each buffer keeps its name, shape and device. A
+    /// sharded buffer cannot be moved this way, and nothing changes if any is.
+    pub fn set_error_feedback_kind(&mut self, kind: Kind) -> Result<(), ErrorFeedbackMismatch> {
+        if let Some(index) = self.state.iter().position(|state| state.delta.is_sharded()) {
+            return Err(ErrorFeedbackMismatch::Sharded { index });
+        }
+        let _no_grad = tch::no_grad_guard();
+        self.state = self
+            .state
+            .iter()
+            .map(|state| {
+                let tensor = state.delta.local_tensor();
+                let delta: Box<dyn Variable> = Box::new((
+                    state.delta.name().to_string(),
+                    Tensor::zeros(tensor.size(), (kind, tensor.device())),
+                    None::<tch::nn::Shard>,
+                    None::<std::sync::Arc<crate::parallelism::Communicator>>,
+                ));
+                State { delta }
+            })
+            .collect();
+        Ok(())
     }
 
     /// Replaces the error-feedback buffer with `buffer`, as

@@ -19,6 +19,7 @@ use leviathan_verifier::checkpoint_repo_files;
 use leviathan_verifier::error_feedback::check_cohort;
 use leviathan_verifier::error_feedback::error_feedback_bytes;
 use leviathan_verifier::error_feedback::read_rounds;
+use leviathan_verifier::error_feedback::reveal_bytes;
 use leviathan_verifier::error_feedback::schedule;
 use leviathan_verifier::error_feedback::simulate;
 use leviathan_verifier::error_feedback::Round;
@@ -35,6 +36,7 @@ use psyche_coordinator::model::LLM;
 use psyche_coordinator::CoordinatorProgress;
 use psyche_core::ConstantLR;
 use psyche_core::LearningRateSchedule;
+use psyche_core::OptimizerDefinition;
 use psyche_core::Shuffle;
 use psyche_core::TokenSize;
 use psyche_data_provider::LocalDataProvider;
@@ -490,4 +492,54 @@ fn the_buffer_holds_a_value_for_every_parameter_in_the_training_dtype() {
     assert!(fp32 > 0);
     assert_eq!(fp32 % 4, 0);
     assert_eq!(fp32, 2 * bf16);
+
+    // A bf16 node that keeps its buffer in fp32 holds the fp32 size, and a
+    // reveal of it sends bf16 weights beside it (wienerlabs/leviathan-net#90).
+    let kept = ReplayTrainerConfig {
+        error_feedback_kind: Some(Kind::Float),
+        ..trainer(&llm, Kind::BFloat16)
+    };
+    let (weights, buffer) = reveal_bytes(&kept).unwrap();
+    assert_eq!(buffer, fp32);
+    assert_eq!(weights, bf16);
+}
+
+/// A bf16 trainer told to keep its buffer in fp32 starts it from zeros in
+/// fp32, beside bf16 weights. One whose optimizer keeps no error feedback
+/// refuses (wienerlabs/leviathan-net#90).
+#[test]
+fn a_trainer_keeps_its_buffer_in_the_dtype_it_is_given() {
+    let llm = genesis();
+    let kept = ReplayTrainerConfig {
+        error_feedback_kind: Some(Kind::Float),
+        ..trainer(&llm, Kind::BFloat16)
+    };
+    let mut node = build_replay_trainer(&kept).unwrap();
+    let buffers = node.error_feedback().unwrap();
+    let buffer = buffers[0].as_ref().expect("the run trains with DisTrO");
+    assert!(!buffer.is_empty());
+    for tensor in buffer {
+        assert_eq!(tensor.kind(), Kind::Float);
+        assert_eq!(tensor.abs().sum(None).double_value(&[]), 0.0);
+    }
+    let weights = node.extract().unwrap();
+    assert!(!weights.is_empty());
+    assert!(weights
+        .values()
+        .all(|tensor| tensor.kind() == Kind::BFloat16));
+
+    let adamw = ReplayTrainerConfig {
+        optimizer: OptimizerDefinition::AdamW {
+            betas: [0.9, 0.95],
+            weight_decay: 0.0,
+            eps: 1e-8,
+            clip_grad_norm: None,
+        },
+        ..kept
+    };
+    let error = match build_replay_trainer(&adamw) {
+        Ok(_) => panic!("a trainer without DisTrO keeps no error feedback to move"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("keeps no error feedback"), "{error}");
 }

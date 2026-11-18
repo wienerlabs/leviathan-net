@@ -21,8 +21,8 @@ use clap::Parser;
 use leviathan_verifier::checkpoint_repo_files;
 use leviathan_verifier::device_label;
 use leviathan_verifier::error_feedback::check_cohort;
-use leviathan_verifier::error_feedback::error_feedback_bytes;
 use leviathan_verifier::error_feedback::read_rounds;
+use leviathan_verifier::error_feedback::reveal_bytes;
 use leviathan_verifier::error_feedback::schedule;
 use leviathan_verifier::error_feedback::share_size;
 use leviathan_verifier::error_feedback::simulate;
@@ -77,6 +77,12 @@ struct Args {
     device: String,
     #[arg(long, default_value = "bf16")]
     dtype: String,
+    /// The dtype the nodes keep their error-feedback buffer in, if not the
+    /// training dtype. The client keeps it in the training dtype, where a
+    /// bf16 buffer neither decays nor takes small increments
+    /// (wienerlabs/leviathan-net#90).
+    #[arg(long)]
+    error_feedback_dtype: Option<String>,
     /// A verifier that replays node 0 from public data, on this device. Leave
     /// it out to measure convergence alone.
     #[arg(long)]
@@ -228,7 +234,14 @@ async fn main() -> Result<()> {
     let repo_files = checkpoint_repo_files(&published_checkpoint(&llm)?)?;
     let device = parse_device(&args.device)?;
     let kind = parse_dtype(&args.dtype)?;
-    let nodes = ReplayTrainerConfig::for_run(&llm, repo_files.clone(), device, kind);
+    let nodes = ReplayTrainerConfig {
+        error_feedback_kind: args
+            .error_feedback_dtype
+            .as_deref()
+            .map(parse_dtype)
+            .transpose()?,
+        ..ReplayTrainerConfig::for_run(&llm, repo_files.clone(), device, kind)
+    };
     let shadow = match &args.shadow_device {
         Some(shadow_device) => Some(ReplayTrainerConfig::for_run(
             &llm,
@@ -240,9 +253,13 @@ async fn main() -> Result<()> {
     };
 
     eprintln!(
-        "[error-feedback] {} on {} {kind:?}, {} nodes, global batch {global_batch}, {} training rounds, {} per epoch, policies {:?}{}{}",
+        "[error-feedback] {} on {} {kind:?}{}, {} nodes, global batch {global_batch}, {} training rounds, {} per epoch, policies {:?}{}{}",
         llm.checkpoint,
         device_label(device),
+        match nodes.error_feedback_kind {
+            Some(buffer) => format!(" with the error feedback kept in {buffer:?}"),
+            None => String::new(),
+        },
         args.nodes,
         args.steps,
         args.epoch_rounds,
@@ -267,11 +284,12 @@ async fn main() -> Result<()> {
     // The weights hold one value per parameter in the training dtype, as the
     // buffer does, so a reveal of both is twice the buffer. The previous
     // round's values come on top, printed once a round has trained.
-    let buffer = error_feedback_bytes(&nodes)?;
+    let (weights, buffer) = reveal_bytes(&nodes)?;
     println!(
-        "error feedback per node: {buffer} bytes ({:.1} MiB) in {kind:?}; a reveal of the weights and the buffer sends {:.1} MiB",
+        "error feedback per node: {buffer} bytes ({:.1} MiB) in {:?}; a reveal of the weights and the buffer sends {:.1} MiB",
         buffer as f64 / (1 << 20) as f64,
-        2.0 * buffer as f64 / (1 << 20) as f64,
+        nodes.error_feedback_kind.unwrap_or(kind),
+        (weights + buffer) as f64 / (1 << 20) as f64,
     );
 
     // Node 0's checkpoint at each reset, in a directory of this run's own.
