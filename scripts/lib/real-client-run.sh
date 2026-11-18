@@ -42,6 +42,13 @@ client_finished() {
     tr -d '\033' < "$WORK/client$1.log" | grep -aq 'new_state[^ ]*Finished'
 }
 
+# The end of a log, for a run that failed where its logs are not kept, as on
+# CI, without the console's colours.
+show_log() {
+    echo "$LABEL --- the last lines of $1 ---" >&2
+    tr -d '\033' < "$1" | sed 's/\[[0-9;]*m//g' | tail -n "${LOG_TAIL_LINES:-80}" >&2
+}
+
 run_real_clients() {
     echo "$LABEL work dir $WORK"
     "$BIN/psyche-centralized-server" run --state "$RUN_CONFIG" --server-port "$PORT" --tui false \
@@ -90,6 +97,8 @@ run_real_clients() {
                 wait "${clients[$node]}" || status=$?
                 if ((status != 0)) || ! client_finished "$node"; then
                     echo "$LABEL client $node stopped with status $status before it saw the run finish; logs in $WORK" >&2
+                    show_log "$WORK/client$node.log"
+                    show_log "$WORK/server.log"
                     exit 1
                 fi
                 returned[$node]=1
@@ -100,16 +109,22 @@ run_real_clients() {
         fi
         if ((SECONDS > deadline)); then
             echo "$LABEL the run did not finish in ${TIMEOUT_SECS}s; logs in $WORK" >&2
+            show_log "$WORK/server.log"
             exit 1
         fi
         if ! kill -0 "$server" 2>/dev/null; then
             echo "$LABEL the server stopped before the run finished; logs in $WORK" >&2
+            show_log "$WORK/server.log"
             exit 1
         fi
         # A client dropped from the run leaves the others waiting for members
         # for good, and its rounds can no longer be accounted for.
         if grep -aq "Dropped .* clients" "$WORK/server.log"; then
             echo "$LABEL the server dropped a client; logs in $WORK" >&2
+            show_log "$WORK/server.log"
+            for ((node = 0; node < NODES; node++)); do
+                show_log "$WORK/client$node.log"
+            done
             exit 1
         fi
         sleep 5
