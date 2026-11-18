@@ -7,26 +7,38 @@ use clap::Args;
 use super::verdict_votes::free_wallet_votes;
 use crate::{SolanaBackend, instructions};
 use anchor_client::solana_sdk::pubkey::Pubkey;
+use anchor_lang::AccountDeserialize;
 use psyche_solana_rpc::utils::native_amount_to_ui_amount;
-use anchor_client::solana_sdk::instruction::AccountMeta;
-use psyche_solana_treasurer::logic::bounty_amount;
 use psyche_solana_treasurer::state::{
-    Participant, Run, WithdrawalHold, WithdrawalStanding, coordinator_slashed_points,
-    unattributed_ledger_forfeit, unledgered_conviction_charge, withdrawal_standing,
+    ConvictionCharge, Participant, Run, SlashReport, WithdrawalHold, WithdrawalStanding,
+    coordinator_slashed_points, unledgered_conviction_charge, withdrawal_standing,
 };
+
+/// The slash report at `address` as it stands now. A step that fails may have
+/// been taken first by someone else, the verifier daemon's sweep for one, and
+/// this tells the two apart.
+async fn fresh_slash_report(
+    backend: &SolanaBackend,
+    address: &Pubkey,
+) -> Result<Option<SlashReport>> {
+    let Some(account) = backend.get_account(address).await? else {
+        return Ok(None);
+    };
+    let report = SlashReport::try_deserialize(&mut &account.data[..])
+        .map_err(|error| anyhow!("Unable to decode the slash report {address}: {error}"))?;
+    Ok(Some(report))
+}
 
 /// How `user`'s withdrawal stands, read from chain exactly the way the
 /// treasurer reads it at finalize: the run, its coordinator, `user`'s
 /// participant account and own audit verdict, and the cluster clock
-/// (wienerlabs/leviathan-net#36, #39). Also returns what the settlement would
-/// forfeit to points no verdict accounts for, whose bounty is paid to a
-/// reporter the withdrawal names (wienerlabs/leviathan-net#64).
+/// (wienerlabs/leviathan-net#36, #39, #72).
 async fn current_withdrawal_standing(
     backend: &SolanaBackend,
     run_address: &Pubkey,
     run_state: &Run,
     user: &Pubkey,
-) -> Result<(WithdrawalStanding, u64)> {
+) -> Result<WithdrawalStanding> {
     let coordinator_account = backend
         .get_coordinator_account(&run_state.coordinator_account)
         .await?;
@@ -46,12 +58,103 @@ async fn current_withdrawal_standing(
         user,
         now,
     );
-    let unattributed = unattributed_ledger_forfeit(
-        &participant,
-        coordinator_slashed_points(&coordinator_account, user),
-        own_verdict.as_ref(),
-    );
-    Ok((standing, unattributed))
+    Ok(standing)
+}
+
+/// Settles the slash reports that concern `user` in the run and that the
+/// ledger allows now (wienerlabs/leviathan-net#72): it charges each slash that
+/// ejected `user` once its epoch is charged, since its bond is held until
+/// then, and credits `user`'s bond the bounty of each slash it reported.
+/// Anyone may send either; the verifier daemon does both each pass, and a
+/// step someone else already took is skipped. Returns how many reports still
+/// hold `user`'s bond.
+async fn settle_wallet_slash_reports(
+    backend: &SolanaBackend,
+    treasurer_index: u64,
+    run_address: &Pubkey,
+    run_state: &Run,
+    user: &Pubkey,
+) -> Result<usize> {
+    let reports = backend.get_treasurer_slash_reports(run_address).await?;
+    // Whether the ledger has charged each report's ejection, read once and
+    // not held across the sends below: a coordinator is a large value.
+    let charged: Vec<bool> = {
+        let account = backend
+            .get_coordinator_account(&run_state.coordinator_account)
+            .await?;
+        reports
+            .iter()
+            .map(|(_, report)| report.ejection_charged(&account.state.coordinator))
+            .collect()
+    };
+    let mut holding = 0;
+    for ((address, report), charged) in reports.into_iter().zip(charged) {
+        let charge = match report.charge {
+            ConvictionCharge::Ejected if report.target == *user => {
+                if !charged {
+                    holding += 1;
+                    continue;
+                }
+                Some(instructions::treasurer_run_charge_slash_report(
+                    treasurer_index,
+                    &run_state.coordinator_account,
+                    user,
+                    &report.target,
+                    report.charge_epoch_start,
+                ))
+            }
+            _ => None,
+        };
+        if let Some(instruction) = charge {
+            match backend
+                .send_and_retry("Slash report charge", &[instruction], &[])
+                .await
+            {
+                Ok(signature) => println!(
+                    "Charged the slash that ejected this wallet in the epoch from {} in transaction: {signature}",
+                    report.charge_epoch_start
+                ),
+                Err(error) => match fresh_slash_report(backend, &address).await? {
+                    Some(fresh) if fresh.charge != ConvictionCharge::Ejected => println!(
+                        "The slash that ejected this wallet in the epoch from {} was already charged",
+                        report.charge_epoch_start
+                    ),
+                    _ => return Err(error),
+                },
+            }
+            continue;
+        }
+        let owed = report.charge == ConvictionCharge::Charged
+            && report.reporter == Some(*user)
+            && report.bounty_owed > 0
+            && !report.bounty_paid;
+        if owed {
+            let instruction = instructions::treasurer_run_pay_slash_report_bounty(
+                treasurer_index,
+                user,
+                &report.target,
+                report.charge_epoch_start,
+                user,
+            );
+            match backend
+                .send_and_retry("Slash report bounty", &[instruction], &[])
+                .await
+            {
+                Ok(signature) => println!(
+                    "Credited this wallet the bounty for reporting {} in transaction: {signature}",
+                    report.target
+                ),
+                Err(error) => match fresh_slash_report(backend, &address).await? {
+                    Some(fresh) if fresh.bounty_paid => println!(
+                        "The bounty for reporting {} was already credited to this wallet",
+                        report.target
+                    ),
+                    _ => return Err(error),
+                },
+            }
+        }
+    }
+    Ok(holding)
 }
 
 fn describe_withdrawal_hold(hold: WithdrawalHold) -> &'static str {
@@ -65,6 +168,9 @@ fn describe_withdrawal_hold(hold: WithdrawalHold) -> &'static str {
         WithdrawalHold::VotesAtStake => {
             "this wallet voted on a verdict that can still cost it; bond-withdraw-finalize frees each vote once it can"
         },
+        WithdrawalHold::SlashReportsUncharged => {
+            "a slash that ejected this wallet has not been charged against its bond yet; bond-withdraw-finalize charges it once its epoch has been"
+        }
     }
 }
 
@@ -227,7 +333,7 @@ impl Command for CommandBondDeposit {
         )
         .await?;
         if participant.bond_withdraw_pending_amount > 0 {
-            match current_withdrawal_standing(&backend, &run_address, &run_state, &user).await?.0 {
+            match current_withdrawal_standing(&backend, &run_address, &run_state, &user).await? {
                 WithdrawalStanding::Held(hold) => {
                     println!("Withdrawal: held, {}", describe_withdrawal_hold(hold))
                 },
@@ -391,12 +497,6 @@ pub struct CommandBondWithdrawFinalize {
     /// way. They stop counting toward a conviction.
     #[clap(long)]
     pub withdraw_live_votes: bool,
-    /// The wallet that reported a slash no verdict accounts for, such as one
-    /// the run authority made. A withdrawal that settles one pays its bounty
-    /// to this wallet's collateral account, and is refused without it. It
-    /// cannot be this wallet.
-    #[clap(long)]
-    pub reporter: Option<Pubkey>,
 }
 
 #[async_trait]
@@ -406,7 +506,6 @@ impl Command for CommandBondWithdrawFinalize {
             run_id,
             treasurer_index,
             withdraw_live_votes,
-            reporter,
         } = self;
 
         let treasurer_index = backend
@@ -463,7 +562,36 @@ impl Command for CommandBondWithdrawFinalize {
             Err(error) => return Err(error),
         }
 
-        let (standing, unattributed_forfeit) =
+        // A slash no verdict accounts for holds the bond until it is charged,
+        // and a slash this wallet reported owes it a bounty; both are settled
+        // here when the ledger allows (wienerlabs/leviathan-net#72). Reading
+        // the reports takes getProgramAccounts, which a public RPC may refuse:
+        // a wallet a report holds cannot withdraw without them, any other is
+        // warned and withdraws all the same.
+        let uncharged = backend
+            .get_treasurer_participant(&participant_address)
+            .await?
+            .uncharged_slash_reports;
+        match settle_wallet_slash_reports(
+            &backend,
+            treasurer_index,
+            &run_address,
+            &run_state,
+            &user,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(holding) => println!(
+                "{holding} slash(es) that ejected this wallet wait for their epoch to be charged"
+            ),
+            Err(error) if uncharged == 0 => println!(
+                "Could not read the run's slash reports to credit any bounty this wallet is owed; withdrawing without it: {error:#}"
+            ),
+            Err(error) => return Err(error),
+        }
+
+        let standing =
             current_withdrawal_standing(&backend, &run_address, &run_state, &user).await?;
         let settle_conviction = match standing {
             WithdrawalStanding::Held(hold) => {
@@ -475,40 +603,15 @@ impl Command for CommandBondWithdrawFinalize {
             WithdrawalStanding::Free { settle_conviction } => settle_conviction,
         };
 
-        let mut instruction = instructions::treasurer_participant_bond_finalize_withdraw(
+        // A withdrawal names no reporter: a slash's reporter is recorded when
+        // the slash is made, and credited from its report
+        // (wienerlabs/leviathan-net#72).
+        let instruction = instructions::treasurer_participant_bond_finalize_withdraw(
             treasurer_index,
             &run_state.collateral_mint,
             &run_state.coordinator_account,
             &user,
         );
-        // A conviction's bounty is recorded on its verdict and credited to
-        // each recipient's bond by anyone, never paid here. What the ledger
-        // charged that no verdict accounts for pays its bounty to a reporter
-        // this withdrawal names (wienerlabs/leviathan-net#64).
-        let reporter_bounty = bounty_amount(&run_state, unattributed_forfeit);
-        if reporter_bounty > 0 {
-            let reporter = reporter.ok_or_else(|| {
-                anyhow!(
-                    "This withdrawal settles {} of slashes no verdict accounts for, which owes a reporter {}; pass --reporter <WALLET>",
-                    native_amount_to_ui_amount(unattributed_forfeit, decimals),
-                    native_amount_to_ui_amount(reporter_bounty, decimals),
-                )
-            })?;
-            if reporter == user {
-                return Err(anyhow!(
-                    "The reporter cannot be the wallet whose bond is slashed"
-                ));
-            }
-            instruction.accounts.push(AccountMeta::new(
-                associated_token::get_associated_token_address(
-                    &reporter,
-                    &run_state.collateral_mint,
-                ),
-                false,
-            ));
-        } else if reporter.is_some() {
-            println!("No slash this withdrawal settles owes a reporter; --reporter is not used");
-        }
         if settle_conviction {
             println!("Settling this wallet's conviction against its bond as part of the withdrawal");
         }

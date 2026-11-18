@@ -23,6 +23,7 @@ use psyche_solana_treasurer::accounts::RunSlashAccounts;
 use psyche_solana_treasurer::accounts::RunUpdateAccounts;
 use psyche_solana_treasurer::find_participant;
 use psyche_solana_treasurer::find_run;
+use psyche_solana_treasurer::find_slash_report;
 use psyche_solana_treasurer::instruction::ParticipantJoinRun;
 use psyche_solana_treasurer::instruction::ParticipantBondDeposit;
 use psyche_solana_treasurer::instruction::ParticipantBondFinalizeWithdraw;
@@ -187,10 +188,13 @@ pub async fn process_treasurer_run_bond_config_update(
 /// the two together.
 #[allow(clippy::too_many_arguments)]
 pub fn run_slash_instruction(
+    payer: &Pubkey,
     authority: &Pubkey,
     run: &Pubkey,
     coordinator_account: &Pubkey,
     run_id: &str,
+    target: &Pubkey,
+    reporter: Option<Pubkey>,
     index: u64,
     batch_start: u64,
     batch_end: u64,
@@ -199,17 +203,23 @@ pub fn run_slash_instruction(
 ) -> Instruction {
     let coordinator_instance = find_coordinator_instance(run_id);
     let accounts = RunSlashAccounts {
+        payer: *payer,
         authority: *authority,
         run: *run,
         coordinator_instance,
         coordinator_account: *coordinator_account,
         coordinator_program: psyche_solana_coordinator::ID,
         instructions: sysvar::instructions::ID,
+        target_participant: find_participant(run, target),
+        slash_report: find_slash_report(run, target, evidence.epoch_start),
+        system_program: system_program::ID,
     };
     Instruction {
         accounts: accounts.to_account_metas(None),
         data: RunSlash {
             params: RunSlashParams {
+                target: *target,
+                reporter,
                 index,
                 batch_start,
                 batch_end,
@@ -232,15 +242,20 @@ pub async fn process_treasurer_run_slash(
     run: &Pubkey,
     coordinator_account: &Pubkey,
     run_id: &str,
+    target: &Pubkey,
+    reporter: Option<Pubkey>,
     index: u64,
     commitment: &SignedCommitment,
     replayed_hash: [u8; 32],
 ) -> Result<()> {
     let instruction = run_slash_instruction(
+        &payer.pubkey(),
         &authority.pubkey(),
         run,
         coordinator_account,
         run_id,
+        target,
+        reporter,
         index,
         commitment.batch_start,
         commitment.batch_end,

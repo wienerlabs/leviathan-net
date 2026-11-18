@@ -526,9 +526,7 @@ impl AuditVerdict {
     /// an epoch that no longer has charges pending, or a later one, has made
     /// it.
     pub fn ejection_charged(&self, coordinator: &Coordinator) -> bool {
-        !(coordinator.charges_pending()
-            && coordinator.epoch_state.start_timestamp
-                == self.charge_epoch_start)
+        crate::state::epoch_charged(coordinator, self.charge_epoch_start)
     }
 
     /// What this conviction will still take from its target's bond before

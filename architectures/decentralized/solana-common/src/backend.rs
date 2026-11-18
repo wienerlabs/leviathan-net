@@ -565,6 +565,56 @@ impl SolanaBackend {
             .collect()
     }
 
+    /// Every slash report in `treasurer_run`, with its address
+    /// (wienerlabs/leviathan-net#72). A report keeps its run where a verdict
+    /// does, so it is found the same way.
+    pub async fn get_treasurer_slash_reports(
+        &self,
+        treasurer_run: &Pubkey,
+    ) -> Result<Vec<(Pubkey, psyche_solana_treasurer::state::SlashReport)>> {
+        use anchor_client::anchor_lang::Discriminator;
+        use psyche_solana_treasurer::state::SlashReport;
+        const RUN_OFFSET: usize = 8 + 1;
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![
+                RpcFilterType::DataSize(SlashReport::space_with_discriminator() as u64),
+                RpcFilterType::Memcmp(Memcmp::new_base58_encoded(0, SlashReport::DISCRIMINATOR)),
+                RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
+                    RUN_OFFSET,
+                    treasurer_run.as_ref(),
+                )),
+            ]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let accounts = self
+            .rpc_with_fallback("get_treasurer_slash_reports", |coord| {
+                let config = config.clone();
+                async move {
+                    coord
+                        .rpc()
+                        .get_program_accounts_with_config(&psyche_solana_treasurer::ID, config)
+                        .await
+                        .map_err(Into::into)
+                }
+            })
+            .await
+            .context(
+                "Unable to list the run's slash reports: the RPC endpoint has to serve getProgramAccounts",
+            )?;
+        accounts
+            .into_iter()
+            .map(|(address, account)| {
+                SlashReport::try_deserialize(&mut account.data.as_slice())
+                    .map(|report| (address, report))
+                    .map_err(|error| anyhow!("Unable to decode slash report {address}: {error}"))
+            })
+            .collect()
+    }
+
     pub async fn get_token_account(
         &self,
         token_account: &Pubkey,

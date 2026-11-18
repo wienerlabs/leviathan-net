@@ -164,13 +164,16 @@ stated and nothing tests.
 ## 2. Bounty recipient is unvalidated when the verdict is omitted (Critical, Class B)
 
 **File:** `architectures/decentralized/solana-treasurer/programs/solana-treasurer/src/logic/participant_bond_finalize_withdraw.rs:167-183`
-**Test:** `memnet_treasurer_bounty_recipient::the_slashed_client_can_name_itself_as_the_bounty_recipient`
+**Test:** `memnet_treasurer_bounty_recipient::the_slashed_client_can_name_itself_as_the_bounty_recipient` (now `the_slashed_client_cannot_name_any_bounty_recipient`)
 
 The bounty is split two ways. With voters, every recipient is unpacked and
 checked against both the recorded voter and the collateral mint (`:194-201`).
 Without voters, it is not checked at all (since wienerlabs/leviathan-net#64
 the voter branch is gone: a conviction's bounty is credited to its voters by
-seat, and only a slash no verdict accounts for still pays a reporter here):
+seat, and only a slash no verdict accounts for still paid a reporter here.
+Since wienerlabs/leviathan-net#72 the withdrawal pays no reporter at all: a
+slash records its reporter when it ejects its target, and the reporter's bond
+is credited once the slash is charged):
 
 ```rust
 if voters.is_empty() {
@@ -1122,8 +1125,10 @@ Listed so the external audit does not spend hours re-deriving these.
   wienerlabs/leviathan-net#64 there is no voter branch: a conviction's bounty
   is recorded on its verdict when the target's bond is charged, and credited to
   each recipient's bond by seat through `run_pay_verdict_bounty`, so no
-  recipient's token account is involved. Only a forfeit no verdict accounts for
-  still pays a reporter here, wienerlabs/leviathan-net#72.)
+  recipient's token account is involved. A forfeit no verdict accounts for
+  paid a reporter here until wienerlabs/leviathan-net#72. It is now charged
+  by `run_charge_slash_report`, and its bounty is credited to the reporter
+  the slash recorded.)
 - Forfeit arithmetic: `saturating_sub` on the points difference, `min` against
   the bond, `min` again for the payout (`:113-124`). It cannot underflow and it
   cannot pay out more than the bond holds. `overflow-checks = true` is set for

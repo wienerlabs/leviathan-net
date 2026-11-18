@@ -57,6 +57,13 @@ pub struct Participant {
     /// charged it. Until then the bond cannot leave
     /// (wienerlabs/leviathan-net#39).
     pub open_verdict_votes: u32,
+
+    /// Slashes no verdict accounts for that ejected this participant and
+    /// whose reports have not been charged against its bond yet. Each holds
+    /// the bond until it is, so the slash is paid before the participant
+    /// leaves and its reporter is credited from it
+    /// (wienerlabs/leviathan-net#72).
+    pub uncharged_slash_reports: u32,
 }
 
 impl Participant {
@@ -143,6 +150,7 @@ impl Participant {
             + 8 // bond_settled_slashed_points
             + 8 // bond_withdraw_delay_snapshot
             + 4 // open_verdict_votes
+            + 4 // uncharged_slash_reports
     }
 
     /// Counts a vote this participant just cast.
@@ -165,6 +173,26 @@ impl Participant {
             self.open_verdict_votes.checked_sub(1).ok_or_else(|| {
                 error!(ProgramError::OpenVerdictVotesInconsistent)
             })?;
+        Ok(())
+    }
+
+    /// Counts a report of a slash that just ejected this participant.
+    pub fn open_slash_report(&mut self) -> Result<()> {
+        self.uncharged_slash_reports = self
+            .uncharged_slash_reports
+            .checked_add(1)
+            .ok_or_else(|| error!(ProgramError::SlashReportsInconsistent))?;
+        Ok(())
+    }
+
+    /// Stops counting a report once its slash is charged. A report is counted
+    /// once and charged once, so a count that would go below zero means the
+    /// reports and this count disagree, and is refused.
+    pub fn close_slash_report(&mut self) -> Result<()> {
+        self.uncharged_slash_reports = self
+            .uncharged_slash_reports
+            .checked_sub(1)
+            .ok_or_else(|| error!(ProgramError::SlashReportsInconsistent))?;
         Ok(())
     }
 
@@ -237,6 +265,7 @@ mod tests {
             bond_settled_slashed_points: settled_points,
             bond_withdraw_delay_snapshot: 0,
             open_verdict_votes: 0,
+            uncharged_slash_reports: 0,
         }
     }
 
@@ -304,6 +333,23 @@ mod tests {
         assert_eq!(p.open_verdict_votes, 0);
         assert!(p.close_verdict_vote().is_err());
         assert_eq!(p.open_verdict_votes, 0);
+    }
+
+    #[test]
+    fn slash_reports_are_counted_open_and_closed_once_each() {
+        let mut p = participant(500, 0, 0);
+        p.open_slash_report().unwrap();
+        p.open_slash_report().unwrap();
+        assert_eq!(p.uncharged_slash_reports, 2);
+        p.close_slash_report().unwrap();
+        p.close_slash_report().unwrap();
+        assert_eq!(p.uncharged_slash_reports, 0);
+        // A report is charged once, so a count below zero is refused.
+        assert!(p.close_slash_report().is_err());
+        assert_eq!(p.uncharged_slash_reports, 0);
+        p.uncharged_slash_reports = u32::MAX;
+        assert!(p.open_slash_report().is_err());
+        assert_eq!(p.uncharged_slash_reports, u32::MAX);
     }
 
     #[test]

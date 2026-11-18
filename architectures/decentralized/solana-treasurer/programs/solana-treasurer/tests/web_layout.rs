@@ -10,6 +10,7 @@
 use psyche_solana_treasurer::state::AuditVerdict;
 use psyche_solana_treasurer::state::Participant;
 use psyche_solana_treasurer::state::Run;
+use psyche_solana_treasurer::state::SlashReport;
 
 /// Mirrors `RUN_LAYOUT_BY_SIZE` in `leviathan-web/src/data/protocol.ts`.
 #[test]
@@ -18,14 +19,30 @@ fn run_is_the_length_the_web_decoder_expects() {
 }
 
 /// Mirrors the participant length check in the same file, which knows 65.
-/// This generation is 4 bytes longer: `open_verdict_votes` (u32) follows
-/// `bond_withdraw_delay_snapshot` at the end, counting the votes that still
-/// hold the bond (wienerlabs/leviathan-net#39). The fields before it are where
-/// they were, so a 65-byte decoder reads a 69-byte account correctly except
-/// for the count; the length check has to learn 69.
+/// Two generations followed it, each appending a u32 at the end:
+///
+/// - 69 adds `open_verdict_votes`, after `bond_withdraw_delay_snapshot`,
+///   counting the votes that still hold the bond (wienerlabs/leviathan-net#39).
+/// - 73, this one, adds `uncharged_slash_reports`, counting the slashes no
+///   verdict accounts for that still hold the bond until they are charged
+///   (wienerlabs/leviathan-net#72).
+///
+/// The fields before each are where they were, so a shorter decoder reads a
+/// longer account correctly except for the counts. The length check has to
+/// learn 73.
 #[test]
 fn participant_is_the_length_the_web_decoder_expects() {
-    assert_eq!(Participant::space_with_discriminator(), 69);
+    assert_eq!(Participant::space_with_discriminator(), 73);
+}
+
+/// A new account the dashboard does not decode yet: a slash no verdict
+/// accounts for, with the reporter it records (wienerlabs/leviathan-net#72).
+/// Its run sits at offset 9, as in `AuditVerdict`, so one filter finds both.
+/// It is allocated at this length, with room for a reporter. One naming no
+/// reporter serializes 32 bytes shorter, and the rest of the account is zero.
+#[test]
+fn slash_report_is_the_length_it_is_allocated_at() {
+    assert_eq!(SlashReport::space_with_discriminator(), 134);
 }
 
 /// Mirrors `VERDICT_LAYOUT_BY_SIZE` in the same file, which stops at 4328

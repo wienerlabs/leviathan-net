@@ -331,6 +331,7 @@ pub async fn settlement_pays_out_exactly_the_unforfeited_bond() {
         .forward_clock_unix_timestamp(WITHDRAW_DELAY as u64)
         .await
         .unwrap();
+    harness.settle_slash_reports().await;
     harness.finalize_withdraw(SUBJECT).await;
     assert_eq!(harness.collateral(SUBJECT).await - before, predicted);
     assert_eq!(harness.bond(SUBJECT).await, 0);

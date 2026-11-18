@@ -83,6 +83,15 @@ pub fn ejection_charge(account: &CoordinatorAccount) -> EjectionCharge {
     }
 }
 
+/// Whether the ledger has charged an ejection landed in the epoch that
+/// started at `epoch_start`: that epoch is over. Every way out of an epoch
+/// that can eject passes through its charge (`Coordinator::ejections_charged`),
+/// so an epoch that no longer has charges pending, or a later one, has made it.
+pub fn epoch_charged(coordinator: &Coordinator, epoch_start: u64) -> bool {
+    !(coordinator.charges_pending()
+        && coordinator.epoch_state.start_timestamp == epoch_start)
+}
+
 /// Where a conviction against a target lands right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Landing {

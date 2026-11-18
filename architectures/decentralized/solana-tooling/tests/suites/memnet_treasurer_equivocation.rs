@@ -14,6 +14,7 @@ use psyche_solana_tooling::signed_commitment::PayloadHeader;
 use psyche_solana_tooling::signed_commitment::SignedCommitment;
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use psyche_solana_treasurer::ProgramError;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
@@ -28,7 +29,7 @@ use super::signed_payload::HONEST_PAYLOAD;
 /// What the target signed for its batch this round, re-signed with
 /// `results_digest`, `step` and `nonce` changed as asked: another payload for
 /// the same work, or a commitment to other work.
-fn resigned(
+pub(super) fn resigned(
     h: &AppealsHarness,
     p2p: &Keypair,
     step_offset: u32,
@@ -54,7 +55,7 @@ fn resigned(
 }
 
 /// Anyone sends the proof that the target signed `first` and `second`.
-async fn report(
+pub(super) async fn report(
     h: &mut AppealsHarness,
     first: &SignedCommitment,
     second: &SignedCommitment,
@@ -63,6 +64,7 @@ async fn report(
     let payer = h.payer.insecure_clone();
     let target_index = h.target_index;
     let run_id = h.run_id.clone();
+    let target = h.target_key;
     process_treasurer_run_slash_equivocation(
         &mut h.endpoint,
         &payer,
@@ -70,6 +72,7 @@ async fn report(
         &h.run,
         &h.coordinator_account,
         &run_id,
+        &target,
         target_index,
         first,
         second,
@@ -147,10 +150,12 @@ pub async fn commitments_for_different_batches_do_not_convict() {
     // The tooling refuses it outright; the chain is asked directly.
     let reporter = Keypair::new();
     let instruction = run_slash_equivocation_instruction(
+        &h.payer.pubkey(),
         &reporter.pubkey(),
         &h.run,
         &h.coordinator_account,
         &h.run_id,
+        &h.target_key,
         h.target_index,
         &first,
         &elsewhere,
@@ -204,9 +209,11 @@ pub async fn a_target_already_ejected_is_refused() {
     );
 }
 
-/// The target is the client at the roster index the proof names. Naming
-/// another seat puts the proof to that seat's key, which signed neither
-/// commitment, and a seat past the roster names nobody.
+/// The target is the client at the roster index the proof names, and the
+/// key the proof names has to be that client's. Naming another seat, with its
+/// own key, puts the proof to that seat's p2p key, which signed neither
+/// commitment; naming the target's index with another key, or a seat past the
+/// roster, names nobody the proof is about.
 #[tokio::test]
 pub async fn a_proof_naming_another_seat_is_refused() {
     let mut h = setup("Leviathan equivocation seat", 157).await;
@@ -214,12 +221,18 @@ pub async fn a_proof_naming_another_seat_is_refused() {
     let first = h.target_commitment;
     let second = resigned(&h, &p2p, 0, 1, 0, replayed_digest());
     let roster = h.clients.len() as u64;
-    for (wrong, refusal) in [
-        (
-            (h.target_index + 1) % roster,
-            ProgramError::CommitmentNotSigned,
-        ),
-        (roster + 5, ProgramError::TargetMismatch),
+    let other_seat = (h.target_index + 1) % roster;
+    let other_key = Pubkey::new_from_array(
+        *h.coordinator_state().await.coordinator.epoch_state.clients
+            [other_seat as usize]
+            .id
+            .signer(),
+    );
+    let target_key = h.target_key;
+    for (wrong_key, wrong, refusal) in [
+        (other_key, other_seat, ProgramError::CommitmentNotSigned),
+        (other_key, h.target_index, ProgramError::TargetMismatch),
+        (target_key, roster + 5, ProgramError::TargetMismatch),
     ] {
         let reporter = Keypair::new();
         let payer = h.payer.insecure_clone();
@@ -232,6 +245,7 @@ pub async fn a_proof_naming_another_seat_is_refused() {
             &run,
             &coordinator_account,
             &run_id,
+            &wrong_key,
             wrong,
             &first,
             &second,
@@ -256,10 +270,12 @@ pub async fn one_proven_signature_is_not_two() {
     let second = resigned(&h, &p2p, 0, 1, 0, replayed_digest());
     let reporter = Keypair::new();
     let instruction = run_slash_equivocation_instruction(
+        &h.payer.pubkey(),
         &reporter.pubkey(),
         &h.run,
         &h.coordinator_account,
         &h.run_id,
+        &h.target_key,
         h.target_index,
         &first,
         &second,

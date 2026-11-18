@@ -164,10 +164,46 @@ out of reach for good (wienerlabs/leviathan-net#39). Two rules now close that:
   wait for someone to dispute the target again: the verifier daemon settles
   every open dispute in the run, as far as nobody's consent is needed, at the
   end of each pass, after its own judging, and `bond-withdraw-finalize`
-  credits every seat a wallet is owed before it withdraws. Points the ledger charged
-  that no verdict accounts for, a `run_slash` or an equivocation, are the only
-  bounty a withdrawal still pays itself: to the reporter it names, never to the
-  participant (wienerlabs/leviathan-net#72).
+  credits every seat a wallet is owed before it withdraws.
+- **A slash no verdict accounts for records its reporter when it is made.**
+  A `run_slash` or an equivocation conviction ejects its target like a verdict
+  does. It writes a `SlashReport`, keyed by the target and the start of the
+  epoch the ejection is charged in, naming who reported it:
+  - for a `run_slash`, the reporter the run authority names, or none;
+  - for an equivocation, whoever sent the proof.
+
+  Once that epoch is charged, `run_charge_slash_report` charges the target's
+  bond and records the reporter's share of the forfeit. Then
+  `run_pay_slash_report_bounty` credits that share to the reporter's bond.
+  Anyone may send either, and the verifier daemon and `bond-withdraw-finalize`
+  do. A slash naming no reporter leaves its bounty in the vault. The target's
+  bond is held until its reports are charged, and the withdrawal pays no
+  reporter of its own.
+
+  It used to pay the bounty to whatever token account the withdrawal named.
+  The withdrawal is signed by the slashed participant itself, so the bounty
+  could go to a second wallet it controlled (wienerlabs/leviathan-net#72).
+- **An equivocator can still report itself.** An equivocation proof is
+  permissionless, so a target that signed two payloads can send its own proof
+  from a second wallet, if it lands before anyone else's.
+  - The proof is public once anyone sends it: both payloads and both
+    signatures are in the transaction. So the target can also copy an honest
+    reporter's transaction, put its own wallet in as the reporter, and land it
+    first.
+  - Either way it gets the bounty back and loses only
+    `1 - slash_bounty_bps / 10000` of the charge, and nothing at 10000.
+  - The chain cannot tell that wallet from an honest reporter.
+
+  So a run's bounty share sets a floor on what equivocating costs, and it has
+  to stay below 10000 for equivocation to cost anything. Closing the route
+  needs a different reporting scheme, such as a commitment to the proof before
+  it is revealed (wienerlabs/leviathan-net#92). A `run_slash` is not exposed
+  this way: the run authority names its reporter.
+- **A target with no participant account when it is slashed owes its reporter
+  nothing.** It has no bond then, so its report is charged at nothing. If it
+  posts a bond later, the ledger's charge is taken from that bond at its
+  withdrawal, and the vault keeps all of it. This happens only in a run that
+  does not gate joining on a bond, where bounties have nothing to pay from.
 - **Switching appeals off ends the appeals in flight.** A run with appeals on
   always has an appeal deadline, so a zero window means the run turned appeals
   off. A challenge still open then has no deadline left to wait for, and

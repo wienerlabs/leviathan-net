@@ -301,6 +301,7 @@ impl EquivocationPass<'_> {
             self.run,
             self.coordinator_account,
             &self.config.run_id,
+            &proof.signer,
             index,
             &proof.first,
             &proof.second,

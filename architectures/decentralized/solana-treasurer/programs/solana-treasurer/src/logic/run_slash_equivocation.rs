@@ -7,8 +7,15 @@ use psyche_solana_coordinator::CoordinatorAccount;
 use psyche_solana_coordinator::CoordinatorInstance;
 use psyche_solana_coordinator::SlashClientParams;
 
+use crate::logic::check_reporter;
+use crate::logic::record_slash_report;
+use crate::logic::SlashRecord;
 use crate::state::commitment_run;
 use crate::state::conviction_landing;
+use crate::state::ejection_charge;
+use crate::state::Participant;
+use crate::state::SlashKind;
+use crate::state::SlashReport;
 use crate::state::transaction_proves_signature;
 use crate::state::CommitmentEvidence;
 use crate::state::Landing;
@@ -18,7 +25,11 @@ use crate::ProgramError;
 #[derive(Accounts)]
 #[instruction(params: RunSlashEquivocationParams)]
 pub struct RunSlashEquivocationAccounts<'info> {
-    /// Anyone: the proof needs no committee and no authority.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// Anyone: the proof needs no committee and no authority. Whoever signs it
+    /// is recorded as its reporter (wienerlabs/leviathan-net#72).
     #[account()]
     pub reporter: Signer<'info>,
 
@@ -46,10 +57,42 @@ pub struct RunSlashEquivocationAccounts<'info> {
     /// two precompile instructions proving the target signed both commitments.
     #[account(address = instructions_sysvar::ID)]
     pub instructions: UncheckedAccount<'info>,
+
+    /// CHECK: the target's participant account at its own PDA, counted on if
+    /// the target has one. A target with none is still convicted.
+    #[account(
+        mut,
+        seeds = [
+            Participant::SEEDS_PREFIX,
+            run.key().as_ref(),
+            params.target.as_ref(),
+        ],
+        bump,
+    )]
+    pub target_participant: UncheckedAccount<'info>,
+
+    /// Who reported the equivocation, written when it ejects its target.
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = SlashReport::space_with_discriminator(),
+        seeds = [
+            SlashReport::SEEDS_PREFIX,
+            run.key().as_ref(),
+            params.target.as_ref(),
+            params.first.epoch_start.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub slash_report: Box<Account<'info, SlashReport>>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct RunSlashEquivocationParams {
+    /// The target's wallet, which has to be the one at `target_index`.
+    pub target: Pubkey,
     /// Where the target sits on the roster now.
     pub target_index: u64,
     /// The batch both commitments are for.
@@ -92,7 +135,8 @@ pub fn run_slash_equivocation_processor(
     context: Context<RunSlashEquivocationAccounts>,
     params: RunSlashEquivocationParams,
 ) -> Result<()> {
-    let (target_p2p, run, index) = {
+    check_reporter(&params.target, Some(&context.accounts.reporter.key()))?;
+    let (target_p2p, run, index, ejection) = {
         let account = context.accounts.coordinator_account.load()?;
         let coordinator = &account.state.coordinator;
         let target = coordinator
@@ -102,6 +146,9 @@ pub fn run_slash_equivocation_processor(
             .nth(params.target_index as usize)
             .ok_or_else(|| error!(ProgramError::TargetMismatch))?;
         let target_key = Pubkey::new_from_array(*target.id.signer());
+        if target_key != params.target {
+            return err!(ProgramError::TargetMismatch);
+        }
         for evidence in [&params.first, &params.second] {
             if !evidence.is_from_current_epoch(coordinator) {
                 return err!(ProgramError::CommitmentOutsideEpoch);
@@ -119,6 +166,7 @@ pub fn run_slash_equivocation_processor(
             *target.id.p2p_identity(),
             commitment_run(coordinator),
             index,
+            ejection_charge(&account),
         )
     };
 
@@ -188,7 +236,23 @@ pub fn run_slash_equivocation_processor(
         },
     )?;
 
-    Ok(())
+    let run_key = context.accounts.run.key();
+    let reporter = context.accounts.reporter.key();
+    let bump = context.bumps.slash_report;
+    let target_participant =
+        context.accounts.target_participant.to_account_info();
+    record_slash_report(
+        &mut context.accounts.slash_report,
+        bump,
+        &target_participant,
+        SlashRecord {
+            run: run_key,
+            target: params.target,
+            ejection,
+            kind: SlashKind::Equivocation,
+            reporter: Some(reporter),
+        },
+    )
 }
 
 #[cfg(test)]

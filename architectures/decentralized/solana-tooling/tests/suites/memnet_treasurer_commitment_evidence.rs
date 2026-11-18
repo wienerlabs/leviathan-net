@@ -65,10 +65,13 @@ async fn slash_with(
 ) -> anyhow::Result<()> {
     let index = harness.roster_index(node).await;
     let slash = run_slash_instruction(
+        &harness.payer.pubkey(),
         &harness.main_authority.pubkey(),
         &harness.run,
         &harness.coordinator_account,
         &harness.run_id,
+        &harness.nodes[node].wallet.pubkey(),
+        None,
         index,
         commitment.batch_start,
         commitment.batch_end,
@@ -260,10 +263,13 @@ pub async fn the_proof_may_follow_the_conviction() {
     let commitment = harness.signed_payload(SUBJECT).await;
     let index = harness.roster_index(SUBJECT).await;
     let slash = run_slash_instruction(
+        &harness.payer.pubkey(),
         &harness.main_authority.pubkey(),
         &harness.run,
         &harness.coordinator_account,
         &harness.run_id,
+        &harness.nodes[SUBJECT].wallet.pubkey(),
+        None,
         index,
         commitment.batch_start,
         commitment.batch_end,

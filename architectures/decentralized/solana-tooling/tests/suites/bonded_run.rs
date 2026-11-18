@@ -46,6 +46,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_toolbox_endpoint::ToolboxEndpoint;
+use psyche_solana_tooling::slash_reports::settle_slash_reports;
 
 use super::signed_payload::replayed_digest;
 use super::signed_payload::signed_payload;
@@ -653,6 +654,21 @@ impl Harness {
             .map(|authorization| authorization.active)
     }
 
+    /// Anyone settles the run's slash reports, as a verifier daemon does each
+    /// pass: each slash whose epoch is charged is charged against its target,
+    /// and its reporter credited (wienerlabs/leviathan-net#72).
+    pub async fn settle_slash_reports(&mut self) {
+        let sweep = settle_slash_reports(
+            &mut self.endpoint,
+            &self.payer,
+            &self.run,
+            &self.coordinator_account,
+        )
+        .await
+        .unwrap();
+        assert!(sweep.failures.is_empty(), "{:?}", sweep.failures);
+    }
+
     /// The run authority convicts `node` in the round under way.
     pub async fn convict(&mut self, node: usize) {
         self.try_convict(node).await.unwrap();
@@ -678,6 +694,8 @@ impl Harness {
             &self.run,
             &self.coordinator_account,
             &self.run_id,
+            &self.nodes[node].wallet.pubkey(),
+            None,
             index,
             commitment,
             replayed_digest(),
