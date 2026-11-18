@@ -235,6 +235,13 @@ out of reach for good (wienerlabs/leviathan-net#39). Two rules now close that:
   a second, or convict directly through `run_slash`. A bonded run's authority
   is a key its operator holds, and the overturn is final once the bench
   reaches quorum.
+- **The deadline binds the bench too.** `run_submit_appeal_verdict` refuses a
+  vote once the appeal's deadline has passed (`AppealWindowClosed`), by the
+  same rule `run_finalize_slash` and the withdrawal hold read. Past the
+  deadline the conviction stands and only waits to be finalised. A bench
+  seated after the deadline used to be able to overturn it still, whenever
+  nobody had finalised it first, so the outcome was decided by whoever sent a
+  transaction first.
 
 ### B. Symmetric verifier audit by hash comparison (does not work, recorded so it is not retried)
 
