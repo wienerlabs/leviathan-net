@@ -14,7 +14,7 @@
 # several epochs on the CPU.
 set -euo pipefail
 
-RUN_CONFIG="${RUN_CONFIG:-config/leviathan/error-feedback-fidelity.toml}"
+RUN_CONFIG="${RUN_CONFIG:-config/error-feedback-fidelity/state.toml}"
 WORK="${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/leviathan-error-feedback-fidelity.XXXXXX")}"
 BIN="${BIN:-./target/debug}"
 PORT="${PORT:-39871}"

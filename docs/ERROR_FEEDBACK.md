@@ -114,7 +114,7 @@ A measurement of this kind is only as good as its claim to follow the client. Th
 
 So the simulation is checked against real clients, byte for byte. `scripts/error-feedback-fidelity.sh` does the following:
 
-1. It starts a local centralized server and two real `psyche-centralized-client` processes on `config/leviathan/error-feedback-fidelity.toml`. That is the genesis rehearsal's model, a nano Llama at sequence length 64 (not the measured run's 20M model), with its data and 1-bit DisTrO, short epochs, and a learning rate that changes at every step. The clients and the checker run on the CPU in bf16.
+1. It starts a local centralized server and two real `psyche-centralized-client` processes on `config/error-feedback-fidelity/state.toml`. That is the genesis rehearsal's model, a nano Llama at sequence length 64 (not the measured run's 20M model), with its data and 1-bit DisTrO, short epochs, and a learning rate that changes at every step. The clients and the checker run on the CPU in bf16.
 2. One client dumps every node's payload of every round with `--write-gradients-dir`.
 3. `check-error-feedback-fidelity` rebuilds the rounds from those dumps: the epochs, the closing rounds, and which node trained which share.
 4. The checker trains those rounds in the simulation and compares every payload's wire bytes with the dump.

@@ -169,13 +169,14 @@ fn the_run_trains_a_fixed_global_batch_of_eight() {
 fn the_measured_runs_seat_no_verifier_among_their_nodes() {
     let config = |name: &str| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../config/leviathan")
+            .join("../../../config")
             .join(name)
     };
     for (name, percent) in [
-        ("genesis-rehearsal.toml", 10),
-        ("fineweb-rehearsal.toml", 10),
-        ("error-feedback-fidelity.toml", 0),
+        ("leviathan/genesis-rehearsal.toml", 10),
+        ("leviathan/fineweb-rehearsal.toml", 10),
+        // The fidelity check's server state: a centralized run, with its id.
+        ("error-feedback-fidelity/state.toml", 0),
     ] {
         let path = config(name);
         assert_eq!(
@@ -271,14 +272,27 @@ async fn a_verifier_in_another_dtype_drifts_from_what_the_node_sent() {
         ),
         data,
     );
-    let drifted = records
-        .iter()
-        .filter_map(|r| r.shadow)
-        .any(|drift| drift.distance > 0.0 && drift.churn > 0.0);
+    let drifts: Vec<_> = records.iter().filter_map(|r| r.shadow).collect();
     assert!(
-        drifted,
+        drifts.iter().any(|drift| drift.distance > 0.0),
         "a bf16 replay of an fp32 node matched it exactly: {records:?}"
     );
+    // Which of the two the drift shows up as depends on the platform: a
+    // coordinate the replay picked instead of node 0's, or a sign it got
+    // wrong. Over 1-bit payloads of equal top-k counts the distance is made of
+    // exactly those: distance² = 2·churn + 4·(1 − churn)·flips, since flips are
+    // a share of the coordinates both sent (docs/ERROR_FEEDBACK.md).
+    for drift in &drifts {
+        let (d, c, f) = (
+            drift.distance as f64,
+            drift.churn as f64,
+            drift.flips as f64,
+        );
+        assert!(
+            (d * d - (2.0 * c + 4.0 * (1.0 - c) * f)).abs() < 1e-5,
+            "{drift:?} does not split into churn and flips"
+        );
+    }
 }
 
 #[tokio::test]
