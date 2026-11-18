@@ -291,8 +291,8 @@ step (wienerlabs/leviathan-net#48), whose window is the rest of epoch 0. The
 final round's window binds once later steps are replayable, and the alert says
 whether the run is ready for it. Later steps become checkable when an audited
 node reveals its error feedback and weights (`docs/ERROR_FEEDBACK.md`, built in
-wienerlabs/leviathan-net#89). That reveal needs a window of its own: for a 1B
-model trained in bf16 it is about 3.7 GiB.
+wienerlabs/leviathan-net#89 as `docs/ROUND_AUDIT.md` designs it). That reveal
+needs a window of its own: for a 1B model trained in bf16 it is about 3.7 GiB.
 
 ### Stage one is still bondless
 

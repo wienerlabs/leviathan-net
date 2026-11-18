@@ -53,7 +53,7 @@ Each node commits to the state it trains a round from: its weights, its buffer, 
 
 **Option 3 stays in force until option 2 is built.** Until then, the verifier replays a run's first step only.
 
-The implementation is tracked in #89.
+The implementation is tracked in #89, and designed in `docs/ROUND_AUDIT.md`.
 
 ## What is measured
 
