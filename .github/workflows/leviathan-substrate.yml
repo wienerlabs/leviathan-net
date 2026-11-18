@@ -198,3 +198,11 @@ jobs:
         run: |
           cargo build --locked --bin psyche-centralized-server --bin psyche-centralized-client --bin check-error-feedback-fidelity --bin check-round-states
           bash scripts/error-feedback-fidelity.sh
+
+      # A run that seats verifiers keeps every honest client: three real
+      # clients train a short run, one of them verifying each round, and none
+      # is dropped when its seat moves from verifying to training.
+      - name: Verifier seats keep every honest client, against real clients
+        run: |
+          cargo build --locked --bin psyche-centralized-server --bin psyche-centralized-client
+          bash scripts/verifier-seats.sh

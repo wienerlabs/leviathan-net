@@ -778,16 +778,28 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Whether `id`, seated by `proof`, did what its seat asked of it in the
+    /// round the previous round's witnesses attest.
+    ///
+    /// A round's witnesses attest to the round before their own: their
+    /// blooms report that round's payloads, which reach them while their own
+    /// round trains, and pick that round's results when they are applied.
+    /// So a check judges that round, two before the current one: its draw,
+    /// and the previous round's witnesses. Judged by the previous round's
+    /// draw instead, every seat was held to another round's role than the
+    /// one the witnesses saw it in: a client that verified the round the
+    /// witnesses attest and trained the next read as a trainer they never
+    /// heard, and was dropped, in every run that seats verifiers.
     pub fn healthy(
         &self,
         id: &NodeIdentity,
         proof: &CommitteeProof,
     ) -> Result<bool, CoordinatorError> {
         let round = self
-            .previous_round()
+            .previous_previous_round()
             .ok_or(CoordinatorError::NoActiveRound)?;
-        let selection = CommitteeSelection::from_coordinator(self, -1)?;
-        // The proof is read off the previous round's draw, by seat. Every
+        let selection = CommitteeSelection::from_coordinator(self, -2)?;
+        // The proof is read off the attested round's draw, by seat. Every
         // round starts by compacting the roster, so once a client has left
         // since that draw, every seat after its own holds the client that sat
         // one further along. Judged by the seat's old role, an honest verifier

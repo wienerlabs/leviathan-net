@@ -160,8 +160,12 @@ impl TrainingStepMetadata {
 
         let applying = self.apply_results(trainers, state, previous_round, current_round)?;
 
-        let sending_health_checks =
-            start_sending_health_checks(current_round, state, self.tx_health_check.clone())?;
+        let sending_health_checks = start_sending_health_checks(
+            current_round,
+            previous_round,
+            state,
+            self.tx_health_check.clone(),
+        )?;
 
         debug!("Transitioning to train step {}", state.progress.step);
 
@@ -724,31 +728,53 @@ impl TrainingStepMetadata {
     }
 }
 
+/// Sends, as a witness of `witness_round`, the round whose witness phase just
+/// ended, a health check for each client that did not do what its seat asked
+/// of it in `attested_round`, the round before it.
+///
+/// A round's witnesses report the payloads of the round before their own, so
+/// the coordinator judges a check by that round: its draw, and the previous
+/// round's witnesses (`Coordinator::healthy`). The check names each client by
+/// its seat in that draw. A client sent no check the coordinator would refuse:
+/// one it cannot judge is not reported.
 fn start_sending_health_checks(
-    round_state: &mut RoundState,
+    witness_round: &RoundState,
+    attested_round: &RoundState,
     state: &Coordinator,
     tx_health_check: mpsc::UnboundedSender<HealthChecks>,
 ) -> Result<Option<JoinHandle<Result<(), TrainError>>>, TrainError> {
-    // we won't have any information to health check with until at least one round of training has finished
-    if round_state.height == 0 {
+    // No check until a round has been witnessed: the coordinator takes none
+    // before two rounds have been drawn.
+    let Some(attested) = state.previous_previous_round() else {
+        return Ok(None);
+    };
+    // A client that did not train the attested round, having joined after it
+    // or missed it, has no draw of it to check by.
+    let Some((_, _, committee_selection)) = attested_round.committee_info.as_ref() else {
+        return Ok(None);
+    };
+    if attested_round.height != attested.height {
+        debug!(
+            client_round = attested_round.height,
+            coordinator_round = attested.height,
+            "This client's rounds do not line up with the coordinator's, so no health check is sent"
+        );
         return Ok(None);
     }
-    let (_, witness_proof, committee_selection) = round_state
+    let (_, witness_proof, _) = witness_round
         .committee_info
         .as_ref()
         .ok_or(TrainError::NoCommitteeInfo)?;
-    // The committee these checks are judged by was drawn over the previous
+    // The committee these checks are judged by was drawn over the attested
     // round's roster, seat by seat. If anyone has left since, the seats no
     // longer hold the clients it seated, and unless every seat trains the
     // coordinator refuses every check this round
     // (`CoordinatorError::RosterMoved`).
-    let roster_moved = state
-        .previous_round()
-        .is_some_and(|round| round.clients_len as usize != state.epoch_state.clients.len());
+    let roster_moved = attested.clients_len as usize != state.epoch_state.clients.len();
     let roles_moved = committee_selection.get_num_verifier_nodes() > 0
         || committee_selection.get_num_tie_breaker_nodes() > 0;
     if roster_moved && roles_moved {
-        debug!("The roster moved since the previous round was drawn, so no health check is sent");
+        debug!("The roster moved since the attested round was drawn, so no health check is sent");
         return Ok(None);
     }
     Ok(
@@ -760,20 +786,21 @@ fn start_sending_health_checks(
                 let mut checks = HealthChecks::new();
                 for (index, client) in clients.iter().enumerate() {
                     let proof = committee_selection.get_committee(index as u64);
-                    if !state.healthy(&client.id, &proof).unwrap_or(false) {
-                        event!(client::HealthCheckFailed {
-                            index: index as u64,
-                            round: state.epoch_state.rounds_head as u64,
-                        });
-                        warn!(
-                            integration_test_log_marker = %IntegrationTestLogMarker::HealthCheck,
-                            index = index,
-                            client_id = %&client.id,
-                            current_step = state.epoch_state.rounds_head,
-                            "Found unhealthy trainer at index: {}", index,
-                        );
-                        checks.push((client.id, proof));
+                    if !matches!(state.healthy(&client.id, &proof), Ok(false)) {
+                        continue;
                     }
+                    event!(client::HealthCheckFailed {
+                        index: index as u64,
+                        round: state.epoch_state.rounds_head as u64,
+                    });
+                    warn!(
+                        integration_test_log_marker = %IntegrationTestLogMarker::HealthCheck,
+                        index = index,
+                        client_id = %&client.id,
+                        current_step = state.epoch_state.rounds_head,
+                        "Found unhealthy trainer at index: {}", index,
+                    );
+                    checks.push((client.id, proof));
                 }
 
                 if !checks.is_empty() {

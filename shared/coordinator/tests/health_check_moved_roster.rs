@@ -1,9 +1,15 @@
-//! A health check names a client by its seat in the previous round's draw,
-//! and the committee proof it carries is read off that draw. Every round
-//! starts by compacting the roster, so once someone has left since then,
-//! every seat after theirs holds a different client than the one the draw
-//! seated there. Judged by its seat's old role, an honest verifier read as a
-//! trainer that trained nothing, and a health check dropped it.
+//! A health check judges the round the previous round's witnesses attest: a
+//! round's witnesses report the payloads of the round before their own. It
+//! names a client by its seat in that round's draw, and the committee proof
+//! it carries is read off that draw.
+//!
+//! Every round starts by compacting the roster, so once someone has left
+//! since the draw, every seat after theirs holds a different client than the
+//! one the draw seated there. Judged by its seat's old role, an honest
+//! verifier read as a trainer that trained nothing, and a health check
+//! dropped it. And judged by the previous round's draw rather than the
+//! attested one, a client that verified the attested round and trained the
+//! next read as a trainer the witnesses never heard, and was dropped too.
 
 use bytemuck::Zeroable;
 use psyche_coordinator::model::Model;
@@ -29,6 +35,10 @@ struct RunConfig {
 }
 
 const SEED: u64 = 0x5eed;
+/// The seed of the round whose witnesses attest the round under check.
+const WITNESS_ROUND_SEED: u64 = 0xa77e57;
+/// The height of the round whose witnesses attest the round under check. The
+/// round under check is the one before it.
 const HEIGHT: u32 = 3;
 const STEP: u32 = 5;
 const CLIENTS: usize = 10;
@@ -41,9 +51,11 @@ fn client(seed: u8, state: ClientState) -> Client {
     }
 }
 
-/// A round of the genesis rehearsal config, with half the seats verifying,
-/// drawn from `round_seed` over `roster`, whose witness phase is over. Its one
-/// witness heard every healthy client the round seated as a trainer.
+/// Two rounds of the genesis rehearsal config, with half the seats verifying,
+/// over `roster`: the round under check, drawn from `round_seed`, and the one
+/// after it, whose witness phase is over. Its one witness heard every healthy
+/// client the round under check seated as a trainer, as a witness reports
+/// the payloads of the round before its own.
 fn witnessed_round(roster: &[ClientState], round_seed: u64) -> Box<Coordinator> {
     witnessed_round_verifying(roster, round_seed, 50)
 }
@@ -88,10 +100,15 @@ fn witnessed_round_verifying(
             participants.add(&sha256(client.id.signer()));
         }
     }
-    let round = &mut coordinator.epoch_state.rounds[0];
+    let attested = &mut coordinator.epoch_state.rounds[0];
+    attested.height = HEIGHT - 1;
+    attested.clients_len = roster.len() as u16;
+    attested.random_seed = round_seed;
+    coordinator.epoch_state.rounds_head = 1;
+    let round = &mut coordinator.epoch_state.rounds[1];
     round.height = HEIGHT;
     round.clients_len = roster.len() as u16;
-    round.random_seed = round_seed;
+    round.random_seed = WITNESS_ROUND_SEED;
     round
         .witnesses
         .push(Witness {
@@ -156,12 +173,12 @@ fn seed_moving_a_verifier_onto_a_trainer_seat() -> (u64, usize) {
 }
 
 /// What every honest witness's client sends: each client on the roster now,
-/// with the proof the previous round's draw gives its seat now.
+/// with the proof the attested round's draw gives its seat now.
 fn proof_at(
     coordinator: &Coordinator,
     seat: usize,
 ) -> (NodeIdentity, psyche_coordinator::CommitteeProof) {
-    let draw = CommitteeSelection::from_coordinator(coordinator, -1).unwrap();
+    let draw = CommitteeSelection::from_coordinator(coordinator, -2).unwrap();
     (
         coordinator.epoch_state.clients[seat].id,
         draw.get_committee(seat as u64),
@@ -215,7 +232,7 @@ fn a_roster_that_did_not_move_is_health_checked_as_drawn() {
     let mut coordinator = witnessed_round(&healthy_roster(), round_seed);
     let silent = trainer_seat;
     let hash = sha256(coordinator.epoch_state.clients[silent].id.signer());
-    let bloom = &mut coordinator.epoch_state.rounds[0].witnesses[0].participant_bloom;
+    let bloom = &mut coordinator.epoch_state.rounds[1].witnesses[0].participant_bloom;
     let mut without = participant_bloom();
     for client in coordinator.epoch_state.clients.iter() {
         let signer_hash = sha256(client.id.signer());
@@ -257,8 +274,8 @@ fn a_roster_that_did_not_move_is_health_checked_as_drawn() {
     );
 }
 
-/// Takes `silent`'s id out of the round's one witness bloom: a trainer that
-/// trained nothing, still on the roster.
+/// Takes `silent`'s id out of the attesting round's one witness bloom: a
+/// trainer that trained nothing, still on the roster.
 fn silence(coordinator: &mut Coordinator, silent: usize) {
     let hash = sha256(coordinator.epoch_state.clients[silent].id.signer());
     let signers: Vec<_> = coordinator
@@ -267,7 +284,7 @@ fn silence(coordinator: &mut Coordinator, silent: usize) {
         .iter()
         .map(|client| sha256(client.id.signer()))
         .collect();
-    let bloom = &mut coordinator.epoch_state.rounds[0].witnesses[0].participant_bloom;
+    let bloom = &mut coordinator.epoch_state.rounds[1].witnesses[0].participant_bloom;
     let mut without = participant_bloom();
     for signer_hash in signers {
         if signer_hash != hash && bloom.contains(&signer_hash) {
@@ -315,11 +332,75 @@ fn a_seat_past_a_moved_roster_is_refused() {
     let mut coordinator = witnessed_round_verifying(&roster_with_a_leaver(), 7, 0);
     let leaver = coordinator.epoch_state.clients[0].id;
     next_round(&mut coordinator);
-    let draw = CommitteeSelection::from_coordinator(&coordinator, -1).unwrap();
+    let draw = CommitteeSelection::from_coordinator(&coordinator, -2).unwrap();
     let past_the_end = draw.get_committee((CLIENTS - 1) as u64);
     let refused = coordinator.health_check(&leaver, vec![(leaver, past_the_end)]);
     assert!(
         matches!(refused, Err(CoordinatorError::InvalidCommitteeProof)),
         "{refused:?}"
     );
+}
+
+/// A seat drawn a verifier in the round under check and a trainer in the
+/// round after it, whose witnesses attest the round under check.
+fn seat_verifying_then_training() -> (u64, usize) {
+    let witness_round = CommitteeSelection::new(0, 1, 50, CLIENTS, WITNESS_ROUND_SEED).unwrap();
+    for round_seed in 1..1_000u64 {
+        let attested = CommitteeSelection::new(0, 1, 50, CLIENTS, round_seed).unwrap();
+        if let Some(seat) = (0..CLIENTS).find(|&seat| {
+            attested.get_committee(seat as u64).committee == Committee::Verifier
+                && witness_round.get_committee(seat as u64).committee == Committee::Trainer
+        }) {
+            return (round_seed, seat);
+        }
+    }
+    panic!("no seed in a thousand draws a verifier the round after trains");
+}
+
+/// A client that verified the round the witnesses attest, and trained the
+/// round after it, is judged by the role it had in the round they attest: a
+/// verifier, healthy. The witnesses report the attested round's payloads,
+/// and it sent none there, as a verifier sends none. Held to the next
+/// round's draw, it read as a trainer they never heard, and every run that
+/// seats verifiers dropped it as soon as its seat changed.
+#[test]
+fn a_verifier_that_trains_the_next_round_is_judged_by_the_round_attested() {
+    let (round_seed, seat) = seat_verifying_then_training();
+    let mut coordinator = witnessed_round(&healthy_roster(), round_seed);
+    let id = coordinator.epoch_state.clients[seat].id;
+    let witnesses = &coordinator.epoch_state.rounds[1].witnesses[0].participant_bloom;
+    assert!(
+        !witnesses.contains(&sha256(id.signer())),
+        "the witness heard no payload from it in the attested round"
+    );
+    next_round(&mut coordinator);
+
+    let next_draw = CommitteeSelection::from_coordinator(&coordinator, -1).unwrap();
+    assert_eq!(
+        next_draw.get_committee(seat as u64).committee,
+        Committee::Trainer,
+        "the round the witnesses sat in drew it a trainer"
+    );
+    let (checked, proof) = proof_at(&coordinator, seat);
+    assert_eq!(checked, id);
+    assert_eq!(proof.committee, Committee::Verifier);
+    assert!(matches!(coordinator.healthy(&id, &proof), Ok(true)));
+    let refused = coordinator.health_check(&id, vec![(id, proof)]);
+    assert!(
+        matches!(refused, Err(CoordinatorError::InvalidHealthCheck)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        coordinator.epoch_state.clients[seat].state,
+        ClientState::Healthy,
+        "the honest verifier was dropped"
+    );
+
+    // Its seat in the round the witnesses sat in proves nothing about the
+    // round they attest.
+    let wrong_round = next_draw.get_committee(seat as u64);
+    assert!(matches!(
+        coordinator.healthy(&id, &wrong_round),
+        Err(CoordinatorError::InvalidCommitteeProof)
+    ));
 }
