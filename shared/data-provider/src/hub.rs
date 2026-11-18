@@ -70,7 +70,8 @@ async fn download_repo_async(
             .map(|x| async {
                 let start_time = Instant::now();
                 tracing::debug!(filename = x.rfilename, "Starting file download from hub");
-                let res = api.get(&x.rfilename).await;
+                let res =
+                    retry_lost_link_race_async(|| api.get(&x.rfilename), tokio_io_error).await;
                 if res.is_ok() {
                     let duration_secs = (Instant::now() - start_time).as_secs_f32();
                     tracing::info!(
@@ -135,6 +136,61 @@ pub async fn download_dataset_repo_async(
     .await
 }
 
+/// Whether `error` is the `AlreadyExists` that a concurrent download of the
+/// same file into the same cache leaves behind.
+///
+/// hf-hub moves a finished file into the cache, then links it into the
+/// revision's snapshot after checking that no link is there yet. Two downloads
+/// that both pass that check race to create the link, and the one that loses
+/// fails although the file is in place. Test binaries downloading one model
+/// from parallel tests hit it on a fresh cache, and so can clients sharing a
+/// machine's cache (wienerlabs/leviathan-net#87).
+fn lost_link_race(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AlreadyExists
+}
+
+fn sync_io_error(error: &hf_hub::api::sync::ApiError) -> Option<&std::io::Error> {
+    match error {
+        hf_hub::api::sync::ApiError::IoError(error) => Some(error),
+        _ => None,
+    }
+}
+
+fn tokio_io_error(error: &ApiError) -> Option<&std::io::Error> {
+    match error {
+        ApiError::IoError(error) => Some(error),
+        _ => None,
+    }
+}
+
+/// Runs `get`, and once more if it lost the race to link its file: the winner
+/// has linked it by then, so the second run finds it in the cache. Any other
+/// failure, or a second clash, is returned as it is.
+fn retry_lost_link_race<T, E>(
+    mut get: impl FnMut() -> Result<T, E>,
+    io_error: impl Fn(&E) -> Option<&std::io::Error>,
+) -> Result<T, E> {
+    match get() {
+        Err(error) if io_error(&error).is_some_and(lost_link_race) => get(),
+        result => result,
+    }
+}
+
+/// [`retry_lost_link_race`], for the async download.
+async fn retry_lost_link_race_async<T, E, F, Fut>(
+    mut get: F,
+    io_error: impl Fn(&E) -> Option<&std::io::Error>,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    match get().await {
+        Err(error) if io_error(&error).is_some_and(lost_link_race) => get().await,
+        result => result,
+    }
+}
+
 fn download_repo_sync(
     repo: Repo,
     cache: Option<PathBuf>,
@@ -158,7 +214,7 @@ fn download_repo_sync(
         .siblings
         .into_iter()
         .filter(|x| check_extensions(x, extensions))
-        .map(|x| api.get(&x.rfilename))
+        .map(|x| retry_lost_link_race(|| api.get(&x.rfilename), sync_io_error))
         .collect();
 
     res
@@ -273,4 +329,113 @@ pub async fn upload_to_hub(
         .map_err(|_| UploadError::SendCheckpoint)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::{Error, ErrorKind};
+
+    fn sync_error(kind: ErrorKind) -> hf_hub::api::sync::ApiError {
+        hf_hub::api::sync::ApiError::IoError(Error::from(kind))
+    }
+
+    fn kind(error: &hf_hub::api::sync::ApiError) -> Option<ErrorKind> {
+        sync_io_error(error).map(Error::kind)
+    }
+
+    #[test]
+    fn a_get_that_lost_the_link_race_is_run_once_more_and_finds_the_file() {
+        let calls = Cell::new(0);
+        let got = retry_lost_link_race(
+            || {
+                calls.set(calls.get() + 1);
+                match calls.get() {
+                    1 => Err(sync_error(ErrorKind::AlreadyExists)),
+                    _ => Ok(PathBuf::from("config.json")),
+                }
+            },
+            sync_io_error,
+        );
+        assert_eq!(got.unwrap(), PathBuf::from("config.json"));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn any_other_failure_is_returned_as_it_is() {
+        let calls = Cell::new(0);
+        let got: Result<PathBuf, _> = retry_lost_link_race(
+            || {
+                calls.set(calls.get() + 1);
+                Err(sync_error(ErrorKind::NotFound))
+            },
+            sync_io_error,
+        );
+        assert_eq!(kind(&got.unwrap_err()), Some(ErrorKind::NotFound));
+        assert_eq!(calls.get(), 1);
+
+        let calls = Cell::new(0);
+        let got: Result<PathBuf, _> = retry_lost_link_race(
+            || {
+                calls.set(calls.get() + 1);
+                Err(hf_hub::api::sync::ApiError::TooManyRetries(Box::new(
+                    sync_error(ErrorKind::AlreadyExists),
+                )))
+            },
+            sync_io_error,
+        );
+        assert!(kind(&got.unwrap_err()).is_none());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_link_that_still_clashes_on_the_second_run_is_an_error_not_a_loop() {
+        let calls = Cell::new(0);
+        let got: Result<PathBuf, _> = retry_lost_link_race(
+            || {
+                calls.set(calls.get() + 1);
+                Err(sync_error(ErrorKind::AlreadyExists))
+            },
+            sync_io_error,
+        );
+        assert_eq!(kind(&got.unwrap_err()), Some(ErrorKind::AlreadyExists));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_async_download_runs_a_lost_get_once_more_too() {
+        let calls = Cell::new(0);
+        let got = retry_lost_link_race_async(
+            || {
+                calls.set(calls.get() + 1);
+                let attempt = calls.get();
+                async move {
+                    match attempt {
+                        1 => Err(ApiError::IoError(Error::from(ErrorKind::AlreadyExists))),
+                        _ => Ok(PathBuf::from("model.safetensors")),
+                    }
+                }
+            },
+            tokio_io_error,
+        )
+        .await;
+        assert_eq!(got.unwrap(), PathBuf::from("model.safetensors"));
+        assert_eq!(calls.get(), 2);
+
+        let calls = Cell::new(0);
+        let got: Result<PathBuf, _> = retry_lost_link_race_async(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(ApiError::IoError(Error::from(ErrorKind::PermissionDenied))) }
+            },
+            tokio_io_error,
+        )
+        .await;
+        assert!(matches!(
+            got.unwrap_err(),
+            ApiError::IoError(error) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        assert_eq!(calls.get(), 1);
+    }
 }

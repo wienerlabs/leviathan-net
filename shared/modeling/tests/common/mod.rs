@@ -6,6 +6,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use psyche_coordinator::CoordinatorConfig;
 use psyche_coordinator::model::{Checkpoint, Model};
@@ -47,7 +48,16 @@ impl Recipe {
     }
 }
 
+/// The genesis rehearsal's recipe, read and downloaded once per test binary.
+/// The tests of one binary run in parallel, and each downloading the model
+/// into an empty cache used to race (wienerlabs/leviathan-net#87). A test
+/// that asks while the first download runs waits for it.
 pub fn genesis_recipe() -> Recipe {
+    static RECIPE: OnceLock<Recipe> = OnceLock::new();
+    RECIPE.get_or_init(read_genesis_recipe).clone()
+}
+
+fn read_genesis_recipe() -> Recipe {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../config/leviathan/genesis-rehearsal.toml"
