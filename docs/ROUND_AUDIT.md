@@ -128,6 +128,19 @@ state the payload's commitment names, from the payload's trainer, by the
 digest. The trainer is the roster key that signed the payload, and iroh
 reaches it at that key.
 
+- **Only what it audits.** The node computes its own assignments when the
+  round starts, with the audit lottery the verifier daemon and the treasurer
+  draw (`select_audits_for_current_round`), and draws none while the roster
+  has moved under the round's draw, when the treasurer refuses every vote. It
+  fetches the state of a payload it is assigned once it keeps that payload,
+  and of no other: every state of every payload would be the run's states
+  once more on every verifier.
+- **Asking again.** A trainer keeps a state beside its payload's broadcast,
+  not before it, so the first request can find it missing. The verifier asks
+  again every round witness time, the span a round's results are broadcast
+  in, until the payload's epoch is over: after that the treasurer convicts
+  nobody on it. A state of another length is refused at once.
+
 - **The fetch checks itself.** iroh verifies a blob against its hash as it
   arrives, and the hash is the digest the trainer signed. A state that does
   not match cannot be served under it.
@@ -136,10 +149,16 @@ reaches it at that key.
   checks it against the size the trainer proves before anything else is
   downloaded. A trainer cannot make a verifier download more than that.
 - **Where it goes.** The verifier's node writes it beside the payload dump, as
-  `<dump>.state`, for the verifier daemon.
-- **The reveal window.** The download has `reveal_seconds`, a run parameter,
-  sized as `state_bytes / reveal_rate + slack`. It is not the final round's
-  audit window: a 1B state at 100 Mbit/s takes over five minutes.
+  `<dump>.state` (`revealed_state_path`), for the verifier daemon, and only
+  whole. It writes it only if the commitment record beside the dump names that
+  state: a payload that lost its name to another the committer signed for the
+  batch is kept as an equivocation, not under that name.
+- **The reveal window.** How long a trainer has before verifiers may vote
+  that it did not reveal is `reveal_seconds`, sized as
+  `state_bytes / reveal_rate + slack`. It is not the final round's audit
+  window: a 1B state at 100 Mbit/s takes over five minutes. The coordinator's
+  config has no room for it, so it is the treasurer's, beside the run, like
+  the equivocation bounty: the treasurer is what takes the vote (part 5).
 
 ## Replaying a later round
 
@@ -209,10 +228,15 @@ does, and it fails against a target that serves its state on appeal.
    payload's `state_digest`, the treasurer's evidence, and the cost measured.
 3. **Retention and serving:** the state store, kept for the epoch under way,
    serving a state by its digest, and the fetch a verifier makes.
-4. **The verifier:** the reveal fetch, and the daemon's replay of a later
-   round from the revealed state, with continuity on classes that repeat
-   themselves. Tests run real clients on the CPU, at a round past the first:
-   an honest node cleared, a forged result convicted, a forged state caught.
+4. **The verifier**, in three:
+   - **the reveal fetch:** each verifier fetches the state of each payload
+     it audits, beside its dump, checked against three real clients on the
+     CPU, one of them verifying each round;
+   - **the replay:** the daemon replays a later round from the revealed
+     state, and judges it by the band. Tests run real clients on the CPU, at
+     a round past the first: an honest node cleared, a forged result
+     convicted;
+   - **continuity** on classes that repeat themselves: a forged state caught.
 5. **A node that does not reveal:** the verdict's kind, the reveal window,
    and the crank passing an overturned non-reveal. Then `ERROR_FEEDBACK.md`,
    the README and `FIRST_RUN.md` say later rounds are checked, and #89 and #48

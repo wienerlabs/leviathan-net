@@ -266,6 +266,58 @@ async fn remove_state_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Why a trainer's state was not revealed to a verifier.
+#[derive(Debug, Error)]
+pub enum RevealError {
+    /// The trainer serves something under the digest that cannot be the
+    /// state: one of another length. The digest names it, so asking again
+    /// would only serve it again.
+    #[error("the trainer serves no state of the run's model under its digest: {0}")]
+    Refused(FetchRoundStateError),
+    /// The trainer did not serve the state before the time to reveal it ran
+    /// out.
+    #[error("the trainer did not serve the state in time; the last attempt failed: {0}")]
+    NotRevealed(FetchRoundStateError),
+    /// The verifier could not write what it fetched: its own trouble, not the
+    /// trainer's.
+    #[error("the revealed state could not be written: {0}")]
+    Local(FetchRoundStateError),
+}
+
+/// Fetches from `node` the state named by `digest`, as `fetch_round_state`
+/// does, asking again every `retry_every` until `time_to_reveal` has gone by.
+///
+/// A trainer keeps the state beside its payload's broadcast, not before it,
+/// so a verifier that asks first finds it missing, and asks again. A state of
+/// another length is refused at once. Returns how many times it asked.
+pub async fn reveal_round_state(
+    endpoint: &Endpoint,
+    node: impl Into<EndpointAddr>,
+    digest: [u8; 32],
+    expected_len: u64,
+    dest: &Path,
+    retry_every: Duration,
+    time_to_reveal: Duration,
+) -> Result<u32, RevealError> {
+    let node = node.into();
+    let started = tokio::time::Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let err = match fetch_round_state(endpoint, node.clone(), digest, expected_len, dest).await
+        {
+            Ok(()) => return Ok(attempts),
+            Err(err @ FetchRoundStateError::Size { .. }) => return Err(RevealError::Refused(err)),
+            Err(err @ FetchRoundStateError::Io(_)) => return Err(RevealError::Local(err)),
+            Err(err) => err,
+        };
+        if started.elapsed() + retry_every > time_to_reveal {
+            return Err(RevealError::NotRevealed(err));
+        }
+        tokio::time::sleep(retry_every).await;
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FetchRoundStateError {
     #[error("the node could not be reached: {0:#}")]

@@ -8,10 +8,13 @@ use psyche_coordinator::{Committee, Coordinator, RunState, Witness, WitnessProof
 use psyche_core::{IntegrationTestLogMarker, MerkleRoot, MerkleTree, NodeIdentity, sha256};
 use psyche_event_sourcing::event;
 use psyche_modeling::{DistroResult, Trainer};
-use psyche_network::{BlobTicket, CommitmentRecord, Hash, P2PEndpointInfo, TransmittableDistroResult};
+use psyche_network::{
+    BlobTicket, CommitmentRecord, EndpointId, Hash, P2PEndpointInfo, TransmittableDistroResult,
+};
 use psyche_watcher::OpportunisticData;
 use std::{
     fmt,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -28,9 +31,12 @@ use super::{
     cooldown::{CooldownError, CooldownStep, CooldownStepMetadata},
     evals::{EvalError, MaybeRunningEvals, RunningEvals},
     init::InitRunError,
+    reveal::{StateToReveal, reveal_audited_state},
     round_state::RoundState,
     stats::StatsLogger,
-    train::{TrainError, TrainingStep, TrainingStepMetadata, write_gradients_to_disk},
+    train::{
+        TrainError, TrainingStep, TrainingStepMetadata, payload_dump_path, write_gradients_to_disk,
+    },
     types::PayloadState,
     warmup::{WarmupStep, WarmupStepMetadata},
     witness::{WitnessStep, WitnessStepMetadata, WitnessingError},
@@ -625,6 +631,37 @@ impl StepStateMachine {
             true => None,
             false => self.training.write_gradients_dir.clone(),
         };
+        // A payload this node audits has its state fetched from its trainer,
+        // beside its dump, for the verifier daemon to replay the round from
+        // (wienerlabs/leviathan-net#89).
+        let state_to_reveal = match (
+            round_state.audits.contains(&(from, batch_id)),
+            distro_result.state_digest,
+            self.training.round_state_len,
+            EndpointId::from_bytes(from.p2p_identity()),
+        ) {
+            (true, Some(digest), Some(expected_len), Ok(trainer)) => {
+                let (retry_every, time_to_reveal) = StateToReveal::windows(&self.coordinator_state);
+                Some(StateToReveal {
+                    endpoint: self.training.endpoint.clone(),
+                    trainer,
+                    digest,
+                    expected_len,
+                    dump: PathBuf::new(),
+                    retry_every,
+                    time_to_reveal,
+                })
+            }
+            (true, None, _, _) => {
+                warn!(
+                    from = %from,
+                    batch_id = %batch_id,
+                    "An audited payload commits to no state, so none can be revealed",
+                );
+                None
+            }
+            _ => None,
+        };
         tokio::spawn(async move {
             // verify that the result matches the commitment
             let (distro_hash, distro_result) = tokio::task::spawn_blocking(move || {
@@ -665,10 +702,17 @@ impl StepStateMachine {
                     commitment.data_hash,
                     commitment.signature,
                 );
-                if let Err(err) =
-                    write_gradients_to_disk(dir, from, distro_result.clone(), Some(record)).await
+                let dump = payload_dump_path(&dir, from, &distro_result);
+                match write_gradients_to_disk(dir, from, distro_result.clone(), Some(record)).await
                 {
-                    error!("Failed to write a received distro result to disk: {err:#}");
+                    Ok(()) => {
+                        if let Some(reveal) = state_to_reveal {
+                            tokio::spawn(reveal_audited_state(StateToReveal { dump, ..reveal }));
+                        }
+                    }
+                    Err(err) => {
+                        error!("Failed to write a received distro result to disk: {err:#}");
+                    }
                 }
             }
 

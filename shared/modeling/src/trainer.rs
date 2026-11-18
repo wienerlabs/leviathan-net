@@ -1,7 +1,8 @@
 use crate::{
     AllReduce, CausalLM, Communicator, CommunicatorId, CudaSynchronize, Distro, DistroResult,
     EosToks, Fp32GradientAccumulator, Optimizer, ReduceType, StableVariableIterator,
-    keep_round_state, round_state_digest, unsharded_cpu_variables, write_round_state,
+    keep_round_state, round_state_digest, round_state_len, unsharded_cpu_variables,
+    write_round_state,
 };
 use anyhow::{Error, Result};
 use psyche_core::{Barrier, BatchId, LearningRateSchedule, OptimizerDefinition};
@@ -286,6 +287,7 @@ enum ParallelAssignment {
     SetErrorFeedbackKind {
         kind: Kind,
     },
+    RoundStateLen,
 }
 
 #[derive(Debug)]
@@ -313,6 +315,9 @@ enum ParallelResult {
     },
     SetErrorFeedbackKind {
         error: Option<String>,
+    },
+    RoundStateLen {
+        len: Result<Option<u64>, String>,
     },
 }
 
@@ -416,6 +421,21 @@ impl Trainer {
             #[cfg(feature = "python")]
             Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
                 "move its error feedback to another dtype",
+            )),
+        }
+    }
+
+    /// The length of the encoding of a state this trainer trains a round
+    /// from (`round_state_len`), from its model's and its optimizer's shapes
+    /// and dtypes, or None if its optimizer keeps no error feedback. A
+    /// verifier expects a state it fetches to be this long
+    /// (wienerlabs/leviathan-net#89).
+    pub fn round_state_len(&mut self) -> Result<Option<u64>, TrainerThreadCommunicationError> {
+        match self {
+            Trainer::Local(local_trainer) => local_trainer.round_state_len(),
+            #[cfg(feature = "python")]
+            Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
+                "say how long its state is",
             )),
         }
     }
@@ -536,6 +556,9 @@ pub enum TrainerThreadCommunicationError {
 
     #[error("Could not keep the error feedback in another dtype: {0}")]
     ErrorFeedbackKind(String),
+
+    #[error("A model thread could not say how long its round state is: {0}")]
+    RoundStateLen(String),
 
     #[cfg(feature = "python")]
     #[error("Python error: {0}")]
@@ -979,6 +1002,41 @@ impl LocalTrainer {
         match first_error {
             Some(error) => Err(TrainerThreadCommunicationError::ErrorFeedbackKind(error)),
             None => Ok(()),
+        }
+    }
+
+    /// The length of the encoding of a state this trainer trains a round
+    /// from, as the first model thread works it out from its model and its
+    /// optimizer (`round_state_len`), or None if the optimizer keeps no error
+    /// feedback (wienerlabs/leviathan-net#89).
+    pub fn round_state_len(&mut self) -> Result<Option<u64>, TrainerThreadCommunicationError> {
+        self.barrier.reset();
+        for (tx, _) in &self.models {
+            tx.send(ParallelAssignment::RoundStateLen)
+                .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
+        }
+        let mut first = None;
+        for (_, rx) in &self.models {
+            match rx
+                .recv()
+                .map_err(|_| TrainerThreadCommunicationError::RecvResult)?
+            {
+                ParallelResult::RoundStateLen { len } => {
+                    if first.is_none() {
+                        first = Some(len);
+                    }
+                }
+                result => {
+                    return Err(TrainerThreadCommunicationError::UnexpectedResult(format!(
+                        "{result:?}"
+                    )));
+                }
+            }
+        }
+        match first {
+            Some(Ok(len)) => Ok(len),
+            Some(Err(error)) => Err(TrainerThreadCommunicationError::RoundStateLen(error)),
+            None => Err(TrainerThreadCommunicationError::RecvResult),
         }
     }
 
@@ -1490,6 +1548,22 @@ impl LocalTrainer {
                     };
                     if submission
                         .send(ParallelResult::SetErrorFeedbackKind { error })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ParallelAssignment::RoundStateLen) => {
+                    let len = match &optimizer {
+                        Optimizer::Distro { optimizer, .. } => {
+                            round_state_len(model.as_ref(), optimizer)
+                                .map(Some)
+                                .map_err(|error| error.to_string())
+                        }
+                        Optimizer::Torch { .. } | Optimizer::Null => Ok(None),
+                    };
+                    if submission
+                        .send(ParallelResult::RoundStateLen { len })
                         .is_err()
                     {
                         return;

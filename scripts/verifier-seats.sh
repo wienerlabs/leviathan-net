@@ -7,7 +7,12 @@
 # client has to see the run through to its end, none dropped, and at least
 # one has to have trained the round after one it verified.
 #
-#   cargo build --bin psyche-centralized-server --bin psyche-centralized-client
+# Each round's verifier also fetches, from the payload's trainer, the state
+# the payload it audits commits to (wienerlabs/leviathan-net#89): every one
+# has to be revealed, and be the state its payload commits to.
+#
+#   cargo build --bin psyche-centralized-server --bin psyche-centralized-client \
+#     --bin check-revealed-states
 #   ./scripts/verifier-seats.sh
 #
 # Requires the libtorch environment (see docs/OPS_RUNBOOK.md) and the network,
@@ -44,4 +49,27 @@ if ((moved == 0)); then
     echo "$LABEL no client trained the round after one it verified, so nothing was checked; logs in $WORK" >&2
     exit 1
 fi
-echo "$LABEL passed: every client saw the run through, and $moved trained a round after verifying the one before"
+echo "$LABEL every client saw the run through, and $moved trained a round after verifying the one before"
+
+# What the verifiers say about the states they asked for.
+said() {
+    cat "$WORK"/client*.log | tr -d '\033' | grep -ac "$1" || true
+}
+not_revealed=$(said "was not revealed")
+no_state=$(said "commits to no state, so none can be revealed")
+revealed=$(said "Revealed the state an audited payload was trained from")
+if ((not_revealed > 0 || no_state > 0)); then
+    echo "$LABEL $not_revealed audited states were not revealed and $no_state audited payloads committed to none; logs in $WORK" >&2
+    exit 1
+fi
+
+echo "$LABEL checking the $revealed states the verifiers say they revealed"
+dumps=()
+for ((node = 0; node < NODES; node++)); do
+    dumps+=("$WORK/dumps$node")
+done
+# With three clients and a third of the roster verifying, every round that
+# trains seats a verifier, so every step a payload was trained at has one.
+"$BIN/check-revealed-states" --run-config "$RUN_CONFIG" --dumps "${dumps[@]}" --revealed "$revealed" \
+    --every-trained-step
+echo "$LABEL passed: every verifier fetched the state each payload it audited commits to"

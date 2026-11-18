@@ -7,6 +7,7 @@ mod evals;
 mod init;
 mod prompt;
 mod prompt_texts;
+mod reveal;
 mod round_state;
 mod stats;
 mod train;

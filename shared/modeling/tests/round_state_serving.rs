@@ -15,8 +15,8 @@ use psyche_metrics::ClientMetrics;
 use psyche_modeling::{round_state_file, round_state_len};
 use psyche_network::allowlist::{AllowAll, AllowDynamic, Allowlist};
 use psyche_network::{
-    DiscoveryMode, FetchRoundStateError, NetworkConnection, RelayKind, RoundStates,
-    RoundStatesError, SecretKey, TransmittableDistroResult,
+    DiscoveryMode, FetchRoundStateError, NetworkConnection, RelayKind, RevealError, RoundStates,
+    RoundStatesError, SecretKey, TransmittableDistroResult, reveal_round_state,
 };
 
 type Connection = NetworkConnection<TransmittableDistroResult, TransmittableDistroResult>;
@@ -384,5 +384,123 @@ async fn a_node_keeping_no_states_serves_none() {
         .await
         .unwrap_err();
     assert!(matches!(err, FetchRoundStateError::Connect(_)), "{err}");
+    assert!(nothing_at(&dest));
+}
+
+/// How often a verifier asks a trainer for a state again in these tests.
+const RETRY_EVERY: Duration = Duration::from_millis(200);
+
+/// A trainer keeps a state beside its payload's broadcast, not before it. A
+/// verifier that asks first finds it missing and asks again, and gets it once
+/// it is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_state_kept_late_is_revealed_when_asked_again() {
+    let recipe = genesis_recipe();
+    let node_dir = tempfile::tempdir().unwrap();
+    let states = RoundStates::open(node_dir.path(), GC_INTERVAL)
+        .await
+        .unwrap();
+    let (first, _) = two_rounds(&recipe, &states);
+
+    let node = connect(secret_key(), AllowAll, Some(states.clone())).await;
+    let verifier = connect(secret_key(), AllowAll, None).await;
+    let node_addr = node.router().endpoint().addr();
+    let len = state_len(&recipe);
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("first.state");
+
+    let keeping = tokio::spawn(async move {
+        tokio::time::sleep(RETRY_EVERY * 3).await;
+        states.keep(1, first).await.unwrap();
+    });
+    let attempts = reveal_round_state(
+        verifier.router().endpoint(),
+        node_addr,
+        first,
+        len,
+        &dest,
+        RETRY_EVERY,
+        RETRY_EVERY * 50,
+    )
+    .await
+    .unwrap();
+    keeping.await.unwrap();
+    assert!(
+        attempts > 1,
+        "revealed at the first attempt, before it was kept"
+    );
+    assert_eq!(*blake3::hash(&fetched(&dest)).as_bytes(), first);
+}
+
+/// A state the trainer never keeps is not revealed: the verifier stops asking
+/// once the time to reveal it is over, and keeps nothing of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_state_never_kept_is_not_revealed_in_time() {
+    let recipe = genesis_recipe();
+    let node_dir = tempfile::tempdir().unwrap();
+    let states = RoundStates::open(node_dir.path(), GC_INTERVAL)
+        .await
+        .unwrap();
+    let (first, _) = two_rounds(&recipe, &states);
+
+    let node = connect(secret_key(), AllowAll, Some(states)).await;
+    let verifier = connect(secret_key(), AllowAll, None).await;
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("first.state");
+    let time_to_reveal = RETRY_EVERY * 5;
+    let started = std::time::Instant::now();
+    let err = reveal_round_state(
+        verifier.router().endpoint(),
+        node.router().endpoint().addr(),
+        first,
+        state_len(&recipe),
+        &dest,
+        RETRY_EVERY,
+        time_to_reveal,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, RevealError::NotRevealed(_)), "{err}");
+    assert!(started.elapsed() >= time_to_reveal - RETRY_EVERY);
+    assert!(nothing_at(&dest));
+}
+
+/// A state of another length than the run's model gives is refused at the
+/// first attempt: the digest names it, so asking again would only serve it
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_state_of_another_length_is_refused_at_once() {
+    let recipe = genesis_recipe();
+    let node_dir = tempfile::tempdir().unwrap();
+    let states = RoundStates::open(node_dir.path(), GC_INTERVAL)
+        .await
+        .unwrap();
+    let (first, _) = two_rounds(&recipe, &states);
+    states.keep(1, first).await.unwrap();
+
+    let node = connect(secret_key(), AllowAll, Some(states)).await;
+    let verifier = connect(secret_key(), AllowAll, None).await;
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("first.state");
+    // Long enough between attempts that one more would show in the time
+    // taken.
+    let retry_every = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let err = reveal_round_state(
+        verifier.router().endpoint(),
+        node.router().endpoint().addr(),
+        first,
+        state_len(&recipe) + 1,
+        &dest,
+        retry_every,
+        retry_every * 6,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, RevealError::Refused(FetchRoundStateError::Size { .. })),
+        "{err}"
+    );
+    assert!(started.elapsed() < retry_every, "it asked again");
     assert!(nothing_at(&dest));
 }

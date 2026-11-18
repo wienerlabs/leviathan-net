@@ -15,7 +15,7 @@ use psyche_modeling::{
     TrainerThreadCommunicationError,
 };
 use psyche_network::{
-    CommitmentRecord, EquivocationRecord, Hash, RoundStates, SerializeDistroResultError,
+    CommitmentRecord, Endpoint, EquivocationRecord, Hash, RoundStates, SerializeDistroResultError,
     SerializedDistroResult, TransmittableDistroResult, commitment_record_path,
     distro_results_to_bytes, equivocation_record_path, payload_dump_name,
 };
@@ -35,6 +35,7 @@ use tracing::{Instrument, debug, error, info, trace, trace_span, warn};
 
 use super::{
     evals::{MaybeRunningEvals, ModelTaskRunner},
+    reveal::own_audits,
     round_state::RoundState,
     types::DistroBroadcastAndPayload,
 };
@@ -106,6 +107,15 @@ pub struct TrainingStepMetadata {
     /// The states this node keeps of the rounds it trains, to reveal one to
     /// an audit (wienerlabs/leviathan-net#89).
     pub round_states: Option<RoundStates>,
+
+    /// This node's endpoint, which fetches the state a payload it audits
+    /// commits to from the payload's trainer.
+    pub endpoint: Endpoint,
+
+    /// How long a state of the run's model is as this node trains it, which a
+    /// state it fetches has to be, or None if its trainer keeps no error
+    /// feedback, and it fetches none.
+    pub round_state_len: Option<u64>,
 
     pub model_task_runner: ModelTaskRunner,
 }
@@ -206,6 +216,11 @@ impl TrainingStepMetadata {
 
         let committee_proof = committee_selection.get_committee(client_index);
         let witness_proof = committee_selection.get_witness(client_index);
+        let audits = if have_training {
+            own_audits(state, &self.identity)
+        } else {
+            Default::default()
+        };
 
         let blooms = {
             let participant_bloom =
@@ -239,6 +254,7 @@ impl TrainingStepMetadata {
             committee_info: Some((committee_proof, witness_proof, committee_selection)),
             batch_ids_not_yet_trained_on,
             self_distro_results: vec![],
+            audits,
         };
 
         let warmup_lr_between = state.get_cold_start_warmup_bounds();
@@ -890,6 +906,28 @@ async fn keep_round_state(
     }
 }
 
+/// Where the payload `distro_result`, which `identity` trained, is kept in
+/// `write_gradients_dir` (`payload_dump_name`).
+///
+/// The committer is the full signer, base58 and untruncated. The daemon
+/// parses this segment back out and matches it against the roster, so a
+/// truncated `Display` made the audit pipeline join on eight characters, and
+/// any change to how identities are printed silently broke the match, with
+/// the daemon skipping every contribution while reporting a clean pass
+/// (wienerlabs/leviathan#15, finding 20).
+pub(crate) fn payload_dump_path(
+    write_gradients_dir: &Path,
+    identity: NodeIdentity,
+    distro_result: &TransmittableDistroResult,
+) -> PathBuf {
+    write_gradients_dir.join(payload_dump_name(
+        &bs58::encode(identity.signer()).into_string(),
+        distro_result.epoch_start,
+        distro_result.step,
+        distro_result.batch_id,
+    ))
+}
+
 /// Writes `distro_result` to disk, as a payload dump the verifier daemon reads.
 ///
 /// A peer's payload comes with `commitment`, the record of what the peer
@@ -918,19 +956,11 @@ pub(crate) async fn write_gradients_to_disk(
         .await
         .map_err(WriteGradientsError::CreateDir)?;
 
-    // The full signer, base58 and untruncated. The daemon parses this segment
-    // back out and matches it against the roster, so a truncated `Display` made
-    // the audit pipeline join on eight characters - and any change to how
-    // identities are printed silently broke the match, with the daemon skipping
-    // every contribution while reporting a clean pass
-    // (wienerlabs/leviathan#15, finding 20).
-    let fname = payload_dump_name(
-        &bs58::encode(identity.signer()).into_string(),
-        distro_result.epoch_start,
-        distro_result.step,
-        distro_result.batch_id,
-    );
-    let fpath = write_gradients_dir.join(&fname);
+    let fpath = payload_dump_path(&write_gradients_dir, identity, &distro_result);
+    let fname = fpath
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let serialized = distro_results_to_bytes(&distro_result.distro_results).map_err(|err| {
         WriteGradientsError::Serialize {
             fname: fname.clone(),

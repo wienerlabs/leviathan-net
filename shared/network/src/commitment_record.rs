@@ -166,6 +166,12 @@ pub fn commitment_record_path(payload_path: &Path) -> PathBuf {
     payload_path.with_extension(COMMITMENT_RECORD_EXTENSION)
 }
 
+/// Where a verifier keeps the state the payload dump at `payload_path` was
+/// trained from, once its trainer revealed it (wienerlabs/leviathan-net#89).
+pub fn revealed_state_path(payload_path: &Path) -> PathBuf {
+    payload_path.with_extension(psyche_modeling::ROUND_STATE_EXTENSION)
+}
+
 /// The extension a payload dump is kept under.
 pub const PAYLOAD_DUMP_EXTENSION: &str = "vec-postcard";
 

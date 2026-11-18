@@ -248,6 +248,23 @@ fn a_trainer_keeps_the_state_each_round_trains_from() {
     assert_eq!(files_in(dir.path()), expected);
 }
 
+/// A trainer says how long the state it trains from is, as a verifier works
+/// it out from its own copy of the model, and the state it keeps is that
+/// long.
+#[test]
+fn a_trainer_says_how_long_its_state_is() {
+    let recipe = genesis_recipe();
+    let model = load(&recipe);
+    let expected = round_state_len(&*model, &distro(&recipe, &*model)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut trainer = round_trainer(&recipe, Some(dir.path().to_path_buf()));
+    assert_eq!(trainer.round_state_len().unwrap(), Some(expected));
+    let first = train_round(&recipe, trainer, 1, 1, vec![]);
+    let file = round_state_file(dir.path(), &first.state_digest.unwrap());
+    assert_eq!(std::fs::metadata(file).unwrap().len(), expected);
+}
+
 /// What committing costs a node every round on the genesis rehearsal's model:
 /// copying the state off the device and hashing it. Printed for the record.
 #[test]
