@@ -93,16 +93,57 @@ cargo check -p leviathan-multitude --target aarch64-apple-ios
 
 Linking an app still needs the Android NDK or Xcode. `--features metal` trains on Apple's GPU.
 
+## Join from a phone
+
+Three pieces turn the simulator's round into a run a phone can join:
+
+- `leviathan-multitude-relay` hosts a run over HTTP. It serves the run config, the corpus and the current round, takes signed contributions until the round closes, tallies them, and publishes the claim and every contribution it received so anyone can recount. It draws the audit lottery from the next round's seed, which nobody knows until the tally is in, and replays an audited phone once the phone reveals the error buffer it committed to.
+- `leviathan-multitude-mobile` is the phone side: a session that checks the device policy, plans its inner steps from measured throughput, trains, signs and uploads, checks from the published digests that it was counted, answers its audits, and keeps its error buffer and pending round on disk, so an app restart does not cost an audit. UniFFI exposes it to Kotlin and Swift as `MultitudeNode`.
+- `android/` is an Android app on those bindings: the phone's address, the relay, a switch to train on the charger, and the round's status. The key is generated on the phone and sealed by an Android Keystore key.
+
+Start a relay and join it from this machine, the way the app does:
+
+```
+cargo run --release -p leviathan-multitude-relay -- --round-seconds 20
+cargo run --release -p leviathan-multitude-mobile --bin multitude-phone -- --key phone.key --state phone.state
+```
+
+`--behave sign-flip` (or `random`, `lazy`, `withhold`) joins as a cheater, to watch the audits work. `GET /v1/status` on the relay lists every phone, its counted rounds and any conviction.
+
+Build the Android app with the Android SDK, its NDK and JDK 17:
+
+```
+cd android
+./build-rust.sh
+./gradlew assembleDebug
+```
+
+`build-rust.sh` cross-compiles the phone library for `arm64-v8a`, aligned for 16 KB pages, and generates the Kotlin bindings; both are build outputs and stay out of git. The app's default relay, `http://10.0.2.2:8080`, is the host machine as the emulator sees it.
+
+Swift bindings come from the same library:
+
+```
+cargo build --release -p leviathan-multitude-mobile --lib
+cargo run -p leviathan-multitude-mobile --features bindgen --bin uniffi-bindgen -- \
+    generate --library target/release/libleviathan_multitude_mobile.dylib --language swift --out-dir swift
+```
+
+On 17 November 2026 a relay on a Mac ran 20-second rounds with audits at 50%, and four phones joined it: the Android app in an arm64 emulator (Android 16, 16 KB pages), a Swift program on the generated bindings, an honest `multitude-phone` and a sign-flipping one. Over 12 rounds the global loss fell from 5.550 to 4.338 nats per byte. Six audits of honest phones, three of them the Android app's, replayed at distance 0.0000; the sign-flipper's three came out at 2.0000 against a band of 0.05 and were logged in dry run. Pulling the emulator's charger paused the app with "not charging", and a reinstall picked up its counted rounds from the saved state. `cargo test` runs the same path over loopback: two honest phones and a sign-flipper, the sign-flipper convicted with the band enforced, one phone restarting mid-run, and a watcher recounting a round from what the relay published.
+
+The relay's limits: at most `--max-phones` keys (64), two distinct contributions per phone per round, request bodies sized to the model, and `--reveal-rounds` (30) for an audited phone to answer before it is convicted. A phone that signs two contributions for one round is convicted. A revealed buffer that misses its commitment is refused rather than convicted, because a reveal is not signed and anyone could send one. A conviction on the replay band stays in dry run unless the relay runs with `--enforce-band`, the main network's rule until the band is measured on real phones. A round nobody trained in stays open, so the outer learning rate is not spent on empty rounds.
+
+Not yet: counted rounds and convictions live in the relay's memory, not on chain, and a relay restart starts a new run; any key can join, so a sybil could fill the run or outvote it, which is why admission comes next; the relay judges the audits, though everything it judges on is public; the app trains only while it is open on the charger; and there is no iOS app, since building one needs Xcode.
+
 ## What the simulator does not prove
 
 The network, the clock, the sensors and the hardware are simulated. Phone classes plan their steps from estimated throughputs for a 135M model, but the training runs on the host CPU. Hardware drift is a model (each pseudo-gradient value scaled by `1 + scale * u`), not a measurement. The model is 135K parameters on 2.5 KB of text: a test of the protocol, not a useful model.
 
 ## Next
 
-1. **Measure a real phone.** Run `train_local` on an iPhone over Metal and an Android phone on CPU: tokens per second, temperature, battery, and the drift of each against an x86 replay, which sets the band per phone class. Until then a band-based slash stays in dry run, as the main network's rule requires.
-2. **Mobile bindings.** UniFFI over `PhoneNode` and the device policy for Swift and Kotlin, with the key in Seed Vault, the Keychain or the Keystore.
-3. **Transport.** iroh, as on the main network, for contributions and tallies, and a relay service.
-4. **On chain.** Join through the authorizer behind the admission service of `docs/FIRST_RUN.md` section 0, with one admission per attested device (App Attest, Play Integrity) and delegates counted; bonds and claims through the treasurer; round seeds from a recent blockhash or a VRF; convictions through the committee vote.
+1. **Measure a real phone.** Run the app on an iPhone over Metal and an Android phone on CPU: tokens per second, temperature, battery, and the drift of each against an x86 replay, which sets the band per phone class. The emulator replays bit for bit against the Mac it runs on, which says nothing yet about a phone's own chip. Until then a band-based slash stays in dry run, as the main network's rule requires.
+2. **On chain.** Join through the authorizer behind the admission service of `docs/FIRST_RUN.md` section 0, with one admission per attested device (App Attest, Play Integrity) and delegates counted; bonds and claims through the treasurer; round seeds from a recent blockhash or a VRF; convictions through the committee vote. Until then the relay is a devnet service with nothing of value at stake.
+3. **iOS and background training.** An iOS app on the Swift bindings with the key in the Keychain (Seed Vault on Solana phones), and Android training from a foreground service so the app need not stay open.
+4. **Transport.** iroh, as on the main network, so watchers get every contribution from the swarm and not only from the relay.
 5. **A real model.** Scale to 100M to 150M parameters once step 1 shows the memory and throughput fit.
 
 Known limits: the round seed chains the previous seed with the tally hash, which a relay choosing what to include could grind (production takes it from the chain); audits run after the tally is applied, as on the main network, so an uncaught round's damage is bounded by the mean vote rather than undone; the error-buffer reveal is the size of the model, which wants per-chunk commitments at 100M parameters; and iOS limits background compute, so overnight training on an iPhone likely means the app stays open on the charger.

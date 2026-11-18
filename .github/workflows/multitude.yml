@@ -1,0 +1,46 @@
+name: Leviathan Multitude
+
+on:
+  push:
+    paths:
+      - "architectures/mobile/**"
+      - "shared/verifier/**"
+      - "shared/client/src/state/prompt_texts/**"
+      - ".github/workflows/multitude.yml"
+  pull_request:
+    paths:
+      - "architectures/mobile/**"
+      - "shared/verifier/**"
+      - "shared/client/src/state/prompt_texts/**"
+      - ".github/workflows/multitude.yml"
+
+concurrency:
+  group: multitude-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  multitude:
+    name: phone runs, relay and join
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: architectures/mobile
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: architectures/mobile
+
+      - name: Lints
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Protocol, relay and phones joining over HTTP
+        run: cargo test --locked --workspace
