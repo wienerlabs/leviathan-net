@@ -93,8 +93,8 @@ pub struct ParticipantBondFinalizeWithdrawAccounts<'info> {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct ParticipantBondFinalizeWithdrawParams {}
 
-pub fn participant_bond_finalize_withdraw_processor<'info>(
-    context: Context<'_, '_, 'info, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
+pub fn participant_bond_finalize_withdraw_processor(
+    context: Context<ParticipantBondFinalizeWithdrawAccounts>,
     _params: ParticipantBondFinalizeWithdrawParams,
 ) -> Result<()> {
     let user_key = context.accounts.user.key();
@@ -142,6 +142,9 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
         WithdrawalStanding::Held(WithdrawalHold::VotesAtStake) => {
             return err!(ProgramError::VerdictVotesOpen)
         },
+        WithdrawalStanding::Held(WithdrawalHold::SlashReportsUncharged) => {
+            return err!(ProgramError::SlashReportsUncharged)
+        },
         WithdrawalStanding::Free { settle_conviction } => settle_conviction,
     };
 
@@ -158,9 +161,8 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
         return err!(ProgramError::WithdrawDelayNotElapsed);
     }
 
-    // Every point the ledger charged that no verdict accounts for, such as a
-    // `run_slash` or an equivocation, read before anything is charged, the
-    // way a client reads it to know whether to name a reporter.
+    // Every point the ledger charged that no verdict or report accounts for,
+    // read before anything is charged.
     let ledger_forfeit = unattributed_ledger_forfeit(
         participant,
         participant_slashed_points,
@@ -237,46 +239,16 @@ pub fn participant_bond_finalize_withdraw_processor<'info>(
 
     let run_index = run.index;
     let run_bump = run.bump;
-    let collateral_mint = run.collateral_mint;
-    let reporter_bounty = bounty_amount(run, ledger_forfeit);
 
     let index_bytes = run_index.to_le_bytes();
     let run_signer_seeds: &[&[&[u8]]] = &[&[Run::SEEDS_PREFIX, &index_bytes, &[run_bump]]];
 
-    if reporter_bounty > 0 {
-        // No verdict accounts for this forfeit, so its bounty goes to whoever
-        // reported the fraud out of band. That account has to be a token
-        // account of the run's collateral, and has to belong to somebody other
-        // than the participant being slashed: this branch used to check
-        // nothing at all, so the participant named its own token account and
-        // took back the bounty half of its own forfeiture
-        // (wienerlabs/leviathan#15, finding 2). That the participant still
-        // names it is wienerlabs/leviathan-net#72.
-        let reporter = context
-            .remaining_accounts
-            .first()
-            .ok_or(error!(ProgramError::MissingReporter))?;
-        let reporter_token_account =
-            Account::<TokenAccount>::try_from(reporter)
-                .map_err(|_| error!(ProgramError::InvalidBountyRecipient))?;
-        if reporter_token_account.mint != collateral_mint
-            || reporter_token_account.owner == user_key
-        {
-            return err!(ProgramError::InvalidBountyRecipient);
-        }
-        transfer(
-            CpiContext::new(
-                context.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: context.accounts.run_collateral.to_account_info(),
-                    to: reporter.to_account_info(),
-                    authority: context.accounts.run.to_account_info(),
-                },
-            )
-            .with_signer(run_signer_seeds),
-            reporter_bounty,
-        )?;
-    }
+    // What the ledger charged beyond every report and every conviction stays
+    // in the vault. Its reporter, if it had one, was recorded on its report
+    // and credited from it; a withdrawal names nobody, and any account it
+    // passes is ignored. It used to pay a bounty to whatever account the
+    // participant named here, a second wallet of its own included
+    // (wienerlabs/leviathan#15, finding 2; wienerlabs/leviathan-net#72).
 
     if payout_amount > 0 {
         transfer(

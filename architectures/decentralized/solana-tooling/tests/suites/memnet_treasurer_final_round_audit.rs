@@ -9,9 +9,11 @@ use psyche_coordinator::ClientState;
 use psyche_coordinator::RunState;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_set_challenge_config;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_slash;
+use psyche_solana_tooling::slash_reports::settle_slash_reports;
 use psyche_solana_tooling::verdict_votes::settle_previous_dispute;
 use psyche_solana_treasurer::state::VerdictStatus;
 use psyche_solana_treasurer::ProgramError;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
 
 use super::appeals_harness::*;
@@ -41,6 +43,17 @@ async fn convicting_at_once(run_id: &str, index: u64) -> AppealsHarness {
 /// The run authority slashes `client`, at `index`, on what it signed in the
 /// round under way: one client leaving the roster this round.
 async fn authority_slashes(h: &mut AppealsHarness, client: usize, index: u64) {
+    authority_slashes_naming(h, client, index, None).await
+}
+
+/// The same, naming `reporter` as who reported it
+/// (wienerlabs/leviathan-net#72).
+async fn authority_slashes_naming(
+    h: &mut AppealsHarness,
+    client: usize,
+    index: u64,
+    reporter: Option<Pubkey>,
+) {
     let commitment = h.signed_payload_of(client).await;
     let main_authority = h.main_authority.insecure_clone();
     process_treasurer_run_slash(
@@ -50,6 +63,8 @@ async fn authority_slashes(h: &mut AppealsHarness, client: usize, index: u64) {
         &h.run,
         &h.coordinator_account,
         &h.run_id,
+        &h.clients[client].pubkey(),
+        reporter,
         index,
         &commitment,
         replayed_digest(),
@@ -215,9 +230,9 @@ pub async fn a_client_leaving_the_final_round_does_not_shut_the_cooldown() {
 /// ejection, and that refusal used to undo the vote that reached the quorum.
 /// The epoch charges the authority's ejection, and the target's withdrawal
 /// settles the committee's conviction against the bond. Each forfeit's bounty
-/// goes where it belongs: the committee's to its voters, by seat, and the
-/// authority's to the reporter the withdrawal names
-/// (wienerlabs/leviathan-net#64).
+/// goes where it belongs: the committee's to its voters, by seat
+/// (wienerlabs/leviathan-net#64), and the authority's to the reporter it named
+/// when it slashed (wienerlabs/leviathan-net#72).
 #[tokio::test]
 pub async fn a_conviction_of_a_target_already_ejected_is_due() {
     let mut h = convicting_at_once("Leviathan final ejected", 143).await;
@@ -226,7 +241,11 @@ pub async fn a_conviction_of_a_target_already_ejected_is_due() {
     let (target, target_index) = committee.trainers[0];
     let target_key = h.clients[target].pubkey();
     let target_commitment = h.signed_payload_of(target).await;
-    authority_slashes(&mut h, target, target_index).await;
+    let reporter = committee.trainers[1].0;
+    assert_ne!(reporter, target);
+    let reporter_key = h.clients[reporter].pubkey();
+    authority_slashes_naming(&mut h, target, target_index, Some(reporter_key))
+        .await;
     assert_eq!(
         h.client_state(&target_key).await,
         Some(ClientState::Ejected)
@@ -265,22 +284,27 @@ pub async fn a_conviction_of_a_target_already_ejected_is_due() {
     assert_eq!(h.slashed_of(&target_key).await, SLASHING_RATE);
     h.request_withdraw(target, BOND).await;
     h.endpoint.forward_clock_unix_timestamp(100).await.unwrap();
-    // The authority's slash owes a reporter, which the withdrawal must name.
+    // The authority's slash holds the bond until it is charged.
     assert_eq!(
         refusal_code(h.try_finalize_withdraw(target).await),
-        treasurer_refusal(ProgramError::MissingReporter),
+        treasurer_refusal(ProgramError::SlashReportsUncharged),
     );
-    let reporter = committee.trainers[1].0;
-    assert_ne!(reporter, target);
     let reporter_before = h.holdings_of(reporter).await;
     let mut voters_before = vec![];
     for voter in &voters {
         voters_before.push(h.holdings_of(*voter).await);
     }
     let before = h.collateral_of(target).await;
-    h.try_finalize_withdraw_naming(target, reporter)
-        .await
-        .unwrap();
+    let sweep = settle_slash_reports(
+        &mut h.endpoint,
+        &payer,
+        &h.run,
+        &h.coordinator_account,
+    )
+    .await
+    .unwrap();
+    assert_eq!((sweep.charged, sweep.credited), (1, 1));
+    h.try_finalize_withdraw(target).await.unwrap();
     // Both convictions, each charged once.
     assert_eq!(
         h.collateral_of(target).await - before,

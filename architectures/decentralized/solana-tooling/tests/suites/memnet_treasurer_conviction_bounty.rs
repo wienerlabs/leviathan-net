@@ -36,7 +36,8 @@ use super::appeals_harness::CHALLENGE_WINDOW;
 use super::appeals_harness::SLASHING_RATE;
 use super::refusal::refusal_code;
 use super::refusal::treasurer_refusal;
-use super::signed_payload::slash_on_signed_payload;
+use super::signed_payload::slash_on_signed_payload_naming;
+use psyche_solana_tooling::slash_reports::settle_slash_reports;
 
 /// The run's bond withdraw delay.
 const WITHDRAW_DELAY: u64 = 100;
@@ -295,7 +296,9 @@ pub async fn a_later_dispute_cannot_take_the_bounty_from_the_convicting_voters()
 
 /// The issue's second case. A target cleared on appeal also carries a
 /// `run_slash` from the run authority. That slash's bounty goes to the
-/// reporter the withdrawal names, and the losing verifiers get none of it.
+/// reporter the run authority named when it slashed, never to an account the
+/// target names, and the losing verifiers get none of it
+/// (wienerlabs/leviathan-net#72).
 #[tokio::test]
 pub async fn a_cleared_target_pays_an_unrelated_slash_to_its_reporter_not_its_losers(
 ) {
@@ -306,6 +309,10 @@ pub async fn a_cleared_target_pays_an_unrelated_slash_to_its_reporter_not_its_lo
     let bench = h.bench();
 
     h.convict_and_overturn().await;
+    let reporter = (0..h.clients.len())
+        .find(|i| *i != target && !losers.contains(i) && !bench.contains(i))
+        .expect("a client that is neither the target, a loser nor the bench");
+    let reporter_key = h.clients[reporter].pubkey();
     let main_authority = h.main_authority.insecure_clone();
     let (wallet, p2p) = (
         h.clients[target].insecure_clone(),
@@ -317,7 +324,7 @@ pub async fn a_cleared_target_pays_an_unrelated_slash_to_its_reporter_not_its_lo
         h.run_id.clone(),
         h.target_index,
     );
-    slash_on_signed_payload(
+    slash_on_signed_payload_naming(
         &mut h.endpoint,
         &h.payer,
         &main_authority,
@@ -327,6 +334,7 @@ pub async fn a_cleared_target_pays_an_unrelated_slash_to_its_reporter_not_its_lo
         target_index,
         &wallet,
         &p2p,
+        Some(reporter_key),
     )
     .await
     .unwrap();
@@ -348,9 +356,6 @@ pub async fn a_cleared_target_pays_an_unrelated_slash_to_its_reporter_not_its_lo
     assert_eq!(settled.seats_credited, bench.len());
     let owed_to_bench = h.verdict_of(&target_key).await.bounty_owed;
 
-    let reporter = (0..h.clients.len())
-        .find(|i| *i != target && !losers.contains(i) && !bench.contains(i))
-        .expect("a client that is neither the target, a loser nor the bench");
     let mut before = vec![];
     for client_idx in losers.iter().chain(&bench) {
         before.push(h.holdings_of(*client_idx).await);
@@ -362,16 +367,24 @@ pub async fn a_cleared_target_pays_an_unrelated_slash_to_its_reporter_not_its_lo
         .forward_clock_unix_timestamp(WITHDRAW_DELAY)
         .await
         .unwrap();
-    // The slash no verdict accounts for owes a reporter, which the withdrawal
-    // has to name.
+    // The slash no verdict accounts for holds the bond until it is charged;
+    // then anyone credits its reporter, and the withdrawal names nobody.
     assert_eq!(
         refusal_code(h.try_finalize_withdraw(target).await),
-        treasurer_refusal(ProgramError::MissingReporter),
+        treasurer_refusal(ProgramError::SlashReportsUncharged),
     );
+    let payer = h.payer.insecure_clone();
+    let sweep = settle_slash_reports(
+        &mut h.endpoint,
+        &payer,
+        &run,
+        &coordinator_account,
+    )
+    .await
+    .unwrap();
+    assert_eq!((sweep.charged, sweep.credited), (1, 1));
     let wallet_before = h.collateral_of(target).await;
-    h.try_finalize_withdraw_naming(target, reporter)
-        .await
-        .unwrap();
+    h.try_finalize_withdraw(target).await.unwrap();
     assert_eq!(
         h.collateral_of(target).await - wallet_before,
         BOND - SLASHING_RATE

@@ -35,6 +35,7 @@ use crate::daemon_equivocation::EquivocationPass;
 use crate::get_accounts::get_coordinator_account_state;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
+use crate::slash_reports::settle_slash_reports;
 use crate::verdict_votes::settle_open_disputes;
 use crate::verdict_votes::settle_previous_dispute;
 use crate::verdict_votes::DisputeSettlement;
@@ -554,6 +555,8 @@ pub async fn audit_pass(
             )
             .await
         } else {
+            // The run authority slashes as itself and names no reporter, so
+            // the bounty stays in the vault (wienerlabs/leviathan-net#72).
             process_treasurer_run_slash(
                 endpoint,
                 authority,
@@ -561,6 +564,8 @@ pub async fn audit_pass(
                 run,
                 coordinator_account,
                 &config.run_id,
+                &target_signer,
+                None,
                 index as u64,
                 &signed,
                 replayed_hash,
@@ -635,6 +640,26 @@ pub async fn audit_pass(
                 }
             },
             Err(err) => println!("[verifier-daemon] could not look up the run's open disputes: {err:#}"),
+        }
+    }
+
+    // A slash no verdict accounts for, from the run authority or an
+    // equivocation proof, is charged against its target once its epoch is,
+    // and its reporter credited (wienerlabs/leviathan-net#72). A dry run sends
+    // nothing.
+    if !config.dry_run {
+        match settle_slash_reports(endpoint, authority, run, coordinator_account).await {
+            Ok(sweep) if sweep.charged == 0 && sweep.credited == 0 && sweep.failures.is_empty() => {},
+            Ok(sweep) => {
+                println!(
+                    "[verifier-daemon] settled slash reports: {} open, {} charged, {} reporter(s) credited, {} reporter(s) with no account to credit yet",
+                    sweep.open, sweep.charged, sweep.credited, sweep.awaiting_reporter
+                );
+                for (target, epoch_start, err) in &sweep.failures {
+                    println!("[verifier-daemon] could not settle the slash of {target} in the epoch from {epoch_start}: {err:#}");
+                }
+            },
+            Err(err) => println!("[verifier-daemon] could not look up the run's slash reports: {err:#}"),
         }
     }
 

@@ -13,4 +13,5 @@ pub mod process_coordinator_instructions;
 pub mod process_treasurer_instructions;
 pub mod redact;
 pub mod signed_commitment;
+pub mod slash_reports;
 pub mod verdict_votes;

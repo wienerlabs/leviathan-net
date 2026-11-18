@@ -861,6 +861,8 @@ pub async fn no_vote_is_taken_once_the_roster_has_moved_under_the_committee() {
         &h.run,
         &h.coordinator_account,
         &h.run_id,
+        &h.clients[leaver].pubkey(),
+        None,
         leaver_index,
         &leaver_commitment,
         replayed_digest(),

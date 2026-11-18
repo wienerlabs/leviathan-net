@@ -63,6 +63,7 @@ use solana_sdk::signer::Signer;
 
 use super::signed_payload::identity;
 use super::signed_payload::slash_on_signed_payload;
+use psyche_solana_tooling::slash_reports::settle_slash_reports;
 
 const RUN_ID: &str = "Leviathan bounty recipient";
 const BOND: u64 = 500;
@@ -73,7 +74,7 @@ const BOUNTY_BPS: u16 = 5_000;
 /// The slashed client names its own token account as the bounty recipient and
 /// is refused.
 #[tokio::test]
-pub async fn the_slashed_client_cannot_name_itself_as_the_bounty_recipient() {
+pub async fn the_slashed_client_cannot_name_any_bounty_recipient() {
     let mut endpoint = create_memnet_endpoint().await;
 
     let payer = Keypair::new();
@@ -392,6 +393,8 @@ pub async fn the_slashed_client_cannot_name_itself_as_the_bounty_recipient() {
 
     // The only change from `memnet_treasurer_bounty`: the account handed over as
     // the bounty recipient belongs to the client being slashed.
+    // The withdrawal waits until the slash is charged against the bond, and
+    // naming a reporter changes nothing about that.
     process_treasurer_participant_bond_finalize_withdraw_with_reporter(
         &mut endpoint,
         &payer,
@@ -403,19 +406,25 @@ pub async fn the_slashed_client_cannot_name_itself_as_the_bounty_recipient() {
         &clients_collateral[cheater],
     )
     .await
-    .expect_err("a slashed participant cannot be its own reporter");
-
-    // Nothing moved: the withdrawal is refused whole, so the bond is still
-    // pending and the vault still holds it.
+    .expect_err("a slashed participant left before its slash was charged");
     assert_amount(&mut endpoint, &clients_collateral[cheater], 0).await;
     assert_amount(&mut endpoint, &run_collateral, BOND).await;
 
-    // Naming somebody else still works, and the run keeps its half.
-    let reporter = Keypair::new();
-    let reporter_collateral = endpoint
+    let sweep =
+        settle_slash_reports(&mut endpoint, &payer, &run, &coordinator_account)
+            .await
+            .unwrap();
+    assert_eq!(sweep.charged, 1);
+
+    // Whatever account the cheater names now, its own or another's, gets
+    // nothing: the slash was the run authority's and named no reporter, so its
+    // bounty stays in the vault (wienerlabs/leviathan-net#72). It used to go to
+    // whichever account the cheater named, a second wallet of its own included.
+    let named = Keypair::new();
+    let named_collateral = endpoint
         .process_spl_associated_token_account_get_or_init(
             &payer,
-            &reporter.pubkey(),
+            &named.pubkey(),
             &collateral_mint,
         )
         .await
@@ -428,15 +437,14 @@ pub async fn the_slashed_client_cannot_name_itself_as_the_bounty_recipient() {
         &collateral_mint,
         &run,
         &coordinator_account,
-        &reporter_collateral,
+        &named_collateral,
     )
     .await
     .unwrap();
 
-    let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
-    assert_amount(&mut endpoint, &reporter_collateral, bounty).await;
+    assert_amount(&mut endpoint, &named_collateral, 0).await;
     assert_amount(&mut endpoint, &clients_collateral[cheater], BOND - SLASHING_RATE).await;
-    assert_amount(&mut endpoint, &run_collateral, SLASHING_RATE - bounty).await;
+    assert_amount(&mut endpoint, &run_collateral, SLASHING_RATE).await;
 }
 
 async fn assert_amount(

@@ -8,42 +8,58 @@ use anyhow::bail;
 use anyhow::Result;
 use psyche_solana_coordinator::find_coordinator_instance;
 use psyche_solana_treasurer::accounts::RunSlashEquivocationAccounts;
+use psyche_solana_treasurer::find_participant;
+use psyche_solana_treasurer::find_slash_report;
 use psyche_solana_treasurer::instruction::RunSlashEquivocation;
 use psyche_solana_treasurer::logic::RunSlashEquivocationParams;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use solana_sdk::system_program;
 use solana_sdk::sysvar;
 use solana_toolbox_endpoint::ToolboxEndpoint;
 
 use crate::signed_commitment::SignedCommitment;
 
-/// The instruction convicting the target at `target_index` of having signed
+/// The instruction convicting `target`, at `target_index`, of having signed
 /// both `first` and `second`. It is refused unless the same transaction proves
 /// both signatures; `process_treasurer_run_slash_equivocation` sends them
-/// together.
+/// together. `reporter` signs it and is recorded as the conviction's reporter
+/// (wienerlabs/leviathan-net#72).
+#[allow(clippy::too_many_arguments)]
 pub fn run_slash_equivocation_instruction(
+    payer: &Pubkey,
     reporter: &Pubkey,
     run: &Pubkey,
     coordinator_account: &Pubkey,
     run_id: &str,
+    target: &Pubkey,
     target_index: u64,
     first: &SignedCommitment,
     second: &SignedCommitment,
 ) -> Instruction {
     let accounts = RunSlashEquivocationAccounts {
+        payer: *payer,
         reporter: *reporter,
         run: *run,
         coordinator_instance: find_coordinator_instance(run_id),
         coordinator_account: *coordinator_account,
         coordinator_program: psyche_solana_coordinator::ID,
         instructions: sysvar::instructions::ID,
+        target_participant: find_participant(run, target),
+        slash_report: find_slash_report(
+            run,
+            target,
+            first.evidence.epoch_start,
+        ),
+        system_program: system_program::ID,
     };
     Instruction {
         accounts: accounts.to_account_metas(None),
         data: RunSlashEquivocation {
             params: RunSlashEquivocationParams {
+                target: *target,
                 target_index,
                 batch_start: first.batch_start,
                 batch_end: first.batch_end,
@@ -56,7 +72,7 @@ pub fn run_slash_equivocation_instruction(
     }
 }
 
-/// `reporter` convicts the target at `target_index` of equivocation on
+/// `reporter` convicts `target`, at `target_index`, of equivocation on
 /// `first` and `second`, with the two precompile instructions that prove the
 /// target signed both.
 ///
@@ -71,6 +87,7 @@ pub async fn process_treasurer_run_slash_equivocation(
     run: &Pubkey,
     coordinator_account: &Pubkey,
     run_id: &str,
+    target: &Pubkey,
     target_index: u64,
     first: &SignedCommitment,
     second: &SignedCommitment,
@@ -81,10 +98,12 @@ pub async fn process_treasurer_run_slash_equivocation(
         bail!("the two commitments are for different batches, which is not equivocation");
     }
     let instruction = run_slash_equivocation_instruction(
+        &payer.pubkey(),
         &reporter.pubkey(),
         run,
         coordinator_account,
         run_id,
+        target,
         target_index,
         first,
         second,

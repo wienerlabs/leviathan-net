@@ -39,7 +39,6 @@ use psyche_solana_tooling::process_coordinator_instructions::process_coordinator
 use psyche_solana_tooling::process_coordinator_instructions::process_coordinator_witness;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_deposit;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw;
-use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_finalize_withdraw_with_reporter;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_bond_request_withdraw;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_participant_create;
 use psyche_solana_tooling::process_treasurer_instructions::process_treasurer_run_bond_config_update;
@@ -79,6 +78,7 @@ use super::signed_payload::FRAUD_PAYLOAD;
 pub(super) const BOND: u64 = 500;
 pub(super) const SLASHING_RATE: u64 = 200;
 pub(super) const BOUNTY_BPS: u16 = 5_000;
+pub(super) const WITHDRAW_DELAY: i64 = 100;
 pub(super) const CHALLENGE_WINDOW: i64 = 50;
 pub(super) const TIE_BREAKER_SIZE: u16 = 2;
 /// Long enough that these tests never hit it: they exercise the appeal itself,
@@ -204,7 +204,7 @@ pub(super) async fn setup_sized(
         &run,
         RunBondConfigUpdateParams {
             bond_minimum_amount: BOND,
-            bond_withdraw_delay_seconds: 100,
+            bond_withdraw_delay_seconds: WITHDRAW_DELAY,
         },
     )
     .await
@@ -580,29 +580,6 @@ impl AppealsHarness {
             &self.collateral_mint,
             &self.run,
             &self.coordinator_account,
-        )
-        .await
-    }
-
-    /// `client_idx` finalizes its pending withdrawal, naming `reporter_idx`'s
-    /// collateral account as the reporter of a slash no verdict accounts for.
-    pub(super) async fn try_finalize_withdraw_naming(
-        &mut self,
-        client_idx: usize,
-        reporter_idx: usize,
-    ) -> anyhow::Result<()> {
-        let client = self.clients[client_idx].insecure_clone();
-        let collateral = self.clients_collateral[client_idx];
-        let reporter = self.clients_collateral[reporter_idx];
-        process_treasurer_participant_bond_finalize_withdraw_with_reporter(
-            &mut self.endpoint,
-            &self.payer,
-            &client,
-            &collateral,
-            &self.collateral_mint,
-            &self.run,
-            &self.coordinator_account,
-            &reporter,
         )
         .await
     }

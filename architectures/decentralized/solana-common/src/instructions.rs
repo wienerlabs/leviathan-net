@@ -645,6 +645,73 @@ pub fn treasurer_run_charge_conviction(
     )
 }
 
+/// Charges the slash that ejected `target` in run `treasurer_index`, in the
+/// epoch that started at `charge_epoch_start`, against its bond, once that
+/// epoch has been charged, and records what that owes the slash's reporter
+/// (wienerlabs/leviathan-net#72). Anyone may send it.
+pub fn treasurer_run_charge_slash_report(
+    treasurer_index: u64,
+    coordinator_account: &Pubkey,
+    payer: &Pubkey,
+    target: &Pubkey,
+    charge_epoch_start: u64,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunChargeSlashReportAccounts {
+            payer: *payer,
+            run,
+            coordinator_account: *coordinator_account,
+            slash_report: psyche_solana_treasurer::find_slash_report(
+                &run,
+                target,
+                charge_epoch_start,
+            ),
+            target_participant: psyche_solana_treasurer::find_participant(&run, target),
+        },
+        psyche_solana_treasurer::instruction::RunChargeSlashReport {
+            params: psyche_solana_treasurer::logic::RunChargeSlashReportParams {
+                target: *target,
+                charge_epoch_start,
+            },
+        },
+    )
+}
+
+/// Credits `reporter`'s bond in run `treasurer_index` the bounty of the slash
+/// that ejected `target` in the epoch that started at `charge_epoch_start`,
+/// once it is charged (wienerlabs/leviathan-net#72). Anyone may send it.
+pub fn treasurer_run_pay_slash_report_bounty(
+    treasurer_index: u64,
+    payer: &Pubkey,
+    target: &Pubkey,
+    charge_epoch_start: u64,
+    reporter: &Pubkey,
+) -> Instruction {
+    let run = psyche_solana_treasurer::find_run(treasurer_index);
+    anchor_instruction(
+        psyche_solana_treasurer::ID,
+        psyche_solana_treasurer::accounts::RunPaySlashReportBountyAccounts {
+            payer: *payer,
+            run,
+            slash_report: psyche_solana_treasurer::find_slash_report(
+                &run,
+                target,
+                charge_epoch_start,
+            ),
+            reporter_participant: psyche_solana_treasurer::find_participant(&run, reporter),
+        },
+        psyche_solana_treasurer::instruction::RunPaySlashReportBounty {
+            params: psyche_solana_treasurer::logic::RunPaySlashReportBountyParams {
+                target: *target,
+                charge_epoch_start,
+                reporter: *reporter,
+            },
+        },
+    )
+}
+
 /// Finalises `target`'s conviction in run `treasurer_index` once its windows
 /// have closed, or once it is due and can land, with the target at
 /// `target_index` on the roster now. Anyone may send it.

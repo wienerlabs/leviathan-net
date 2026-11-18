@@ -189,7 +189,7 @@ pub fn keep_reference(
 
 /// The run authority `authority` convicts the client at roster `index`, the
 /// node of `wallet` and `p2p`, on the payload it signed in the round the
-/// coordinator is in.
+/// coordinator is in, naming no reporter.
 #[allow(clippy::too_many_arguments)]
 pub async fn slash_on_signed_payload(
     endpoint: &mut ToolboxEndpoint,
@@ -201,6 +201,38 @@ pub async fn slash_on_signed_payload(
     index: u64,
     wallet: &Keypair,
     p2p: &Keypair,
+) -> anyhow::Result<()> {
+    slash_on_signed_payload_naming(
+        endpoint,
+        payer,
+        authority,
+        run,
+        coordinator_account,
+        run_id,
+        index,
+        wallet,
+        p2p,
+        None,
+    )
+    .await
+}
+
+/// The run authority `authority` convicts the client at roster `index`, the
+/// node of `wallet` and `p2p`, on the payload it signed in the round the
+/// coordinator is in, naming `reporter` as who reported it
+/// (wienerlabs/leviathan-net#72).
+#[allow(clippy::too_many_arguments)]
+pub async fn slash_on_signed_payload_naming(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    authority: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    index: u64,
+    wallet: &Keypair,
+    p2p: &Keypair,
+    reporter: Option<Pubkey>,
 ) -> anyhow::Result<()> {
     let coordinator =
         get_coordinator_account_state(endpoint, coordinator_account)
@@ -220,6 +252,8 @@ pub async fn slash_on_signed_payload(
         run,
         coordinator_account,
         run_id,
+        &wallet.pubkey(),
+        reporter,
         index,
         &commitment,
         replayed_digest(),

@@ -26,6 +26,12 @@ pub enum WithdrawalHold {
     /// crank. A vote on a conviction that stands, or on a dispute that lapsed,
     /// has to be released first (wienerlabs/leviathan-net#39).
     VotesAtStake,
+    /// A slash no verdict accounts for ejected the participant, and its
+    /// report has not been charged against the bond yet. Anyone can charge it
+    /// once its epoch is charged; until then the bond waits, so the slash is
+    /// paid and its reporter credited before the participant leaves
+    /// (wienerlabs/leviathan-net#72).
+    SlashReportsUncharged,
 }
 
 /// What finalizing a withdrawal does right now.
@@ -114,28 +120,50 @@ pub fn withdrawal_standing(
         if in_charging_epoch {
             return WithdrawalStanding::Held(WithdrawalHold::EpochNotSettled);
         }
-        return WithdrawalStanding::Free {
-            settle_conviction: true,
-        };
+        return unless_slash_reports_uncharged(
+            participant,
+            WithdrawalStanding::Free {
+                settle_conviction: true,
+            },
+        );
     }
 
     if in_charging_epoch {
         return WithdrawalStanding::Held(WithdrawalHold::EpochNotSettled);
     }
-    WithdrawalStanding::Free {
-        settle_conviction: false,
+    unless_slash_reports_uncharged(
+        participant,
+        WithdrawalStanding::Free {
+            settle_conviction: false,
+        },
+    )
+}
+
+/// `free`, unless a slash that ejected the participant still waits to be
+/// charged against its bond. That comes after every other hold: while its
+/// epoch runs, the epoch holds the bond, and the report cannot be charged yet.
+fn unless_slash_reports_uncharged(
+    participant: &Participant,
+    free: WithdrawalStanding,
+) -> WithdrawalStanding {
+    match participant.uncharged_slash_reports {
+        0 => free,
+        _ => WithdrawalStanding::Held(WithdrawalHold::SlashReportsUncharged),
     }
 }
 
 /// What a withdrawal settled now forfeits to points the ledger charged that no
-/// verdict accounts for, such as a `run_slash` or an equivocation: the forfeit
-/// whose bounty goes to the reporter the withdrawal names.
+/// verdict accounts for. A `run_slash` or an equivocation is charged through
+/// its own report before the withdrawal can settle, and its reporter credited
+/// from that (wienerlabs/leviathan-net#72), so what is left here is what the
+/// ledger charged beyond any report: points charged while the participant had
+/// no account, or beyond a bond a report's charge could not cover. Its bounty
+/// stays in the vault: nobody recorded earning it.
 ///
 /// Settlement first takes the participant's own conviction's charge, if a
 /// conviction ejected it and is not charged yet, out of the same points and
 /// the same bond; what the ledger charged beyond that, up to what the bond
-/// still holds, is this (wienerlabs/leviathan-net#64). A client reads it to
-/// know whether the withdrawal needs a reporter account.
+/// still holds, is this (wienerlabs/leviathan-net#64).
 pub fn unattributed_ledger_forfeit(
     participant: &Participant,
     coordinator_slashed_points: u64,
@@ -174,6 +202,7 @@ mod tests {
             bond_settled_slashed_points: settled_points,
             bond_withdraw_delay_snapshot: 0,
             open_verdict_votes: 0,
+            uncharged_slash_reports: 0,
         }
     }
 
@@ -235,6 +264,31 @@ mod tests {
         participant
             .unsettled_slashed_points(slashed)
             .min(participant.bond_amount)
+    }
+
+    #[test]
+    fn an_uncharged_slash_report_holds_a_bond_that_is_otherwise_free() {
+        let mut p = participant(500, 0);
+        for free in [
+            WithdrawalStanding::Free {
+                settle_conviction: false,
+            },
+            WithdrawalStanding::Free {
+                settle_conviction: true,
+            },
+        ] {
+            p.uncharged_slash_reports = 0;
+            assert_eq!(unless_slash_reports_uncharged(&p, free), free);
+            for count in [1, 3] {
+                p.uncharged_slash_reports = count;
+                assert_eq!(
+                    unless_slash_reports_uncharged(&p, free),
+                    WithdrawalStanding::Held(
+                        WithdrawalHold::SlashReportsUncharged
+                    ),
+                );
+            }
+        }
     }
 
     #[test]

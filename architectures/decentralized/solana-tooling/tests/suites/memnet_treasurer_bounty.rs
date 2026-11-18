@@ -39,7 +39,10 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 
 use super::signed_payload::identity;
-use super::signed_payload::slash_on_signed_payload;
+use super::signed_payload::slash_on_signed_payload_naming;
+use psyche_solana_tooling::get_accounts::get_participant;
+use psyche_solana_tooling::slash_reports::settle_slash_reports;
+use psyche_solana_treasurer::find_participant;
 
 const RUN_ID: &str = "Leviathan bounty split";
 const BOND: u64 = 500;
@@ -328,7 +331,18 @@ pub async fn run() {
         .unwrap();
     }
 
-    slash_on_signed_payload(
+    // The run authority names who reported the fraud when it slashes
+    // (wienerlabs/leviathan-net#72); the reporter has an account in the run
+    // for its bond to be credited.
+    process_treasurer_participant_create(
+        &mut endpoint,
+        &payer,
+        &reporter,
+        &run,
+    )
+    .await
+    .unwrap();
+    slash_on_signed_payload_naming(
         &mut endpoint,
         &payer,
         &main_authority,
@@ -338,6 +352,7 @@ pub async fn run() {
         cheater as u64,
         &clients[cheater],
         &p2ps[cheater],
+        Some(reporter.pubkey()),
     )
     .await
     .unwrap();
@@ -369,6 +384,14 @@ pub async fn run() {
         .forward_clock_unix_timestamp(WITHDRAW_DELAY as u64)
         .await
         .unwrap();
+    // Anyone charges the slash and credits its reporter, as a verifier
+    // daemon's sweep does.
+    let sweep =
+        settle_slash_reports(&mut endpoint, &payer, &run, &coordinator_account)
+            .await
+            .unwrap();
+    assert_eq!((sweep.charged, sweep.credited), (1, 1));
+    // The account the cheater names at withdrawal gets nothing.
     process_treasurer_participant_bond_finalize_withdraw_with_reporter(
         &mut endpoint,
         &payer,
@@ -382,10 +405,20 @@ pub async fn run() {
     .await
     .unwrap();
 
+    // The bounty is the reporter's, credited to its bond, which stays in the
+    // vault until it withdraws; the rest of the forfeit stays there too.
     let bounty = (SLASHING_RATE as u128 * BOUNTY_BPS as u128 / 10_000) as u64;
-    assert_amount(&mut endpoint, &reporter_collateral, bounty).await;
+    let reporter_participant = get_participant(
+        &mut endpoint,
+        &find_participant(&run, &reporter.pubkey()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reporter_participant.bond_amount, bounty);
+    assert_amount(&mut endpoint, &reporter_collateral, 0).await;
     assert_amount(&mut endpoint, &clients_collateral[cheater], BOND - SLASHING_RATE).await;
-    assert_amount(&mut endpoint, &run_collateral, SLASHING_RATE - bounty).await;
+    assert_amount(&mut endpoint, &run_collateral, SLASHING_RATE).await;
 }
 
 async fn assert_amount(

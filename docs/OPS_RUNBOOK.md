@@ -156,6 +156,12 @@ dominates. See COMMITTEE_ECONOMICS.md in the private repo.
 Practical consequence: do not set the bond from the whitepaper break-even figure
 alone. Size it from the committee table for the committee size you are running.
 
+Keep `slash_bounty_bps` below 10000. An equivocation proof is permissionless and
+public once sent. An equivocator can send its own proof from a second wallet, or
+copy an honest reporter's, and get the bounty back. Equivocating then costs it
+`slashing_rate * (1 - bounty_bps / 10000)`, and nothing at 10000
+(`docs/DISPUTE_DESIGN.md`, wienerlabs/leviathan-net#72, #92).
+
 ## Incident response
 
 ### A node cannot join
@@ -228,6 +234,8 @@ The treasurer's own accounts grow the same way:
 | wienerlabs/leviathan-net#67: evidence gained the epoch it was trained in | `AuditVerdict` | 4400 |
 | wienerlabs/leviathan-net#64: bounty fields renamed `bounty_owed` and `bounty_paid`; gained `charge`, `charge_epoch_start`, `charge_rate` and `appeal_upheld` | `AuditVerdict` | 4418 |
 | Votes counted per signed payload: gained `vote_commitments`, the commitment hash each vote convicts on | `AuditVerdict` | 6470 |
+| wienerlabs/leviathan-net#72: gained `uncharged_slash_reports` | `Participant` | 73 |
+| wienerlabs/leviathan-net#72: new, one per slash no verdict accounts for | `SlashReport` | 134 |
 
 An older, shorter account does not deserialize with the new layout, so the treasurer that carries them deploys under a new id too.
 
@@ -239,7 +247,13 @@ An older, shorter account does not deserialize with the new layout, so the treas
   - Each recipient's bond is then credited through `run_pay_verdict_bounty`.
   - The verifier daemon does both, for every open dispute in the run, at the end of each pass, after its own judging, so a backlog never costs it a vote. A daemon in dry-run mode sends nothing.
   - `run-manager bond-withdraw-finalize` does both for every seat the wallet is owed before it withdraws, whether or not the wallet still has a vote open.
-- **A slash no verdict accounts for.** A `run_slash`, or an equivocation, still pays its bounty to a reporter that the withdrawal names. `bond-withdraw-finalize` asks for it with `--reporter <WALLET>` when the settlement owes one, and refuses to send without it.
+- **A slash no verdict accounts for.** Since wienerlabs/leviathan-net#72, the withdrawal no longer names who is paid for it. A `run_slash` or an equivocation records its reporter on a `SlashReport` when it ejects its target:
+  - A `run_slash` takes the target and an optional reporter. `run_slash_instruction` and `process_treasurer_run_slash` in the tooling take both.
+  - An equivocation's reporter is whoever sent the proof.
+  - Once the epoch is charged, `run_charge_slash_report` charges the target's bond, and `run_pay_slash_report_bounty` credits the reporter's bond.
+  - The verifier daemon sends both for every open report at the end of each pass. It leaves a bounty whose reporter has no participant account yet for a later pass. A daemon in dry-run mode sends nothing.
+  - `bond-withdraw-finalize` sends both for the wallet's own reports and for those it reported, before it withdraws. A step the daemon took first is skipped. It has no `--reporter` option any more.
+  - A bond with a report not yet charged is held (`SlashReportsUncharged`).
 
 The appeals bench size now reaches the coordinator (wienerlabs/leviathan#15,
 finding 4). `run_set_challenge_config` names the coordinator's accounts and

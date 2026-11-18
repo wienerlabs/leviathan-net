@@ -63,6 +63,7 @@ use solana_toolbox_endpoint::ToolboxEndpoint;
 
 use super::signed_payload::identity;
 use super::signed_payload::slash_on_signed_payload;
+use psyche_solana_tooling::slash_reports::settle_slash_reports;
 
 const RUN_ID: &str = "Leviathan exit order";
 const BOND: u64 = 500;
@@ -428,6 +429,13 @@ pub async fn exiting_out_of_join_order_still_forfeits() {
         .forward_clock_unix_timestamp(WITHDRAW_DELAY as u64)
         .await
         .unwrap();
+    // Anyone charges both slashes against their bonds first, as a verifier
+    // daemon's sweep does (wienerlabs/leviathan-net#72).
+    let sweep =
+        settle_slash_reports(&mut endpoint, &payer, &run, &coordinator_account)
+            .await
+            .unwrap();
+    assert_eq!(sweep.charged, 2);
     process_treasurer_participant_bond_finalize_withdraw(
         &mut endpoint,
         &payer,

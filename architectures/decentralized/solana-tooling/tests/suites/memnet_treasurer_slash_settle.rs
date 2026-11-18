@@ -38,6 +38,7 @@ use solana_sdk::signer::Signer;
 
 use super::signed_payload::identity;
 use super::signed_payload::slash_on_signed_payload;
+use psyche_solana_tooling::slash_reports::settle_slash_reports;
 
 const RUN_ID: &str = "Leviathan full slash settle";
 const BOND: u64 = 500;
@@ -58,6 +59,11 @@ pub async fn run() {
     let main_authority = Keypair::new();
     let join_authority = Keypair::new();
     let stranger = Keypair::new();
+    let stranger_payer = Keypair::new();
+    endpoint
+        .request_airdrop(&stranger_payer.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
     let ticker = Keypair::new();
     let mut clients = vec![];
     for _ in 0..4 {
@@ -406,6 +412,18 @@ pub async fn run() {
         .forward_clock_unix_timestamp(WITHDRAW_DELAY as u64)
         .await
         .unwrap();
+    // A stranger charges the slash against the cheater's bond, as a verifier
+    // daemon's sweep does; until then it holds the bond
+    // (wienerlabs/leviathan-net#72).
+    let sweep = settle_slash_reports(
+        &mut endpoint,
+        &stranger_payer,
+        &run,
+        &coordinator_account,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sweep.charged, 1);
     process_treasurer_participant_bond_finalize_withdraw(
         &mut endpoint,
         &payer,

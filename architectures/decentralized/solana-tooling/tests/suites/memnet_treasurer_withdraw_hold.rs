@@ -42,9 +42,17 @@ pub async fn a_node_cannot_leave_while_its_epoch_is_unsettled() {
         "a node left with its bond in the middle of an epoch it could still be slashed for"
     );
 
-    // Convicted in that same epoch, it pays for it once the epoch is charged.
+    // Convicted in that same epoch, it pays for it once the epoch is charged,
+    // and once the slash is charged against its bond: until then the slash
+    // still holds the bond (wienerlabs/leviathan-net#72).
     harness.convict(SUBJECT).await;
     harness.finish_epoch().await;
+    assert_eq!(
+        refusal_code(harness.try_finalize_withdraw(SUBJECT).await),
+        treasurer_refusal(ProgramError::SlashReportsUncharged),
+        "a node left before the slash of its epoch was charged against its bond"
+    );
+    harness.settle_slash_reports().await;
     let before = harness.collateral(SUBJECT).await;
     harness.finalize_withdraw(SUBJECT).await;
     assert_eq!(

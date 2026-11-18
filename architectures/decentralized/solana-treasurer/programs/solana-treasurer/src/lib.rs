@@ -32,6 +32,23 @@ pub fn find_participant(run: &Pubkey, user: &Pubkey) -> Pubkey {
     .0
 }
 
+pub fn find_slash_report(
+    run: &Pubkey,
+    target: &Pubkey,
+    charge_epoch_start: u64,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            state::SlashReport::SEEDS_PREFIX,
+            run.as_ref(),
+            target.as_ref(),
+            charge_epoch_start.to_le_bytes().as_ref(),
+        ],
+        &crate::ID,
+    )
+    .0
+}
+
 pub fn find_audit_verdict(run: &Pubkey, target: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[
@@ -97,8 +114,8 @@ pub mod psyche_solana_treasurer {
         participant_bond_request_withdraw_processor(context, params)
     }
 
-    pub fn participant_bond_finalize_withdraw<'info>(
-        context: Context<'_, '_, 'info, 'info, ParticipantBondFinalizeWithdrawAccounts<'info>>,
+    pub fn participant_bond_finalize_withdraw(
+        context: Context<ParticipantBondFinalizeWithdrawAccounts>,
         params: ParticipantBondFinalizeWithdrawParams,
     ) -> Result<()> {
         participant_bond_finalize_withdraw_processor(context, params)
@@ -188,6 +205,20 @@ pub mod psyche_solana_treasurer {
         run_slash_equivocation_processor(context, params)
     }
 
+    pub fn run_charge_slash_report(
+        context: Context<RunChargeSlashReportAccounts>,
+        params: RunChargeSlashReportParams,
+    ) -> Result<()> {
+        run_charge_slash_report_processor(context, params)
+    }
+
+    pub fn run_pay_slash_report_bounty(
+        context: Context<RunPaySlashReportBountyAccounts>,
+        params: RunPaySlashReportBountyParams,
+    ) -> Result<()> {
+        run_pay_slash_report_bounty_processor(context, params)
+    }
+
     pub fn participant_release_verdict_vote(
         context: Context<ParticipantReleaseVerdictVoteAccounts>,
         params: ParticipantReleaseVerdictVoteParams,
@@ -210,6 +241,8 @@ pub enum ProgramError {
     #[msg("The bond withdraw delay has not elapsed yet")]
     WithdrawDelayNotElapsed,
 
+    /// No longer raised: a slash's reporter is recorded when it is made
+    /// (wienerlabs/leviathan-net#72). Kept so later codes do not move.
     #[msg("A slash bounty is configured but no reporter account was provided")]
     MissingReporter,
 
@@ -290,6 +323,8 @@ pub enum ProgramError {
     #[msg("The appeal window has not elapsed yet")]
     AppealWindowOpen,
 
+    /// No longer raised: a slash's reporter is recorded when it is made
+    /// (wienerlabs/leviathan-net#72). Kept so later codes do not move.
     #[msg("The bounty recipient must be a token account owned by someone other than the slashed participant")]
     InvalidBountyRecipient,
 
@@ -369,4 +404,16 @@ pub enum ProgramError {
 
     #[msg("The participant a verdict would convict cannot vote on it")]
     VerifierIsTarget,
+
+    #[msg("The participant a slash convicts cannot be its reporter")]
+    ReporterIsTarget,
+
+    #[msg("The bond is held until every slash that ejected this participant has been charged against it")]
+    SlashReportsUncharged,
+
+    #[msg("The participant's count of uncharged slash reports disagrees with the reports")]
+    SlashReportsInconsistent,
+
+    #[msg("This slash names no reporter, so its bounty stays in the vault")]
+    SlashReportOwesNoBounty,
 }
