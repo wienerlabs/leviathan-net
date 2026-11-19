@@ -51,9 +51,12 @@ Each node commits to the state it trains a round from: its weights, its buffer, 
 
 **Option 1 is rejected.** A reset costs convergence whatever the verifier's hardware: 1.6% to 12.5% of the loss by round 1000, depending on how often it resets, and no gap is closing. On top of that, across hardware classes a replay of the window drifts further with every round, even with the weights pinned at its start.
 
-**Option 3 stays in force until option 2 is built.** Until then, the verifier replays a run's first step only.
+**Option 2 is built** (#89, designed in `docs/ROUND_AUDIT.md`). Option 3, replaying a run's first step only, held until then.
 
-The implementation is tracked in #89, and designed in `docs/ROUND_AUDIT.md`.
+- Each payload commits to the state its round trains from.
+- A verifier fetches the state of each payload it audits from its trainer, and the daemon replays the round from it, at any round of the epoch.
+- With `--continuity`, on the class the run trains in, the daemon also checks that each state is the one the node's last round left.
+- A trainer that does not reveal within the run's window is voted a non-reveal, which costs what fraud costs.
 
 ## What is measured
 
@@ -498,9 +501,9 @@ In return, over these rounds it buys no loss that shows, and about 1% of the dri
   - **A class has to be pinned down.** For a transition to replay exactly, a verifier has to match not only the device and dtype but also the micro-batch size and the data and tensor parallelism. The simulation used one micro-batch and no parallelism.
 - **What #49 does with it: the band for a check across classes.** The drift there is top-k churn with no sign wrong: 0 flips in 600 rounds. So the verifier now counts flips on the coordinates both sides sent apart from churn, and holds each to a band of its own, which holds flips far tighter than the distance alone allows. The churn it tolerates, up to about 8% here, is a share of coordinates a cheater could choose freely, signs included, and pricing it is still open (`docs/BAND_CALIBRATION.md`).
 
-### Option 3, leave replay at the first step: in force until option 2 is built
+### Option 3, leave replay at the first step: in force until option 2 was built
 
-The README, `docs/FIRST_RUN.md` and the verifier daemon already say that only a run's first step is replayed.
+Until #89, the README, `docs/FIRST_RUN.md` and the verifier daemon said that only a run's first step is replayed. They now say that every round whose state is revealed is.
 
 ## Limits of these measurements
 

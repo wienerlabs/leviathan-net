@@ -6,6 +6,8 @@ pub mod daemon;
 pub mod daemon_continuity;
 #[cfg(feature = "daemon")]
 pub mod daemon_equivocation;
+#[cfg(feature = "daemon")]
+pub mod daemon_non_reveal;
 pub mod distributor;
 pub mod equivocation;
 pub mod get_accounts;
