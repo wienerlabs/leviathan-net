@@ -21,12 +21,14 @@ use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::TrainerReplayEngine;
 use psyche_core::BatchId;
+use psyche_modeling::round_state_file;
 use psyche_modeling::Batch;
 use psyche_modeling::BatchData;
 use psyche_modeling::BatchDataCPU;
 use psyche_modeling::DistroResult;
 use psyche_modeling::Trainer;
 use tokio_util::sync::CancellationToken;
+use psyche_network::{previous_round_path, revealed_state_path, PreviousRound};
 use psyche_solana_authorizer::logic::AuthorizationGrantorUpdateParams;
 use psyche_solana_coordinator::instruction::Witness;
 use psyche_solana_coordinator::logic::JOIN_RUN_AUTHORIZATION_SCOPE;
@@ -60,10 +62,11 @@ use super::chain_state::coordinator_state;
 
 const RUN_ID: &str = "Leviathan daemon replay slash";
 const RUN_ID_MOVED: &str = "Leviathan replay moved seat";
+const RUN_ID_REVEALED: &str = "Leviathan replay revealed state";
 const BOND: u64 = 500;
-const SLASHING_RATE: u64 = 200;
+pub(super) const SLASHING_RATE: u64 = 200;
 
-fn scratch(tag: &str) -> PathBuf {
+pub(super) fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("levdaemonreplay-{}-{}", std::process::id(), tag));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -72,7 +75,7 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// The model of the genesis rehearsal, which this run trains: a 1-bit DisTrO
 /// payload under a Cosine warmup, as every Leviathan configuration has.
-fn genesis_model() -> LLM {
+pub(super) fn genesis_model() -> LLM {
     read_run_model(std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../config/leviathan/genesis-rehearsal.toml"
@@ -94,7 +97,7 @@ fn batch_data(llm: &LLM) -> Vec<BatchDataCPU> {
 
 /// A trainer built from the run's model, as the client and the daemon build
 /// one.
-fn trainer_for(llm: &LLM) -> (Trainer, ReplayTrainerConfig) {
+pub(super) fn trainer_for(llm: &LLM) -> (Trainer, ReplayTrainerConfig) {
     let config = ReplayTrainerConfig::for_run(
         llm,
         checkpoint_repo_files(&published_checkpoint(llm).unwrap()).unwrap(),
@@ -119,7 +122,10 @@ fn first_step_payload(
 
 /// The samples of `batch_id` in a dataset whose batches differ from one
 /// another, so that one batch's honest result is not another's.
-fn distinct_batch_data(llm: &LLM, batch_id: BatchId) -> Vec<BatchDataCPU> {
+pub(super) fn distinct_batch_data(
+    llm: &LLM,
+    batch_id: BatchId,
+) -> Vec<BatchDataCPU> {
     let offset = batch_id.0.start as i32;
     let input_ids: Vec<i32> = (0..llm.max_seq_len as i32)
         .map(|i| (i * 7 + offset * 11 + 3) % 29)
@@ -178,26 +184,26 @@ fn flipped(payload: &[DistroResult]) -> Vec<DistroResult> {
 }
 
 /// The pieces of a bonded run the replay suites drive.
-struct ReplayRun {
-    endpoint: ToolboxEndpoint,
-    payer: Keypair,
-    main_authority: Keypair,
-    ticker: Keypair,
-    run: Pubkey,
-    coordinator_instance: Pubkey,
-    coordinator_account: Pubkey,
-    clients: Vec<Keypair>,
-    p2ps: Vec<Keypair>,
+pub(super) struct ReplayRun {
+    pub(super) endpoint: ToolboxEndpoint,
+    pub(super) payer: Keypair,
+    pub(super) main_authority: Keypair,
+    pub(super) ticker: Keypair,
+    pub(super) run: Pubkey,
+    pub(super) coordinator_instance: Pubkey,
+    pub(super) coordinator_account: Pubkey,
+    pub(super) clients: Vec<Keypair>,
+    pub(super) p2ps: Vec<Keypair>,
 }
 
 const WARMUP_TIME: u64 = 10;
 const ROUND_WITNESS_TIME: u64 = 10;
-const COOLDOWN_TIME: u64 = 88;
+pub(super) const COOLDOWN_TIME: u64 = 88;
 
 /// A run of the genesis rehearsal model with four clients, `bonded` of them
 /// bonded, ticked into its first round: the round that trains the run's first
 /// step, the one step a replay reproduces.
-async fn start_replay_run(
+pub(super) async fn start_replay_run(
     run_index: u64,
     run_id: &str,
     bonded: &[usize],
@@ -417,7 +423,7 @@ async fn start_replay_run(
 
 /// Every client the round draws as a witness reports it, and the run is ticked
 /// on past its witness phase.
-async fn witness_round(
+pub(super) async fn witness_round(
     endpoint: &mut ToolboxEndpoint,
     payer: &Keypair,
     ticker: &Keypair,
@@ -621,6 +627,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
 
     let mut convicted = HashSet::new();
@@ -823,6 +830,7 @@ pub async fn an_honest_node_whose_seat_moved_is_judged_against_its_own_batch() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
     let mut convicted = HashSet::new();
     let report = audit_pass(
@@ -851,4 +859,278 @@ pub async fn an_honest_node_whose_seat_moved_is_judged_against_its_own_batch() {
             ..PassReport::default()
         }
     );
+}
+
+/// What a node keeping its states sends and commits to for its batches of
+/// two rounds in a row, trained as a client trains them: the second round
+/// takes the first's results out of the buffer first.
+struct TwoRounds {
+    first: Vec<DistroResult>,
+    second: Vec<DistroResult>,
+    first_state: [u8; 32],
+    second_state: [u8; 32],
+    second_state_file: PathBuf,
+}
+
+fn two_rounds(
+    llm: &LLM,
+    coordinator: &Coordinator,
+    first: (u32, BatchId),
+    second: (u32, BatchId),
+    keep_in: PathBuf,
+) -> TwoRounds {
+    let (trainer, config) = trainer_for(llm);
+    #[allow(irrefutable_let_patterns)]
+    let Trainer::Local(local) = trainer
+    else {
+        panic!("a replay trainer is a local one");
+    };
+    let trainer: Trainer =
+        local.keeping_round_states_in(keep_in.clone()).into();
+    let warmup = coordinator.get_cold_start_warmup_bounds();
+    let train = |trainer: Trainer,
+                 (step, batch_id): (u32, BatchId),
+                 sent_before| {
+        trainer
+            .train(
+                step,
+                Batch {
+                    id: batch_id,
+                    data: BatchData::CPU(distinct_batch_data(llm, batch_id)),
+                },
+                warmup,
+                false,
+                vec![],
+                Some(sent_before),
+                CancellationToken::new(),
+            )
+            .expect("the run's model trains a batch")
+    };
+    let first_round = train(trainer, first, vec![]);
+    let sent_first = first_round.distro_results.clone().unwrap();
+    let second_round =
+        train(first_round.trainer, second, vec![sent_first.clone()]);
+    let second_state = second_round.state_digest.unwrap();
+    let send = |results: Vec<DistroResult>| match config.quantize_1bit() {
+        true => Trainer::quantize_results(&results),
+        false => results,
+    };
+    TwoRounds {
+        first: send(sent_first),
+        second: send(second_round.distro_results.unwrap()),
+        first_state: first_round.state_digest.unwrap(),
+        second_state,
+        second_state_file: round_state_file(&keep_in, &second_state),
+    }
+}
+
+/// A round past the run's first is judged from the state its trainer
+/// revealed (wienerlabs/leviathan-net#89). Two nodes train their batches of
+/// the run's first two rounds, keeping their states, and one forges its
+/// second round's result. Beside each second-round payload, the verifier
+/// kept the state it commits to, as its trainer revealed it, and what its
+/// trainer did the round before. The daemon replays the second round from
+/// that state, with what the trainer sent the round before read off it: the
+/// honest node is cleared and the forger convicted and slashed.
+#[tokio::test]
+pub async fn a_later_round_is_judged_from_the_state_its_trainer_revealed() {
+    let cheater = 0usize;
+    let honest = 1usize;
+    let ReplayRun {
+        mut endpoint,
+        payer,
+        main_authority,
+        ticker,
+        run,
+        coordinator_instance,
+        coordinator_account,
+        clients,
+        p2ps,
+    } = start_replay_run(76, RUN_ID_REVEALED, &[cheater]).await;
+
+    let first_round =
+        coordinator_state(&mut endpoint, &coordinator_account).await;
+    let run_id = String::from(&first_round.coordinator.run_id);
+    witness_round(
+        &mut endpoint,
+        &payer,
+        &ticker,
+        &clients,
+        &coordinator_instance,
+        &coordinator_account,
+    )
+    .await;
+    let second_round =
+        coordinator_state(&mut endpoint, &coordinator_account).await;
+    // Through the run's last round, as the first-step audit goes, so the
+    // cooldown after the audit charges the epoch.
+    for _ in 0..3 {
+        witness_round(
+            &mut endpoint,
+            &payer,
+            &ticker,
+            &clients,
+            &coordinator_instance,
+            &coordinator_account,
+        )
+        .await;
+    }
+    let roster = coordinator_state(&mut endpoint, &coordinator_account).await;
+    assert_eq!(
+        roster.coordinator.epoch_state.start_timestamp,
+        second_round.coordinator.epoch_state.start_timestamp,
+        "the audit is in the epoch the payloads were trained in"
+    );
+
+    let llm = genesis_model();
+    let submitted_dir = scratch("revealed-submitted");
+    let staging = scratch("revealed-staging");
+    let mut assignments = vec![];
+    for node in [cheater, honest] {
+        let id = identity(&clients[node], &p2ps[node]);
+        let first = payload_header(&first_round.coordinator, &id);
+        let second = payload_header(&second_round.coordinator, &id);
+        assert_eq!(second.step, first.step + 1);
+        let trained = two_rounds(
+            &llm,
+            &first_round.coordinator,
+            (first.step, first.batch_id),
+            (second.step, second.batch_id),
+            scratch(&format!("revealed-states-{node}")),
+        );
+        let second_payload = match node == cheater {
+            true => flipped(&trained.second),
+            false => trained.second,
+        };
+        let mut kept = vec![];
+        for (header, payload, state) in [
+            (first, trained.first, trained.first_state),
+            (second, second_payload, trained.second_state),
+        ] {
+            let staged =
+                staging.join(format!("{node}-{}.vec-postcard", header.step));
+            write_results_dump(&staged, &payload).unwrap();
+            let header = signed_commitment_header(header, state);
+            kept.push(keep_signed_payload(
+                &submitted_dir,
+                &staged,
+                &clients[node],
+                &p2ps[node],
+                &run_id,
+                header,
+            ));
+            assignments.push(ReplayAssignment {
+                epoch_start: header.epoch_start,
+                step: header.step,
+                warmup_lr_between: roster
+                    .coordinator
+                    .get_cold_start_warmup_bounds(),
+                batch_id: header.batch_id,
+                data: distinct_batch_data(&llm, header.batch_id),
+            });
+        }
+        // What the verifier kept beside the second round's payload: the state
+        // its trainer revealed, and what it did the round before.
+        fs::copy(&trained.second_state_file, revealed_state_path(&kept[1]))
+            .unwrap();
+        fs::write(
+            previous_round_path(&kept[1]),
+            PreviousRound::Trained(vec![first.batch_id]).encode(),
+        )
+        .unwrap();
+    }
+
+    let (mut trainer, replay_config) = trainer_for(&llm);
+    let checkpoint = trainer
+        .extract()
+        .unwrap()
+        .into_iter()
+        .map(|(name, tensor)| (name, tensor.copy()))
+        .collect();
+    let engine = TrainerReplayEngine::new(
+        trainer,
+        assignments,
+        tch::Device::Cpu,
+        replay_config.quantize_1bit(),
+    )
+    .with_checkpoint(checkpoint);
+    // The nodes trained in the replay's own class, the CPU in fp32, so a
+    // replay is exact and no churn and no flip is honest.
+    let config = AuditConfig {
+        run_id: RUN_ID_REVEALED.to_string(),
+        submitted_dir,
+        reference_dir: None,
+        band: PayloadBand::Signs(SignBand {
+            churn: 0.0,
+            flips: 0.0,
+        }),
+        audit_assigned: false,
+        dry_run: false,
+        verdict_mode: false,
+        continuity: false,
+    };
+    let mut convicted = HashSet::new();
+    let report = audit_pass(
+        &mut endpoint,
+        &main_authority,
+        &coordinator_account,
+        &run,
+        &config,
+        Some(&engine),
+        &mut convicted,
+    )
+    .await
+    .unwrap();
+
+    // Both nodes' first rounds replay from the checkpoint and clear, as does
+    // the honest node's second, replayed from its revealed state. The
+    // forger's second round does not.
+    assert_eq!(
+        report,
+        PassReport {
+            cleared: 3,
+            fraud_found: 1,
+            submitted: 1,
+            ..PassReport::default()
+        }
+    );
+    assert!(convicted.contains(&clients[cheater].pubkey().to_string()));
+    assert!(
+        !convicted.contains(&clients[honest].pubkey().to_string()),
+        "the honest node was convicted"
+    );
+
+    endpoint
+        .forward_clock_unix_timestamp(COOLDOWN_TIME)
+        .await
+        .unwrap();
+    process_coordinator_tick_and_reveal(
+        &mut endpoint,
+        &payer,
+        &ticker,
+        &coordinator_instance,
+        &coordinator_account,
+    )
+    .await
+    .unwrap();
+    let state = coordinator_state(&mut endpoint, &coordinator_account).await;
+    let cheater_state = state
+        .clients_state
+        .clients
+        .iter()
+        .find(|c| *c.id.signer() == clients[cheater].pubkey().to_bytes())
+        .unwrap();
+    assert_eq!(cheater_state.slashed, SLASHING_RATE);
+}
+
+/// `header`, committing to the state `state`, the one its trainer trained
+/// from, rather than the one the shared fixtures claim.
+pub(super) fn signed_commitment_header(
+    header: psyche_solana_tooling::signed_commitment::PayloadHeader,
+    state: [u8; 32],
+) -> psyche_solana_tooling::signed_commitment::PayloadHeader {
+    psyche_solana_tooling::signed_commitment::PayloadHeader {
+        state_digest: Some(state),
+        ..header
+    }
 }

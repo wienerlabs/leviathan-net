@@ -10,6 +10,8 @@
 #   PORT          the port the server listens on
 #   TIMEOUT_SECS  how long the run may take before it counts as stuck
 #   NODES         how many clients train it
+#   NODE_ENV      optionally, an array of an environment assignment for each
+#                 client by index, such as a forged result for one of them
 #
 # Client N keeps every payload in "$WORK/dumpsN" (--write-gradients-dir) and
 # the state each round trains from in "$WORK/statesN" (--round-state-dir), and
@@ -61,6 +63,7 @@ run_real_clients() {
     until grep -aq "Server listening on" "$WORK/server.log"; do
         if ! kill -0 "$server" 2>/dev/null || ((SECONDS > ready)); then
             echo "$LABEL the server did not start on port $PORT; logs in $WORK" >&2
+            show_log "$WORK/server.log"
             exit 1
         fi
         sleep 1
@@ -73,7 +76,9 @@ run_real_clients() {
     local node
     for ((node = 0; node < NODES; node++)); do
         # A fresh identity per client: the run admits each by its own key.
-        RAW_IDENTITY_SECRET_KEY=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n') \
+        # shellcheck disable=SC2086
+        env RAW_IDENTITY_SECRET_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
+            ${NODE_ENV[$node]:-} \
             "$BIN/psyche-centralized-client" train \
             --run-id "$run_id" \
             --server-addr "localhost:$PORT" --device cpu --logs console \

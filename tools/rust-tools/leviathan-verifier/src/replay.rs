@@ -34,6 +34,10 @@ use psyche_verifier::ReplayError;
 use tokio_util::sync::CancellationToken;
 
 use crate::decompress_results;
+use crate::read_dump;
+use crate::revealed::{NextRound, RevealedRound};
+use psyche_modeling::{read_round_state, DistroResult};
+use tch::Tensor;
 
 /// A piece of work a verifier can replay: the batch trained at a step of an
 /// epoch, and what training it takes.
@@ -372,13 +376,42 @@ pub fn build_replay_trainer(config: &ReplayTrainerConfig) -> Result<Trainer> {
 /// of exactly that work, whatever has happened to the roster since.
 pub trait ReplayWork {
     fn replay_work(&self, work: &DumpKey) -> Result<Vec<f32>, ReplayError>;
+
+    /// The replay of `work` from the state its trainer revealed
+    /// (wienerlabs/leviathan-net#89).
+    fn replay_revealed_work(
+        &self,
+        work: &DumpKey,
+        round: &RevealedRound,
+    ) -> Result<Vec<f32>, ReplayError>;
+
+    /// The digest of the state `work`'s round leaves, replayed from the state
+    /// its trainer revealed, once the results the round after applied first
+    /// are applied: the state the trainer's next round trains from
+    /// (wienerlabs/leviathan-net#89).
+    fn replay_continuity(
+        &self,
+        work: &DumpKey,
+        round: &RevealedRound,
+        next: &NextRound,
+    ) -> Result<[u8; 32], ReplayError>;
 }
+
+/// What a replay of a round from its revealed state returns: the results it
+/// sent, and, if it went on to the round after, the digest of the state that
+/// leaves.
+type RevealedStep = (Option<Vec<DistroResult>>, Option<[u8; 32]>);
 
 pub struct TrainerReplayEngine {
     trainer: Mutex<Option<Trainer>>,
     assignments: HashMap<DumpKey, ReplayAssignment>,
     device: tch::Device,
     quantize_1bit: bool,
+    /// The run's checkpoint, which a replay of a first step trains from: a
+    /// replay from a revealed state leaves the trainer holding that state.
+    checkpoint: Mutex<Option<HashMap<String, Tensor>>>,
+    /// Whether the trainer holds anything other than the checkpoint.
+    holds_a_state: Mutex<bool>,
 }
 
 impl TrainerReplayEngine {
@@ -397,6 +430,18 @@ impl TrainerReplayEngine {
             assignments: assignments.into_iter().map(|a| (a.work(), a)).collect(),
             device,
             quantize_1bit,
+            checkpoint: Mutex::new(None),
+            holds_a_state: Mutex::new(false),
+        }
+    }
+
+    /// This engine, restoring `checkpoint`, the run's checkpoint as the
+    /// trainer was built with it (`Trainer::extract`), before a replay of a
+    /// first step that follows one from a revealed state.
+    pub fn with_checkpoint(self, checkpoint: HashMap<String, Tensor>) -> Self {
+        Self {
+            checkpoint: Mutex::new(Some(checkpoint)),
+            ..self
         }
     }
 
@@ -409,9 +454,38 @@ impl TrainerReplayEngine {
             .trainer
             .lock()
             .map_err(|_| ReplayError::Backend("replay trainer lock poisoned".to_string()))?;
-        let trainer = slot
+        let mut trainer = slot
             .take()
             .ok_or_else(|| ReplayError::Backend("replay trainer unavailable".to_string()))?;
+
+        // A replay from a revealed state left the trainer holding it: the
+        // first step trains from the checkpoint.
+        let mut holds_a_state = self
+            .holds_a_state
+            .lock()
+            .map_err(|_| ReplayError::Backend("replay state flag poisoned".to_string()))?;
+        if *holds_a_state {
+            let checkpoint = self
+                .checkpoint
+                .lock()
+                .map_err(|_| ReplayError::Backend("replay checkpoint lock poisoned".to_string()))?;
+            let restored = match checkpoint.as_ref() {
+                Some(checkpoint) => trainer.load(checkpoint, None).map_err(|err| {
+                    ReplayError::Backend(format!("cannot restore the checkpoint: {err}"))
+                }),
+                None => Err(ReplayError::Backend(
+                    "the trainer holds a revealed state, and this engine has no checkpoint to restore"
+                        .to_string(),
+                )),
+            };
+            drop(checkpoint);
+            if let Err(err) = restored {
+                *slot = Some(trainer);
+                return Err(err);
+            }
+            *holds_a_state = false;
+        }
+        drop(holds_a_state);
 
         // Trained as the client trains a step with zeroed error feedback: the
         // run's warmup bounds, and no results of its own from before.
@@ -454,6 +528,176 @@ impl TrainerReplayEngine {
     }
 }
 
+impl TrainerReplayEngine {
+    /// The round `assignment` trained, replayed from the state its trainer
+    /// revealed: the trainer loads the state, reads the values the trainer
+    /// sent for the round before off its buffer, at the indices of its
+    /// payload of that round, and trains the round with them, as the node's
+    /// step did (wienerlabs/leviathan-net#89).
+    fn recompute_revealed(
+        &self,
+        assignment: &ReplayAssignment,
+        round: &RevealedRound,
+    ) -> Result<Vec<f32>, ReplayError> {
+        let (results, _) = self.train_revealed(assignment, round, None)?;
+        let results = results.ok_or_else(|| {
+            ReplayError::Backend(
+                "replay produced no distro results, the run is not using DisTrO".to_string(),
+            )
+        })?;
+        let results = match self.quantize_1bit {
+            true => Trainer::quantize_results(&results),
+            false => results,
+        };
+        decompress_results(&results, self.device)
+            .map_err(|e| ReplayError::Backend(format!("cannot decompress replay: {e}")))
+    }
+
+    /// The state the round `assignment` trained leaves, replayed from the
+    /// state its trainer revealed, once `next`'s applied results are applied.
+    fn recompute_continuity(
+        &self,
+        assignment: &ReplayAssignment,
+        round: &RevealedRound,
+        next: &NextRound,
+    ) -> Result<[u8; 32], ReplayError> {
+        let (_, digest) = self.train_revealed(assignment, round, Some(next))?;
+        digest.ok_or_else(|| {
+            ReplayError::Backend("the replay trainer commits to no state".to_string())
+        })
+    }
+
+    /// Trains the round `assignment` from the state its trainer revealed, and
+    /// returns its results; given `next`, then applies what the round after
+    /// applied first, as the client does, and returns the digest of the state
+    /// that leaves.
+    fn train_revealed(
+        &self,
+        assignment: &ReplayAssignment,
+        round: &RevealedRound,
+        next: Option<&NextRound>,
+    ) -> Result<RevealedStep, ReplayError> {
+        let backend = |what: &str, err: &dyn std::fmt::Display| {
+            ReplayError::Backend(format!("{what}: {err}"))
+        };
+        let state = std::fs::read(&round.state)
+            .map_err(|err| backend("cannot read the revealed state", &err))?;
+        let state = read_round_state(&state)
+            .map_err(|err| backend("the revealed state does not read", &err))?;
+        let weights: HashMap<String, Tensor> = state.variables.into_iter().collect();
+        let buffers: Vec<Tensor> = state
+            .buffers
+            .into_iter()
+            .map(|(_, tensor)| tensor)
+            .collect();
+        let previous = match &round.previous_payload {
+            Some(path) => read_dump(path)
+                .map_err(|err| {
+                    backend(
+                        "cannot read the trainer's payload of the round before",
+                        &err,
+                    )
+                })?
+                .iter()
+                .map(DistroResult::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| {
+                    backend(
+                        "the trainer's payload of the round before does not decode",
+                        &err,
+                    )
+                })?,
+            None => vec![],
+        };
+        let applied = match next.and_then(|next| next.applied.as_ref()) {
+            Some(paths) => Some(
+                paths
+                    .iter()
+                    .map(|path| {
+                        read_dump(path)
+                            .map_err(|err| backend("cannot read an applied payload", &err))?
+                            .iter()
+                            .map(DistroResult::try_from)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|err| backend("an applied payload does not decode", &err))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+
+        let mut slot = self
+            .trainer
+            .lock()
+            .map_err(|_| ReplayError::Backend("replay trainer lock poisoned".to_string()))?;
+        let mut trainer = slot
+            .take()
+            .ok_or_else(|| ReplayError::Backend("replay trainer unavailable".to_string()))?;
+        *self
+            .holds_a_state
+            .lock()
+            .map_err(|_| ReplayError::Backend("replay state flag poisoned".to_string()))? = true;
+        let sent_before = trainer
+            .load(&weights, Some(&[buffers]))
+            .map_err(|err| backend("cannot load the revealed state", &err))
+            .and_then(|()| match previous.is_empty() {
+                true => Ok(vec![]),
+                false => trainer
+                    .previous_results(&previous)
+                    .map(|results| vec![results])
+                    .map_err(|err| backend("cannot read the round before off the buffer", &err)),
+            });
+        let sent_before = match sent_before {
+            Ok(sent_before) => sent_before,
+            Err(err) => {
+                *slot = Some(trainer);
+                return Err(err);
+            }
+        };
+
+        let output = trainer.train(
+            assignment.step,
+            Batch {
+                id: assignment.batch_id,
+                data: BatchData::CPU(assignment.data.clone()),
+            },
+            assignment.warmup_lr_between,
+            false,
+            vec![],
+            Some(sent_before),
+            CancellationToken::new(),
+        );
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(ReplayError::Backend(format!(
+                    "replay training failed: {error}"
+                )));
+            }
+        };
+        let results = output.distro_results.clone();
+        let Some(next) = next else {
+            *slot = Some(output.trainer);
+            return Ok((results, None));
+        };
+        // The round after opens by applying the results it names, at its
+        // own step, as the client's apply does; an epoch's first two apply
+        // nothing.
+        let mut trainer = match applied {
+            Some(applied) => output
+                .trainer
+                .optimize(next.step, assignment.warmup_lr_between, Some(applied))
+                .map_err(|err| backend("cannot apply what the round after applied", &err))?,
+            None => output.trainer,
+        };
+        let digest = trainer.round_state_digest();
+        *slot = Some(trainer);
+        let digest =
+            digest.map_err(|err| backend("cannot hash the state the round leaves", &err))?;
+        Ok((results, digest))
+    }
+}
+
 impl ReplayWork for TrainerReplayEngine {
     fn replay_work(&self, work: &DumpKey) -> Result<Vec<f32>, ReplayError> {
         let assignment = self
@@ -462,5 +706,32 @@ impl ReplayWork for TrainerReplayEngine {
             .ok_or_else(|| ReplayError::WorkNotAssigned(work.to_string()))?
             .clone();
         self.recompute(&assignment)
+    }
+
+    fn replay_revealed_work(
+        &self,
+        work: &DumpKey,
+        round: &RevealedRound,
+    ) -> Result<Vec<f32>, ReplayError> {
+        let assignment = self
+            .assignments
+            .get(work)
+            .ok_or_else(|| ReplayError::WorkNotAssigned(work.to_string()))?
+            .clone();
+        self.recompute_revealed(&assignment, round)
+    }
+
+    fn replay_continuity(
+        &self,
+        work: &DumpKey,
+        round: &RevealedRound,
+        next: &NextRound,
+    ) -> Result<[u8; 32], ReplayError> {
+        let assignment = self
+            .assignments
+            .get(work)
+            .ok_or_else(|| ReplayError::WorkNotAssigned(work.to_string()))?
+            .clone();
+        self.recompute_continuity(&assignment, round, next)
     }
 }

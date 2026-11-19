@@ -9,7 +9,8 @@ use psyche_core::{IntegrationTestLogMarker, MerkleRoot, MerkleTree, NodeIdentity
 use psyche_event_sourcing::event;
 use psyche_modeling::{DistroResult, Trainer};
 use psyche_network::{
-    BlobTicket, CommitmentRecord, EndpointId, Hash, P2PEndpointInfo, TransmittableDistroResult,
+    BlobTicket, CommitmentRecord, EndpointId, Hash, P2PEndpointInfo, PreviousRound,
+    TransmittableDistroResult,
 };
 use psyche_watcher::OpportunisticData;
 use std::{
@@ -31,7 +32,7 @@ use super::{
     cooldown::{CooldownError, CooldownStep, CooldownStepMetadata},
     evals::{EvalError, MaybeRunningEvals, RunningEvals},
     init::InitRunError,
-    reveal::{StateToReveal, reveal_audited_state},
+    reveal::{RoundDraw, StateToReveal, previous_training, reveal_audited_state, round_training},
     round_state::RoundState,
     stats::StatsLogger,
     train::{
@@ -546,6 +547,9 @@ impl StepStateMachine {
     ) {
         // The run the payload's commitment is bound to.
         let run_id = String::from(&self.coordinator_state.run_id);
+        // What the round before the current one drew, for a payload of the
+        // current round this node audits (wienerlabs/leviathan-net#89).
+        let previous_draw = RoundDraw::of(&self.previous_round);
         let (round_state, current_round) =
             if self.current_round.distro_result_blob_downloaded(&hash) {
                 trace!(
@@ -642,12 +646,21 @@ impl StepStateMachine {
         ) {
             (true, Some(digest), Some(expected_len), Ok(trainer)) => {
                 let (retry_every, time_to_reveal) = StateToReveal::windows(&self.coordinator_state);
+                // What the trainer did in the round before, which its step
+                // took out of its buffer first: only the round before this
+                // one is still kept to say.
+                let previous = match current_round {
+                    true => previous_training(&previous_draw, round_state, &from),
+                    false => PreviousRound::Unknown,
+                };
                 Some(StateToReveal {
                     endpoint: self.training.endpoint.clone(),
                     trainer,
                     digest,
                     expected_len,
                     dump: PathBuf::new(),
+                    previous,
+                    trained: round_training(round_state, &from),
                     retry_every,
                     time_to_reveal,
                 })

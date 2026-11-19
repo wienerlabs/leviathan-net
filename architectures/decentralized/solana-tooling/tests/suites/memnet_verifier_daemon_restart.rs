@@ -90,6 +90,7 @@ async fn kept_fraud_naming(
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
     (
         config,

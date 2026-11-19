@@ -339,6 +339,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: true,
+        continuity: false,
     };
 
     // A trainer off this round's committee proves the same fraud and cannot

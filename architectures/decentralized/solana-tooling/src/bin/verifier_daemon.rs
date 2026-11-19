@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use std::time::Instant;
+
+use tch::Tensor;
 
 use anyhow::anyhow;
 use anyhow::Result;
@@ -20,6 +23,7 @@ use leviathan_verifier::payload_band;
 use leviathan_verifier::DumpKey;
 use leviathan_verifier::published_checkpoint;
 use leviathan_verifier::replay_data_layout;
+use leviathan_verifier::revealed::revealed_round;
 use leviathan_verifier::ReplayAssignment;
 use leviathan_verifier::ReplayTrainerConfig;
 use leviathan_verifier::ReplayWork;
@@ -102,6 +106,14 @@ struct Args {
     audit_assigned: bool,
     #[arg(long, default_value_t = false)]
     verdict: bool,
+    /// Also check that each round replayed from its revealed state leaves
+    /// the state its trainer's next round committed to, and convict that
+    /// next round's payload if it does not (wienerlabs/leviathan-net#89).
+    /// A replay holds a state to the bit only in the class of hardware and
+    /// the dtype the run trains in: set it only for a run known to train in
+    /// this daemon's (`docs/ROUND_AUDIT.md`).
+    #[arg(long, default_value_t = false)]
+    continuity: bool,
 
     /// Serve what each pass judged at http://<address>/metrics for Prometheus:
     /// contributions cleared, fraud found, convictions submitted, and
@@ -150,6 +162,11 @@ struct Loaded {
     checkpoint: HubRepo,
     /// Lent to each pass's engine and handed back after it.
     trainer: Option<Trainer>,
+    /// The checkpoint's weights, which a replay of the run's first step
+    /// trains from after one from a revealed state left the trainer holding
+    /// that state (wienerlabs/leviathan-net#89). Copies, not the trainer's
+    /// own tensors.
+    weights: HashMap<String, Tensor>,
     provider: LocalDataProvider,
     quantize_1bit: bool,
 }
@@ -192,7 +209,12 @@ impl Replayer {
                 // for the dtype chosen (wienerlabs/leviathan-net#49).
                 self.kind,
             );
-            let trainer = build_replay_trainer(&config)?;
+            let mut trainer = build_replay_trainer(&config)?;
+            let weights = trainer
+                .extract()?
+                .into_iter()
+                .map(|(name, tensor)| (name, tensor.copy()))
+                .collect();
             let (token_size, shuffle) = replay_data_layout(llm)?;
             let provider = LocalDataProvider::new_from_directory(
                 &self.data_dir,
@@ -209,6 +231,7 @@ impl Replayer {
             self.loaded = Some(Loaded {
                 checkpoint,
                 trainer: Some(trainer),
+                weights,
                 provider,
                 quantize_1bit: config.quantize_1bit(),
             });
@@ -228,32 +251,39 @@ impl Replayer {
             .await?
             .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
         let coordinator = &state.coordinator;
-        // Only the run's first step is trained by every node from the
-        // published checkpoint with fresh state, so only its contributions can
-        // be reproduced here. Past the first epoch there is nothing to replay,
-        // and nothing worth loading (wienerlabs/leviathan-net#48).
-        if coordinator.replayable_step().is_none() {
+        // What a replay can reproduce: the run's first step, trained by every
+        // node from the published checkpoint with fresh state
+        // (wienerlabs/leviathan-net#48), and any round of the epoch under way
+        // whose payload has the state its trainer revealed beside it
+        // (wienerlabs/leviathan-net#89). Without either there is nothing to
+        // replay, and nothing worth loading.
+        let replayable =
+            |epoch_start: u64, step: u32, path: &std::path::Path| {
+                coordinator.is_replayable(epoch_start, step)
+                    || (epoch_start == coordinator.epoch_state.start_timestamp
+                        && matches!(revealed_round(path), Ok(Some(_))))
+            };
+        let work: Vec<(DumpKey, PathBuf)> = index_dir(&args.submitted_dir)?
+            .into_iter()
+            .filter_map(|(key, path)| Some((parse_assignment_key(&key)?, path)))
+            .filter(|(key, path)| replayable(key.epoch_start, key.step, path))
+            .collect();
+        if work.is_empty() {
             return Ok(None);
         }
         let Model::LLM(llm) = coordinator.model;
         let loaded = self.load(&llm)?;
 
         let mut assignments = Vec::new();
-        for (key, path) in index_dir(&args.submitted_dir)? {
-            let Some(DumpKey {
+        for (
+            DumpKey {
                 epoch_start,
                 step,
                 batch_id,
-            }) = parse_assignment_key(&key)
-            else {
-                continue;
-            };
-            // A run restarted from an earlier step trains it again in a later
-            // epoch; only this epoch's is the step the replay reproduces
-            // (wienerlabs/leviathan-net#67).
-            if !coordinator.is_replayable(epoch_start, step) {
-                continue;
-            }
+            },
+            path,
+        ) in work
+        {
             // Only a payload someone in the epoch signed is worth the data.
             // The dump names carry the full base58 signer (finding 20), so the
             // roster is matched on the same. Where it sits there is not kept:
@@ -292,12 +322,20 @@ impl Replayer {
         let trainer = loaded.trainer.take().ok_or_else(|| {
             anyhow!("the replay model was lost in an earlier pass")
         })?;
-        Ok(Some(TrainerReplayEngine::new(
-            trainer,
-            assignments,
-            tch::Device::Cpu,
-            loaded.quantize_1bit,
-        )))
+        let weights = loaded
+            .weights
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.copy()))
+            .collect();
+        Ok(Some(
+            TrainerReplayEngine::new(
+                trainer,
+                assignments,
+                tch::Device::Cpu,
+                loaded.quantize_1bit,
+            )
+            .with_checkpoint(weights),
+        ))
     }
 
     /// Takes the trainer back after a pass. A replay that failed consumed it,
@@ -358,6 +396,7 @@ async fn main() -> Result<()> {
         audit_assigned: args.audit_assigned,
         dry_run: args.dry_run,
         verdict_mode: args.verdict,
+        continuity: args.continuity,
     };
 
     println!(
@@ -375,12 +414,13 @@ async fn main() -> Result<()> {
         config.dry_run
     );
     println!(
-        "[verifier-daemon] action={}",
+        "[verifier-daemon] action={} continuity={}",
         if config.verdict_mode {
             "submit-verdict (bonded committee vote)"
         } else {
             "slash (single authority)"
-        }
+        },
+        config.continuity
     );
 
     let mut exporter = match args.metrics_listen {

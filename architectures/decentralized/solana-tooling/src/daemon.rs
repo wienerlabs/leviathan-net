@@ -12,6 +12,7 @@ use leviathan_verifier::judge_payload;
 use leviathan_verifier::sends_signs;
 use leviathan_verifier::PayloadBand;
 use leviathan_verifier::parse_assignment_key;
+use leviathan_verifier::revealed::revealed_round;
 use leviathan_verifier::check_commitment;
 use leviathan_verifier::CommitmentCheck;
 use leviathan_verifier::ReplayWork;
@@ -35,6 +36,7 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use tch::Device;
 
+use crate::daemon_continuity::ContinuityPass;
 use crate::daemon_equivocation::EquivocationPass;
 use crate::get_accounts::get_coordinator_account_state;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
@@ -59,6 +61,12 @@ pub struct AuditConfig {
     pub audit_assigned: bool,
     pub dry_run: bool,
     pub verdict_mode: bool,
+    /// Whether each round replayed from its revealed state is also checked to
+    /// leave the state its trainer's next round committed to, convicting
+    /// that next round's payload if it does not
+    /// (wienerlabs/leviathan-net#89). It holds to the bit only where the
+    /// run trains in the replay's own class of hardware and dtype.
+    pub continuity: bool,
 }
 
 pub fn hex8(bytes: &[u8; 32]) -> String {
@@ -275,6 +283,30 @@ pub async fn audit_pass(
     // submitted again on the next pass.
     judged: &mut HashSet<String>,
 ) -> Result<PassReport> {
+    // On the heap: a pass's every step is a future of its own, and a caller
+    // that keeps the pass on its stack (a test's runtime does) would hold
+    // them all there.
+    Box::pin(run_pass(
+        endpoint,
+        authority,
+        coordinator_account,
+        run,
+        config,
+        replay,
+        judged,
+    ))
+    .await
+}
+
+async fn run_pass(
+    endpoint: &mut solana_toolbox_endpoint::ToolboxEndpoint,
+    authority: &Keypair,
+    coordinator_account: &Pubkey,
+    run: &Pubkey,
+    config: &AuditConfig,
+    replay: Option<&(dyn ReplayWork + Sync)>,
+    judged: &mut HashSet<String>,
+) -> Result<PassReport> {
     let state = get_coordinator_account_state(endpoint, coordinator_account)
         .await?
         .ok_or_else(|| anyhow!("coordinator account {} not found", coordinator_account))?;
@@ -464,13 +496,31 @@ pub async fn audit_pass(
                 }
             }
             (None, Some(engine)) => {
-                // A replay reproduces only the first step of a cold-start
-                // epoch, trained from zeroed error feedback, and the run says
-                // which step that is. Judging any other step against it would
-                // convict honest nodes (wienerlabs/leviathan-net#47, #48), and
-                // so would the same step trained again after a restart, from
-                // other weights (wienerlabs/leviathan-net#67).
-                if !coordinator.is_replayable(record.epoch_start, record.step) {
+                // A payload whose trainer revealed the state it trained from
+                // is replayed from that state, at whatever round of the epoch
+                // (wienerlabs/leviathan-net#89). What this verifier did not
+                // keep to replay it with is its own gap, not the target's.
+                let revealed = match revealed_round(submitted_path) {
+                    Ok(revealed) => revealed,
+                    Err(err) => {
+                        println!(
+                            "[verifier-daemon] skip  {key} committer {committer} cannot be replayed from its revealed state: {err}"
+                        );
+                        report.unreplayable += 1;
+                        continue;
+                    },
+                };
+                // Without one, a replay reproduces only the first step of a
+                // cold-start epoch, trained from zeroed error feedback, and
+                // the run says which step that is. Judging any other step
+                // against it would convict honest nodes
+                // (wienerlabs/leviathan-net#47, #48), and so would the same
+                // step trained again after a restart, from other weights
+                // (wienerlabs/leviathan-net#67).
+                if revealed.is_none()
+                    && !coordinator
+                        .is_replayable(record.epoch_start, record.step)
+                {
                     continue;
                 }
                 // The replay of the work this payload is signed for, found by
@@ -479,7 +529,11 @@ pub async fn audit_pass(
                 // was built from an earlier read, and anyone leaving the epoch
                 // in between moves the committer to a seat whose batch is
                 // someone else's.
-                match engine.replay_work(&dump) {
+                let replayed = match &revealed {
+                    Some(round) => engine.replay_revealed_work(&dump, round),
+                    None => engine.replay_work(&dump),
+                };
+                match replayed {
                     Ok(delta) => delta,
                     Err(err) => {
                         println!(
@@ -548,128 +602,44 @@ pub async fn audit_pass(
             hex8(&replayed_hash)
         );
 
-        if judged.contains(&committer) {
-            println!("  already convicted {committer} this session, skipping");
-            judged.insert(key.clone());
-            continue;
+        Convicting {
+            endpoint: &mut *endpoint,
+            authority,
+            coordinator_account,
+            run,
+            config,
+            report: &mut report,
+            judged: &mut *judged,
         }
+        .submit(&Conviction {
+            key: key.clone(),
+            committer,
+            target: Pubkey::new_from_array(*target.signer()),
+            index,
+            signed,
+            replayed_hash,
+        })
+        .await;
+    }
 
-        let action = if config.verdict_mode {
-            "verdict"
-        } else {
-            "slash"
-        };
-        if config.dry_run {
-            println!("  [dry-run] would submit {action} for {committer} at epoch index {index}");
-            report.withheld += 1;
-            judged.insert(key.clone());
-            continue;
+    // Then, where the operator asked for it, each round replayed from the
+    // state its trainer revealed is checked to leave the state its trainer's
+    // next round committed to (wienerlabs/leviathan-net#89).
+    if let (true, None, Some(engine)) = (config.continuity, &reference, replay)
+    {
+        ContinuityPass {
+            endpoint: &mut *endpoint,
+            authority,
+            coordinator_account,
+            run,
+            config,
+            coordinator,
+            replay: engine,
+            report: &mut report,
+            judged: &mut *judged,
         }
-
-        let target_signer = Pubkey::new_from_array(*target.signer());
-        if config.verdict_mode {
-            // The target's verdict account holds one dispute at a time, and it
-            // is taken over only once the last one holds nobody's bond and
-            // owes nobody a bounty. What nobody's consent is needed for is
-            // settled first, so a lapsed, standing or overturned dispute does
-            // not refuse this one (wienerlabs/leviathan-net#39). Anything still
-            // at stake stays, and the vote below is refused as before.
-            match settle_previous_dispute(
-                endpoint,
-                authority,
-                run,
-                coordinator_account,
-                &target_signer,
-            )
-            .await
-            {
-                Ok(settled) if settled == DisputeSettlement::default() => {},
-                Ok(settled) => println!(
-                    "  settled the last dispute against {committer}: conviction finalised {}, conviction charged {}, {} vote(s) freed, {} loser(s) charged, {} recipient(s) credited",
-                    settled.conviction_finalized,
-                    settled.conviction_charged,
-                    settled.votes_freed,
-                    settled.losers_charged,
-                    settled.seats_credited
-                ),
-                Err(err) => println!(
-                    "  could not settle the last dispute against {committer}: {err:#}"
-                ),
-            }
-        }
-        let result = if config.verdict_mode {
-            process_treasurer_run_submit_audit_verdict(
-                endpoint,
-                authority,
-                authority,
-                run,
-                coordinator_account,
-                &config.run_id,
-                &target_signer,
-                index as u64,
-                &signed,
-                replayed_hash,
-            )
-            .await
-        } else {
-            // The run authority slashes as itself and names no reporter, so
-            // the bounty stays in the vault (wienerlabs/leviathan-net#72).
-            process_treasurer_run_slash(
-                endpoint,
-                authority,
-                authority,
-                run,
-                coordinator_account,
-                &config.run_id,
-                &target_signer,
-                None,
-                index as u64,
-                &signed,
-                replayed_hash,
-            )
-            .await
-        };
-
-        match result {
-            Ok(()) => {
-                println!("  {action} submitted for {committer} at epoch index {index}");
-                judged.insert(committer);
-                judged.insert(key.clone());
-                report.submitted += 1;
-            }
-            Err(err) => {
-                match already_on_chain(
-                    endpoint,
-                    coordinator_account,
-                    run,
-                    &target_signer,
-                    &authority.pubkey(),
-                )
-                .await
-                {
-                    Ok(true) => {
-                        println!(
-                            "  {action} for {committer} refused, the chain already holds it: {err:#}"
-                        );
-                        judged.insert(committer);
-                        judged.insert(key.clone());
-                        report.already_on_chain += 1;
-                    },
-                    Ok(false) => {
-                        println!(
-                            "  {action} submission failed for {committer} at index {index}, retrying next pass: {err:#}"
-                        );
-                        report.submission_failures += 1;
-                    },
-                    Err(check) => {
-                        println!(
-                            "  {action} submission failed for {committer} at index {index}, and the chain could not be read to tell why: {err:#}; {check:#}"
-                        );
-                        report.submission_failures += 1;
-                    },
-                }
-            }
-        }
+        .check_all(&submitted)
+        .await;
     }
 
     // Then every dispute in the run is settled as far as nobody's consent is
@@ -721,4 +691,177 @@ pub async fn audit_pass(
     }
 
     Ok(report)
+}
+
+/// What a conviction is sent with: the chain, the daemon's key and the run,
+/// and what the pass reports and settles.
+pub struct Convicting<'a> {
+    pub endpoint: &'a mut solana_toolbox_endpoint::ToolboxEndpoint,
+    pub authority: &'a Keypair,
+    pub coordinator_account: &'a Pubkey,
+    pub run: &'a Pubkey,
+    pub config: &'a AuditConfig,
+    pub report: &'a mut PassReport,
+    pub judged: &'a mut HashSet<String>,
+}
+
+/// A conviction of `committer`, signer `target`, at `index` on the roster,
+/// for the payload it signed (`signed`), with the honest work's hash
+/// (`replayed_hash`). `key` is what the pass settles once the chain holds it.
+pub struct Conviction {
+    pub key: String,
+    pub committer: String,
+    pub target: Pubkey,
+    pub index: usize,
+    pub signed: SignedCommitment,
+    pub replayed_hash: [u8; 32],
+}
+
+impl Convicting<'_> {
+    /// Sends `conviction`: a vote on a verdict, or a slash, as the daemon is
+    /// configured. A committer convicted this session is not sent again, a
+    /// dry run sends nothing, and a submission the chain refuses without
+    /// holding it is sent again on the next pass.
+    pub async fn submit(&mut self, conviction: &Conviction) {
+        let Conviction {
+            key,
+            committer,
+            target,
+            index,
+            signed,
+            replayed_hash,
+        } = conviction;
+        let index = *index;
+        let replayed_hash = *replayed_hash;
+        let (endpoint, authority, run, coordinator_account, config) = (
+            &mut *self.endpoint,
+            self.authority,
+            self.run,
+            self.coordinator_account,
+            self.config,
+        );
+        let (report, judged) = (&mut *self.report, &mut *self.judged);
+        if judged.contains(committer.as_str()) {
+            println!("  already convicted {committer} this session, skipping");
+            judged.insert(key.clone());
+            return;
+        }
+
+        let action = if config.verdict_mode {
+            "verdict"
+        } else {
+            "slash"
+        };
+        if config.dry_run {
+            println!("  [dry-run] would submit {action} for {committer} at epoch index {index}");
+            report.withheld += 1;
+            judged.insert(key.clone());
+            return;
+        }
+
+        let target_signer = *target;
+        if config.verdict_mode {
+            // The target's verdict account holds one dispute at a time, and it
+            // is taken over only once the last one holds nobody's bond and
+            // owes nobody a bounty. What nobody's consent is needed for is
+            // settled first, so a lapsed, standing or overturned dispute does
+            // not refuse this one (wienerlabs/leviathan-net#39). Anything still
+            // at stake stays, and the vote below is refused as before.
+            match settle_previous_dispute(
+                endpoint,
+                authority,
+                run,
+                coordinator_account,
+                &target_signer,
+            )
+            .await
+            {
+                Ok(settled) if settled == DisputeSettlement::default() => {},
+                Ok(settled) => println!(
+                    "  settled the last dispute against {committer}: conviction finalised {}, conviction charged {}, {} vote(s) freed, {} loser(s) charged, {} recipient(s) credited",
+                    settled.conviction_finalized,
+                    settled.conviction_charged,
+                    settled.votes_freed,
+                    settled.losers_charged,
+                    settled.seats_credited
+                ),
+                Err(err) => println!(
+                    "  could not settle the last dispute against {committer}: {err:#}"
+                ),
+            }
+        }
+        let result = if config.verdict_mode {
+            process_treasurer_run_submit_audit_verdict(
+                endpoint,
+                authority,
+                authority,
+                run,
+                coordinator_account,
+                &config.run_id,
+                &target_signer,
+                index as u64,
+                signed,
+                replayed_hash,
+            )
+            .await
+        } else {
+            // The run authority slashes as itself and names no reporter, so
+            // the bounty stays in the vault (wienerlabs/leviathan-net#72).
+            process_treasurer_run_slash(
+                endpoint,
+                authority,
+                authority,
+                run,
+                coordinator_account,
+                &config.run_id,
+                &target_signer,
+                None,
+                index as u64,
+                signed,
+                replayed_hash,
+            )
+            .await
+        };
+
+        match result {
+            Ok(()) => {
+                println!("  {action} submitted for {committer} at epoch index {index}");
+                judged.insert(committer.clone());
+                judged.insert(key.clone());
+                report.submitted += 1;
+            }
+            Err(err) => {
+                match already_on_chain(
+                    endpoint,
+                    coordinator_account,
+                    run,
+                    &target_signer,
+                    &authority.pubkey(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        println!(
+                            "  {action} for {committer} refused, the chain already holds it: {err:#}"
+                        );
+                        judged.insert(committer.clone());
+                        judged.insert(key.clone());
+                        report.already_on_chain += 1;
+                    },
+                    Ok(false) => {
+                        println!(
+                            "  {action} submission failed for {committer} at index {index}, retrying next pass: {err:#}"
+                        );
+                        report.submission_failures += 1;
+                    },
+                    Err(check) => {
+                        println!(
+                            "  {action} submission failed for {committer} at index {index}, and the chain could not be read to tell why: {err:#}; {check:#}"
+                        );
+                        report.submission_failures += 1;
+                    },
+                }
+            }
+        }
+    }
 }

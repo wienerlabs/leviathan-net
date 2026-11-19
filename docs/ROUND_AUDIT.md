@@ -175,18 +175,44 @@ reaches it at that key.
 The daemon audits a payload past a run's first step when its state is beside
 it:
 
-1. It reads `<dump>.state` and checks its digest against the payload's
-   commitment.
-2. It builds a replay trainer of the run's model, loads the state into it
-   (`Trainer::load`, which takes weights and a buffer across dtypes, #48), and
-   derives the previous round's values from the buffer and the node's round
-   `h - 1` payload, which every node holds.
-3. It replays round `h` on the node's batch, and judges the payload against
-   the replay as it judges a first step: by the run's band, on the distance
-   or, for 1-bit runs, on churn and flips (#49).
+1. **The state.** It reads `<dump>.state` (`read_round_state`), whose digest
+   the reveal already checked against the payload's commitment.
+2. **Loading it.** It loads the state into its replay trainer (`Trainer::load`,
+   which takes weights and a buffer across dtypes, #48).
+3. **The previous round's values.** A node's step at round `h` first takes
+   out of its buffer the values it sent at round `h - 1`. Those values are the
+   buffer encoded as the node encodes it to send, read at the indices of its
+   round `h - 1` payload (`Distro::results_at`). Nothing changes the buffer
+   between the step that sent them and this one (`apply` touches only the
+   weights), so they follow from the revealed state and the payload's public
+   indices, and are never revealed.
+4. **What the node did the round before.** The verifier keeps beside the dump
+   what the node did the round before (`<dump>.previous`), from its own view
+   of that round's draw:
+   - **nothing:** it verified there, or the round opens its epoch, which every
+     node starts afresh; its step takes nothing out;
+   - **trained:** it trained a batch there, whose payload the verifier kept
+     with every other.
+5. **The replay.** It replays round `h` on the node's batch, and judges the
+   payload against the replay as it judges a first step: by the run's band,
+   on the distance or, for 1-bit runs, on churn and flips (#49).
 
 `Coordinator::is_replayable` then no longer limits what is judged; the state's
 presence does.
+
+**What the verifier cannot replay is its own gap, not the node's:**
+- it did not see the round before;
+- the node trained more than one batch there, and only the last one's values
+  are the buffer's;
+- it did not keep the node's payload of that round.
+
+The payload is skipped, not convicted.
+
+**On the same class the replay is exact.** On the CPU, a replay from the state
+a node committed to at round 3 sends exactly what the node sent there, and
+commits to the same state. Three real clients, one forging every result,
+check it end to end: replayed from the states the verifiers fetched, every
+honest payload is cleared at a band of zero and every forged one convicted.
 
 ## Continuity
 
@@ -199,6 +225,37 @@ respect to it.
   replay of round `h` from `S_h` is exact. The verifier then derives `S_{h+1}`
   from it and the public results, and compares its digest with the one the
   node committed to at `h + 1`. A mismatch convicts the node of a forged state.
+
+How the daemon checks it, with `--continuity`:
+
+1. **What the node trained in round `h`.** The verifier keeps beside the dump
+   the batches the node was assigned in the payload's own round
+   (`<dump>.round`). Only a round where it trained this batch alone leaves
+   `S_{h+1}` from this payload's step; one with several batches is skipped.
+2. **What round `h + 1` applied.** Every node keeps, beside its dumps, what it
+   applied at the start of each round (`applied-epoch{E}-step{S}.list`):
+   nothing, in an epoch's first two rounds, or the dumps of the consensus
+   payloads of round `h - 1`, in the order applied. Honest nodes apply the
+   same results, so the verifier uses its own node's list, never the
+   target's.
+3. **The replay on.** It replays round `h` from `S_h` (as above), applies
+   those results at step `h + 1` (`Trainer::optimize`, as the client does),
+   and takes the digest of the state that leaves (`Trainer::round_state_digest`).
+4. **The judgement.** It compares the digest with the one the node's payload
+   of round `h + 1` commits to, checked against the node's signature. A
+   mismatch convicts that payload, with the digest the verifier derived as
+   the replayed hash. Replayed from the state it commits to, that payload
+   would pass the band, so continuity is what catches it.
+
+The check waits for the node's next payload until the epoch is over. A node
+that verified, or did not train, at `h + 1` commits to no next state, and its
+round is not checked.
+
+On three real clients on the CPU, every round checked leaves, to the bit, the
+state the node committed to next, whether the round after applied results or
+not. On the chain's test validator, a node that trains its second round from
+its state with the buffer halved, as consistently as a replay would, passes
+the band and is convicted and slashed by continuity; the honest node is not.
 - **Across classes it is not.** The next state cannot be matched by hash
   there, and no bound is shown to hold (#48). A verifier of another class
   checks the round, not the transition.
@@ -252,7 +309,9 @@ does, and it fails against a target that serves its state on appeal.
      state, and judges it by the band. Tests run real clients on the CPU, at
      a round past the first: an honest node cleared, a forged result
      convicted;
-   - **continuity** on classes that repeat themselves: a forged state caught.
+   - **continuity** on classes that repeat themselves: a forged state caught
+     and slashed on the test validator, and every round of three real
+     clients on the CPU leaving the state its node committed to next.
 5. **A node that does not reveal**, in two:
    - **the treasurer:** the verdict's kind, the reveal window, and the crank
      passing an overturned non-reveal;
