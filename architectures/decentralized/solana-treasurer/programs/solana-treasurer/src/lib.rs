@@ -74,6 +74,14 @@ pub fn find_equivocation_bounty(run: &Pubkey) -> Pubkey {
     .0
 }
 
+pub fn find_reveal_window(run: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[state::RevealWindow::SEEDS_PREFIX, run.as_ref()],
+        &crate::ID,
+    )
+    .0
+}
+
 pub fn find_audit_verdict(run: &Pubkey, target: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[
@@ -277,6 +285,13 @@ pub mod psyche_solana_treasurer {
         params: ParticipantReleaseVerdictVoteParams,
     ) -> Result<()> {
         participant_release_verdict_vote_processor(context, params)
+    }
+
+    pub fn run_set_reveal_window(
+        context: Context<RunSetRevealWindowAccounts>,
+        params: RunSetRevealWindowParams,
+    ) -> Result<()> {
+        run_set_reveal_window_processor(context, params)
     }
 }
 
@@ -487,4 +502,19 @@ pub enum ProgramError {
 
     #[msg("The appeal's deadline has passed, so the bench can no longer rule on it")]
     AppealWindowClosed,
+
+    #[msg("A reveal window has to be longer than zero and shorter than the run's round witness time")]
+    RevealWindowInvalid,
+
+    #[msg("This run set no reveal window, so it takes no vote that a target did not reveal")]
+    RevealWindowUnset,
+
+    #[msg("The reveal window has not passed in a witness phase yet; a target did not reveal only once it has")]
+    RevealWindowOpen,
+
+    #[msg("The payload commits to no state, so there is none its trainer could have failed to reveal")]
+    NonRevealWithoutState,
+
+    #[msg("A vote that the target did not reveal replayed nothing, so its replayed hash is zero")]
+    NonRevealReplayed,
 }

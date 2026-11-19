@@ -5,6 +5,7 @@ use crate::logic::bounty_amount;
 use crate::state::AuditVerdict;
 use crate::state::Participant;
 use crate::state::Run;
+use crate::state::VerdictKind;
 use crate::state::VerdictStatus;
 use crate::state::coordinator_slashed_points;
 use crate::ProgramError;
@@ -97,9 +98,16 @@ pub fn run_slash_losing_verifier_processor(
     };
 
     // A vote for other evidence than the overturned conviction was not part of
-    // its quorum, so the overturn costs it nothing. It is passed, and its hold
-    // on the voter's bond closed unless a release already closed it.
-    if context.accounts.audit_verdict.dissents(position) {
+    // its quorum, so the overturn costs it nothing. Nor does an overturned
+    // non-reveal cost its voters: whether a target revealed cannot be proven
+    // either way, and a target could otherwise withhold its state from the
+    // verifiers and serve it to the bench, to charge them
+    // (wienerlabs/leviathan-net#89). Either is passed, and its hold on the
+    // voter's bond closed unless a release already closed it.
+    let verdict = &context.accounts.audit_verdict;
+    let passed =
+        verdict.dissents(position) || verdict.kind == VerdictKind::NonReveal;
+    if passed {
         if !context.accounts.audit_verdict.vote_released(position) {
             context.accounts.loser_participant.close_verdict_vote()?;
         }
@@ -108,7 +116,7 @@ pub fn run_slash_losing_verifier_processor(
             .audit_verdict
             .settle_dissenting_vote(position);
         msg!(
-            "slash_losing_verifier: voter={} voted for other evidence, not charged",
+            "slash_losing_verifier: voter={} voted for other evidence, or that the target did not reveal, not charged",
             params.loser
         );
         return Ok(());

@@ -17,6 +17,9 @@ use crate::state::Participant;
 use crate::state::Run;
 use crate::state::VerdictStatus;
 use crate::state::VoteEvidence;
+use crate::state::check_non_reveal_vote;
+use crate::state::RevealWindow;
+use crate::state::VerdictKind;
 use crate::state::MAX_VERDICT_VOTERS;
 use crate::state::Landing;
 use crate::state::coordinator_slashed_points;
@@ -120,6 +123,16 @@ pub struct RunSubmitAuditVerdictAccounts<'info> {
         bump,
     )]
     pub verifier_verdict: UncheckedAccount<'info>,
+
+    /// CHECK: the run's reveal window, pinned to its PDA by the seeds below
+    /// and read only after this checks that it exists and belongs to this
+    /// program. A vote that the target did not reveal is taken only once it
+    /// has passed (wienerlabs/leviathan-net#89).
+    #[account(
+        seeds = [RevealWindow::SEEDS_PREFIX, run.key().as_ref()],
+        bump,
+    )]
+    pub reveal_window: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -133,6 +146,10 @@ pub struct RunSubmitAuditVerdictParams {
     /// target's p2p key signing its commitment hash.
     pub evidence: CommitmentEvidence,
     pub replayed_hash: [u8; 32],
+    /// What the vote convicts the target of: a replay outside the band, or a
+    /// state it did not reveal within the run's reveal window
+    /// (wienerlabs/leviathan-net#89).
+    pub kind: VerdictKind,
 }
 
 pub fn run_submit_audit_verdict_processor(
@@ -221,6 +238,26 @@ pub fn run_submit_audit_verdict_processor(
         // earlier one names work whose epoch was already charged.
         if !params.evidence.is_from_current_epoch(coordinator) {
             return err!(ProgramError::CommitmentOutsideEpoch);
+        }
+
+        // A vote that the target did not reveal is taken only once the run's
+        // reveal window has passed in a witness phase, for a payload that
+        // commits to a state (wienerlabs/leviathan-net#89).
+        if params.kind == VerdictKind::NonReveal {
+            let window = context.accounts.reveal_window.to_account_info();
+            let reveal_seconds = RevealWindow::from_pda_account(
+                window.owner,
+                &window.try_borrow_data()?,
+            )?
+            .map(|window| window.reveal_seconds);
+            check_non_reveal_vote(
+                &params.evidence,
+                &params.replayed_hash,
+                reveal_seconds,
+                coordinator.run_state,
+                coordinator.run_state_start_unix_timestamp,
+                Clock::get()?.unix_timestamp,
+            )?;
         }
 
         // A committee has to be big enough for agreement to mean something.
@@ -329,6 +366,7 @@ pub fn run_submit_audit_verdict_processor(
                 batch_start: params.batch_start,
                 batch_end: params.batch_end,
                 replayed_hash: params.replayed_hash,
+                kind: params.kind,
             },
         );
         context.accounts.verifier_participant.open_verdict_vote()?;

@@ -197,6 +197,7 @@ mod tests {
     use super::*;
     use anchor_lang::prelude::Pubkey;
     use psyche_solana_treasurer::state::CommitmentEvidence;
+    use psyche_solana_treasurer::state::VerdictKind;
 
     fn verdict(target: u8, epoch: u16, round_height: u32, status: VerdictStatus) -> AuditVerdict {
         AuditVerdict {
@@ -229,6 +230,7 @@ mod tests {
             voters: vec![],
             appeal_voters: vec![],
             vote_commitments: vec![],
+            kind: VerdictKind::Replay,
         }
     }
 

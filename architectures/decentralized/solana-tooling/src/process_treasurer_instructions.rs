@@ -24,6 +24,11 @@ use psyche_solana_treasurer::accounts::RunSlashAccounts;
 use psyche_solana_treasurer::accounts::RunUpdateAccounts;
 use psyche_solana_treasurer::find_equivocation_bounty;
 use psyche_solana_treasurer::find_participant;
+use psyche_solana_treasurer::find_reveal_window;
+use psyche_solana_treasurer::accounts::RunSetRevealWindowAccounts;
+use psyche_solana_treasurer::instruction::RunSetRevealWindow;
+use psyche_solana_treasurer::logic::RunSetRevealWindowParams;
+use psyche_solana_treasurer::state::VerdictKind;
 use psyche_solana_treasurer::find_run;
 use psyche_solana_treasurer::find_slash_report;
 use psyche_solana_treasurer::instruction::ParticipantJoinRun;
@@ -293,6 +298,39 @@ pub fn run_submit_audit_verdict_instruction(
     evidence: CommitmentEvidence,
     replayed_hash: [u8; 32],
 ) -> Instruction {
+    run_submit_verdict_instruction(
+        payer,
+        verifier,
+        run,
+        coordinator_account,
+        run_id,
+        target,
+        target_index,
+        batch_start,
+        batch_end,
+        evidence,
+        replayed_hash,
+        VerdictKind::Replay,
+    )
+}
+
+/// The vote of `run_submit_audit_verdict_instruction`, convicting the target
+/// of `kind` (wienerlabs/leviathan-net#89).
+#[allow(clippy::too_many_arguments)]
+pub fn run_submit_verdict_instruction(
+    payer: &Pubkey,
+    verifier: &Pubkey,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    target: &Pubkey,
+    target_index: u64,
+    batch_start: u64,
+    batch_end: u64,
+    evidence: CommitmentEvidence,
+    replayed_hash: [u8; 32],
+    kind: VerdictKind,
+) -> Instruction {
     let coordinator_instance = find_coordinator_instance(run_id);
     let verifier_participant = find_participant(run, verifier);
     let audit_verdict = find_audit_verdict(run, target);
@@ -308,6 +346,7 @@ pub fn run_submit_audit_verdict_instruction(
         system_program: system_program::ID,
         instructions: sysvar::instructions::ID,
         verifier_verdict: find_audit_verdict(run, verifier),
+        reveal_window: find_reveal_window(run),
     };
     Instruction {
         accounts: accounts.to_account_metas(None),
@@ -319,6 +358,7 @@ pub fn run_submit_audit_verdict_instruction(
                 batch_end,
                 evidence,
                 replayed_hash,
+                kind,
             },
         }
         .data(),
@@ -360,6 +400,79 @@ pub async fn process_treasurer_run_submit_audit_verdict(
             &[commitment.proof_instruction(), instruction],
             &[verifier],
         )
+        .await?;
+    Ok(())
+}
+
+/// `verifier` votes that `target` did not reveal, within the run's reveal
+/// window, the state `commitment`, a payload it signed, commits to
+/// (wienerlabs/leviathan-net#89). Nothing was replayed, so the vote's
+/// replayed hash is zero.
+#[allow(clippy::too_many_arguments)]
+pub async fn process_treasurer_run_submit_non_reveal_verdict(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    verifier: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    run_id: &str,
+    target: &Pubkey,
+    target_index: u64,
+    commitment: &SignedCommitment,
+) -> Result<()> {
+    let instruction = run_submit_verdict_instruction(
+        &payer.pubkey(),
+        &verifier.pubkey(),
+        run,
+        coordinator_account,
+        run_id,
+        target,
+        target_index,
+        commitment.batch_start,
+        commitment.batch_end,
+        commitment.evidence,
+        [0; 32],
+        VerdictKind::NonReveal,
+    );
+    endpoint
+        .process_instructions_with_signers(
+            payer,
+            &[commitment.proof_instruction(), instruction],
+            &[verifier],
+        )
+        .await?;
+    Ok(())
+}
+
+/// `main_authority` sets how long a trainer has, into a round's witness
+/// phase, to reveal a state before a non-reveal can be voted, which has to be
+/// shorter than the run's round witness time (wienerlabs/leviathan-net#89).
+pub async fn process_treasurer_run_set_reveal_window(
+    endpoint: &mut ToolboxEndpoint,
+    payer: &Keypair,
+    main_authority: &Keypair,
+    run: &Pubkey,
+    coordinator_account: &Pubkey,
+    reveal_seconds: u64,
+) -> Result<()> {
+    let accounts = RunSetRevealWindowAccounts {
+        payer: payer.pubkey(),
+        main_authority: main_authority.pubkey(),
+        run: *run,
+        coordinator_account: *coordinator_account,
+        reveal_window: find_reveal_window(run),
+        system_program: system_program::ID,
+    };
+    let instruction = Instruction {
+        accounts: accounts.to_account_metas(None),
+        data: RunSetRevealWindow {
+            params: RunSetRevealWindowParams { reveal_seconds },
+        }
+        .data(),
+        program_id: psyche_solana_treasurer::ID,
+    };
+    endpoint
+        .process_instruction_with_signers(payer, instruction, &[main_authority])
         .await?;
     Ok(())
 }

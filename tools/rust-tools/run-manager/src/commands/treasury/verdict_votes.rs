@@ -379,7 +379,7 @@ mod tests {
     use super::*;
     use bytemuck::Zeroable;
     use psyche_coordinator::RunState;
-    use psyche_solana_treasurer::state::{CommitmentEvidence, EjectionCharge};
+    use psyche_solana_treasurer::state::{CommitmentEvidence, EjectionCharge, VerdictKind};
 
     fn verdict(status: VerdictStatus, voters: &[Pubkey], round_height: u32) -> AuditVerdict {
         AuditVerdict {
@@ -412,6 +412,7 @@ mod tests {
             voters: voters.to_vec(),
             appeal_voters: vec![Pubkey::new_unique()],
             vote_commitments: vec![[0u8; 32]; voters.len()],
+            kind: VerdictKind::Replay,
         }
     }
 

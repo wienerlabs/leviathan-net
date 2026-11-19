@@ -153,12 +153,22 @@ reaches it at that key.
   whole. It writes it only if the commitment record beside the dump names that
   state: a payload that lost its name to another the committer signed for the
   batch is kept as an equivocation, not under that name.
-- **The reveal window.** How long a trainer has before verifiers may vote
-  that it did not reveal is `reveal_seconds`, sized as
-  `state_bytes / reveal_rate + slack`. It is not the final round's audit
-  window: a 1B state at 100 Mbit/s takes over five minutes. The coordinator's
-  config has no room for it, so it is the treasurer's, beside the run, like
-  the equivocation bounty: the treasurer is what takes the vote (part 5).
+- **The reveal window.** How long a trainer has, into a round's witness
+  phase, before verifiers may vote that it did not reveal is
+  `reveal_seconds`, sized as `state_bytes / reveal_rate + slack`. The
+  coordinator's config has no room for it, so it is the treasurer's, in an
+  account beside the run (`RevealWindow`, set by `run_set_reveal_window`),
+  like the equivocation bounty: the treasurer is what takes the vote.
+  - **It closes within the witness phase.** The treasurer takes a vote only
+    from the committee of the round under way, so a window the witness phase
+    cannot hold could never be voted on. `run_set_reveal_window` refuses a
+    window of zero, or of the run's `round_witness_time` or more. A run with a
+    large state gives its rounds a witness phase long enough: a 1B state at
+    100 Mbit/s takes over five minutes.
+  - **It counts from the witness phase.** Every payload a vote can cite was
+    broadcast before the witness phase it is cast in began, and its trainer
+    serves the state from its broadcast on. A trainer has at least
+    `reveal_seconds` before a non-reveal can be voted.
 
 ## Replaying a later round
 
@@ -264,8 +274,14 @@ let verifiers claim a non-reveal falsely.
   rate. A cheaper penalty would make refusing to reveal the way out of every
   audit.
 - **Verifiers vote it as they vote fraud.** It needs a quorum of the round's
-  committee, within the reveal window. The verdict records that the vote is
-  for a missing state, not for a replay.
+  committee, cast in a witness phase (or the cooldown after the epoch's final
+  round) once the reveal window has passed in it, on a payload that commits
+  to a state. The vote's replayed hash is zero.
+- **The verdict records what it convicts of.** `AuditVerdict.kind` is
+  `Replay` or `NonReveal`. Votes are counted by a key that keeps the two
+  apart even on the same payload: the commitment hash for a replay, a hash of
+  it under a domain of its own for a non-reveal. So neither completes the
+  other's quorum.
 - **The target answers by revealing.** It challenges the verdict and serves
   the state to the bench. A bench that fetches the state within its own
   window overturns the verdict, and the state then goes through the ordinary
@@ -273,7 +289,7 @@ let verifiers claim a non-reveal falsely.
 - **An overturned non-reveal costs its voters nothing.** A non-reveal cannot
   be proven either way, and a target could otherwise withhold from the
   verifiers and serve the bench, to charge them. The losing-verifier crank
-  passes those votes, as it passes a dissent.
+  passes those votes, as it passes a dissent, and the bench is owed nothing.
 
 So a false non-reveal claim needs a colluding quorum, as a false fraud vote
 does, and it fails against a target that serves its state on appeal.
@@ -296,7 +312,9 @@ does, and it fails against a target that serves its state on appeal.
    - **continuity** on classes that repeat themselves: a forged state caught
      and slashed on the test validator, and every round of three real
      clients on the CPU leaving the state its node committed to next.
-5. **A node that does not reveal:** the verdict's kind, the reveal window,
-   and the crank passing an overturned non-reveal. Then `ERROR_FEEDBACK.md`,
-   the README and `FIRST_RUN.md` say later rounds are checked, and #89 and #48
-   close.
+5. **A node that does not reveal**, in two:
+   - **the treasurer:** the verdict's kind, the reveal window, and the crank
+     passing an overturned non-reveal;
+   - **the daemon** votes a non-reveal for a payload it audits whose state
+     did not arrive in the window. Then `ERROR_FEEDBACK.md`, the README and
+     `FIRST_RUN.md` say later rounds are checked, and #89 and #48 close.

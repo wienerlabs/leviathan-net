@@ -183,6 +183,7 @@ mod tests {
     use crate::state::CommitmentEvidence;
     use crate::state::ConvictionCharge;
     use crate::state::EjectionCharge;
+    use crate::state::VerdictKind;
 
     fn participant(bond: u64, settled_points: u64) -> Participant {
         Participant {
@@ -230,6 +231,7 @@ mod tests {
             voters: vec![],
             appeal_voters: vec![],
             vote_commitments: vec![],
+            kind: VerdictKind::Replay,
         };
         verdict.land_ejection(EjectionCharge {
             epoch_start: 1_000,

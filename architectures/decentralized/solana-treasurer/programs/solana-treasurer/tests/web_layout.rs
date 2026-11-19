@@ -9,6 +9,7 @@
 
 use psyche_solana_treasurer::state::AuditVerdict;
 use psyche_solana_treasurer::state::Participant;
+use psyche_solana_treasurer::state::RevealWindow;
 use psyche_solana_treasurer::state::Run;
 use psyche_solana_treasurer::state::SlashReport;
 
@@ -45,8 +46,16 @@ fn slash_report_is_the_length_it_is_allocated_at() {
     assert_eq!(SlashReport::space_with_discriminator(), 134);
 }
 
+/// A new account the dashboard does not decode yet: how long a run's
+/// trainers have to reveal a state before a non-reveal can be voted
+/// (wienerlabs/leviathan-net#89). Its run sits at offset 9.
+#[test]
+fn reveal_window_is_the_length_it_is_allocated_at() {
+    assert_eq!(RevealWindow::space_with_discriminator(), 49);
+}
+
 /// Mirrors `VERDICT_LAYOUT_BY_SIZE` in the same file, which stops at 4328
-/// (`appealsWithDeadline`). Five generations followed it:
+/// (`appealsWithDeadline`). Six generations followed it:
 ///
 /// - 4368 records the payload the target signed: `evidence` (step u32,
 ///   trainer nonce u32, results digest 32 bytes) sits between `batch_end` and
@@ -70,14 +79,19 @@ fn slash_report_is_the_length_it_is_allocated_at() {
 ///   convicts on, one 32-byte entry per voter, so votes are counted per payload
 ///   rather than refused when the first vote cited another. It comes after
 ///   `appeal_voters`, so every field a 4418 decoder reads is where it was.
-/// - 6503, this one, ends `evidence` with the state the target trained the
-///   payload from (wienerlabs/leviathan-net#89): `state_committed` (one byte)
-///   and `state_digest` (32 bytes, zeros when not committed), before
+/// - 6503 ends `evidence` with the state the target trained the payload from
+///   (wienerlabs/leviathan-net#89): `state_committed` (one byte) and
+///   `state_digest` (32 bytes, zeros when not committed), before
 ///   `pending_since_unix`. Every field after the evidence moves 33 bytes.
+/// - 6504, this one, appends `kind` after `vote_commitments`: one byte, 0 for
+///   a conviction on a replay, 1 for a target that did not reveal its state
+///   (wienerlabs/leviathan-net#89). Each entry of `vote_commitments` is now
+///   the vote's key, the commitment hash for a replay and a hash of it for a
+///   non-reveal. Every field a 6503 decoder reads is where it was.
 ///
-/// A decoder has to learn 6503 before it reads accounts from the deployment
+/// A decoder has to learn 6504 before it reads accounts from the deployment
 /// carrying it.
 #[test]
 fn audit_verdict_is_the_length_the_web_decoder_expects() {
-    assert_eq!(AuditVerdict::space_with_discriminator(), 6503);
+    assert_eq!(AuditVerdict::space_with_discriminator(), 6504);
 }

@@ -167,6 +167,15 @@ nothing. Copying an honest reporter's proof no longer works: a reporter commits
 to its proof a slot before it reveals it (`docs/DISPUTE_DESIGN.md`,
 wienerlabs/leviathan-net#72, #92).
 
+Set a reveal window with `run_set_reveal_window` once a run audits later
+rounds (`docs/ROUND_AUDIT.md`, wienerlabs/leviathan-net#89). It is how long a
+trainer has, into a round's witness phase, to reveal the state a payload
+commits to before verifiers may vote that it did not, sized as
+`state_bytes / reveal_rate + slack`. It has to be shorter than the run's
+`round_witness_time`, which the chain checks when it is set: give a run with a
+large state a witness phase long enough. A run that set none takes no
+non-reveal vote, and an overturned non-reveal costs its voters nothing.
+
 ## Incident response
 
 ### A node cannot join
@@ -252,6 +261,8 @@ The treasurer's own accounts grow the same way:
 | wienerlabs/leviathan-net#89: evidence gained the state the target trained from (`state_committed`, `state_digest`) | `AuditVerdict` | 6503 |
 | wienerlabs/leviathan-net#92: new, one per proof of equivocation a reporter committed to and has not revealed | `EquivocationCommitment` | 113 |
 | wienerlabs/leviathan-net#92: new, one per run that set an equivocation bounty | `EquivocationBounty` | 43 |
+| wienerlabs/leviathan-net#89: gained `kind`, whether the votes convict on a replay or on a state not revealed | `AuditVerdict` | 6504 |
+| wienerlabs/leviathan-net#89: new, one per run that set a reveal window | `RevealWindow` | 49 |
 
 An older, shorter account does not deserialize with the new layout, so the treasurer that carries them deploys under a new id too.
 

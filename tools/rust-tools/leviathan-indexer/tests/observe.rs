@@ -22,6 +22,7 @@ use psyche_solana_treasurer::logic::MIN_VERIFIER_COMMITTEE;
 use psyche_solana_treasurer::state::AuditVerdict;
 use psyche_solana_treasurer::state::CommitmentEvidence;
 use psyche_solana_treasurer::state::Run;
+use psyche_solana_treasurer::state::VerdictKind;
 use psyche_solana_treasurer::state::VerdictStatus;
 
 const EARNING_RATE: u64 = 900;
@@ -164,6 +165,7 @@ fn verdict(target: u8, epoch: u16, round_height: u32, status: VerdictStatus) -> 
         voters: vec![],
         appeal_voters: vec![],
         vote_commitments: vec![],
+        kind: VerdictKind::Replay,
     }
 }
 
