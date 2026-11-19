@@ -291,6 +291,7 @@ enum ParallelAssignment {
     PreviousResults {
         previous: Vec<DistroResult>,
     },
+    StateDigest,
 }
 
 #[derive(Debug)]
@@ -324,6 +325,9 @@ enum ParallelResult {
     },
     PreviousResults {
         results: Result<Vec<DistroResult>, String>,
+    },
+    StateDigest {
+        digest: Result<Option<[u8; 32]>, String>,
     },
 }
 
@@ -442,6 +446,21 @@ impl Trainer {
             #[cfg(feature = "python")]
             Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
                 "say how long its state is",
+            )),
+        }
+    }
+
+    /// The digest of the state this trainer holds now (`round_state_digest`):
+    /// what it would commit to if a round started from it. None if its
+    /// optimizer keeps no error feedback (wienerlabs/leviathan-net#89).
+    pub fn round_state_digest(
+        &mut self,
+    ) -> Result<Option<[u8; 32]>, TrainerThreadCommunicationError> {
+        match self {
+            Trainer::Local(local_trainer) => local_trainer.round_state_digest(),
+            #[cfg(feature = "python")]
+            Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
+                "hash the state it holds",
             )),
         }
     }
@@ -586,6 +605,9 @@ pub enum TrainerThreadCommunicationError {
 
     #[error("A model thread could not read a previous result off its buffer: {0}")]
     PreviousResults(String),
+
+    #[error("A model thread could not hash the state it holds: {0}")]
+    StateDigest(String),
 
     #[cfg(feature = "python")]
     #[error("Python error: {0}")]
@@ -1063,6 +1085,42 @@ impl LocalTrainer {
         match first {
             Some(Ok(len)) => Ok(len),
             Some(Err(error)) => Err(TrainerThreadCommunicationError::RoundStateLen(error)),
+            None => Err(TrainerThreadCommunicationError::RecvResult),
+        }
+    }
+
+    /// The digest of the state the model threads hold now, as the first one
+    /// hashes it (`round_state_digest`); the others of a sharded model join
+    /// the gathers it needs.
+    pub fn round_state_digest(
+        &mut self,
+    ) -> Result<Option<[u8; 32]>, TrainerThreadCommunicationError> {
+        self.barrier.reset();
+        for (tx, _) in &self.models {
+            tx.send(ParallelAssignment::StateDigest)
+                .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
+        }
+        let mut first = None;
+        for (_, rx) in &self.models {
+            match rx
+                .recv()
+                .map_err(|_| TrainerThreadCommunicationError::RecvResult)?
+            {
+                ParallelResult::StateDigest { digest } => {
+                    if first.is_none() {
+                        first = Some(digest);
+                    }
+                }
+                result => {
+                    return Err(TrainerThreadCommunicationError::UnexpectedResult(format!(
+                        "{result:?}"
+                    )));
+                }
+            }
+        }
+        match first {
+            Some(Ok(digest)) => Ok(digest),
+            Some(Err(error)) => Err(TrainerThreadCommunicationError::StateDigest(error)),
             None => Err(TrainerThreadCommunicationError::RecvResult),
         }
     }
@@ -1614,6 +1672,36 @@ impl LocalTrainer {
                     };
                     if submission
                         .send(ParallelResult::SetErrorFeedbackKind { error })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ParallelAssignment::StateDigest) => {
+                    let digest = match &optimizer {
+                        Optimizer::Distro { optimizer, .. } => match index {
+                            0 => round_state_digest(model.as_ref(), optimizer)
+                                .map(Some)
+                                .map_err(|error| error.to_string()),
+                            _ => {
+                                if model.variables().any(|variable| variable.is_sharded()) {
+                                    if let Err(error) = write_round_state(
+                                        &mut std::io::sink(),
+                                        model.as_ref(),
+                                        optimizer,
+                                    ) {
+                                        error!(
+                                            "Cannot gather the state this trainer holds: {error}"
+                                        );
+                                    }
+                                }
+                                Ok(None)
+                            }
+                        },
+                        Optimizer::Torch { .. } | Optimizer::Null => Ok(None),
+                    };
+                    if submission
+                        .send(ParallelResult::StateDigest { digest })
                         .is_err()
                     {
                         return;

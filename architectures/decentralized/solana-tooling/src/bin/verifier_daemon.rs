@@ -106,6 +106,14 @@ struct Args {
     audit_assigned: bool,
     #[arg(long, default_value_t = false)]
     verdict: bool,
+    /// Also check that each round replayed from its revealed state leaves
+    /// the state its trainer's next round committed to, and convict that
+    /// next round's payload if it does not (wienerlabs/leviathan-net#89).
+    /// A replay holds a state to the bit only in the class of hardware and
+    /// the dtype the run trains in: set it only for a run known to train in
+    /// this daemon's (`docs/ROUND_AUDIT.md`).
+    #[arg(long, default_value_t = false)]
+    continuity: bool,
 
     /// Serve what each pass judged at http://<address>/metrics for Prometheus:
     /// contributions cleared, fraud found, convictions submitted, and
@@ -388,6 +396,7 @@ async fn main() -> Result<()> {
         audit_assigned: args.audit_assigned,
         dry_run: args.dry_run,
         verdict_mode: args.verdict,
+        continuity: args.continuity,
     };
 
     println!(
@@ -405,12 +414,13 @@ async fn main() -> Result<()> {
         config.dry_run
     );
     println!(
-        "[verifier-daemon] action={}",
+        "[verifier-daemon] action={} continuity={}",
         if config.verdict_mode {
             "submit-verdict (bonded committee vote)"
         } else {
             "slash (single authority)"
-        }
+        },
+        config.continuity
     );
 
     let mut exporter = match args.metrics_listen {

@@ -15,9 +15,10 @@ use psyche_modeling::{
     TrainerThreadCommunicationError,
 };
 use psyche_network::{
-    CommitmentRecord, Endpoint, EquivocationRecord, Hash, RoundStates, SerializeDistroResultError,
-    SerializedDistroResult, TransmittableDistroResult, commitment_record_path,
-    distro_results_to_bytes, equivocation_record_path, payload_dump_name,
+    AppliedResults, CommitmentRecord, Endpoint, EquivocationRecord, Hash, RoundStates,
+    SerializeDistroResultError, SerializedDistroResult, TransmittableDistroResult,
+    applied_results_path, commitment_record_path, distro_results_to_bytes,
+    equivocation_record_path, payload_dump_name,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -564,17 +565,29 @@ impl TrainingStepMetadata {
         previous_round: &mut RoundState,
         current_round: &mut RoundState,
     ) -> Result<JoinHandle<Result<Vec<Trainer>, ApplyError>>, ApplyError> {
+        // What this node applies at this step, kept beside its dumps for a
+        // verifier's continuity check (wienerlabs/leviathan-net#89).
+        let applied_record = self.write_gradients_dir.clone().map(|dir| {
+            applied_results_path(&dir, state.epoch_state.start_timestamp, state.progress.step)
+        });
         if current_round.height == 0 {
             // the first TWO training step of each epoch has no apply phase.
             // but, because we call this once with the default initalized RoundState (round 0)
             // and a second time (when transitioning from round 0 -> round 1), this check will skip
             // the two phases
             trace!("Skipping early apply");
-            return Ok(tokio::task::spawn(async move { Ok(trainers) }));
+            return Ok(tokio::task::spawn(async move {
+                if let Some(path) = applied_record {
+                    keep_applied_record(&path, AppliedResults::Skipped).await;
+                }
+                Ok(trainers)
+            }));
         }
 
         let apply_start = Instant::now();
         let step = state.progress.step;
+        // The round whose results are applied, as its payloads' dumps name it.
+        let (applied_epoch_start, applied_step) = (previous_round.epoch_start, previous_round.step);
         let witness_quorum = state.witness_quorum(
             state
                 .previous_round()
@@ -623,6 +636,7 @@ impl TrainingStepMetadata {
         Ok(tokio::task::spawn(async move {
                 let payloads = payloads.clone();
                 let mut distro_results: Vec<Vec<DistroResult>> = Vec::new();
+                let mut applied_dumps: Vec<String> = Vec::new();
 
                 trace!("Have commitments for batches {:?}", commitments.keys().collect::<Vec<_>>());
                 trace!("Have payloads for hashes {:?}", payloads.lock().unwrap().keys().collect::<Vec<_>>());
@@ -662,6 +676,7 @@ impl TrainingStepMetadata {
                     };
                     trace!("Consensus commitment for batch {batch_id}: {consensus:?}");
 
+                    let committer = batch_commitments[consensus].0;
                     let (commitment, result) = &batch_commitments[consensus].1;
                     let payload_remove_result = payloads.lock().unwrap().remove(&result.ticket.hash());
                     let maybe_results: Result<(Vec<DistroResult>, u32), DeserializeError> = match payload_remove_result {
@@ -699,12 +714,21 @@ impl TrainingStepMetadata {
                                 info!("Skipping apply of batch {batch_id}, trainer warming up ({trainer_nonce}/{cold_start_warmup_steps})");
                             } else {
                                 distro_results.push(results);
+                                applied_dumps.push(payload_dump_name(
+                                    &bs58::encode(committer.signer()).into_string(),
+                                    applied_epoch_start,
+                                    applied_step,
+                                    batch_id,
+                                ));
                             }
                         }
                         Err(err) => warn!("DESYNC: Got the following error when deserializing results for commitment 0x{}: {}", hex::encode(commitment.data_hash), err),
                     }
                 }
 
+                if let Some(path) = &applied_record {
+                    keep_applied_record(path, AppliedResults::Applied(applied_dumps)).await;
+                }
                 event!(train::ApplyDistroResultsStart);
                 let futures: Vec<JoinHandle<std::result::Result<Trainer, ApplyDistroResultError>>> =
                     trainers
@@ -884,6 +908,24 @@ fn inject_fake_delta(results: Vec<DistroResult>) -> Vec<DistroResult> {
             result
         })
         .collect()
+}
+
+/// Keeps at `path`, whole, what this node applied at the start of a round
+/// (`AppliedResults`). One that cannot be kept is logged: it only takes a
+/// continuity check off a verifier.
+async fn keep_applied_record(path: &Path, applied: AppliedResults) {
+    let (Some(dir), Some(fname)) = (path.parent(), path.file_name()) else {
+        warn!(path = %path.display(), "Cannot keep what this node applied: not a file's path");
+        return;
+    };
+    if let Err(err) = tokio::fs::create_dir_all(dir).await {
+        warn!(path = %path.display(), "Cannot keep what this node applied: {err}");
+        return;
+    }
+    let fname = fname.to_string_lossy();
+    if let Err(err) = write_whole(dir, &fname, applied.encode().as_bytes()).await {
+        warn!(path = %path.display(), "Cannot keep what this node applied: {err}");
+    }
 }
 
 /// Keeps the state the round at `step` of the epoch that started at

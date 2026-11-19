@@ -10,7 +10,7 @@ use psyche_coordinator::{Coordinator, select_audits_for_current_round};
 use psyche_core::{BatchId, NodeIdentity};
 use psyche_network::{
     CommitmentRecord, Endpoint, EndpointId, PreviousRound, commitment_record_path,
-    previous_round_path, reveal_round_state, revealed_state_path,
+    previous_round_path, reveal_round_state, revealed_state_path, round_training_path,
 };
 
 use super::round_state::RoundState;
@@ -58,6 +58,10 @@ pub(crate) struct StateToReveal {
     /// too: a replay needs it to know what the trainer's step took out of its
     /// buffer first.
     pub previous: PreviousRound,
+    /// What the trainer trained in the payload's own round, kept beside it
+    /// as well: a continuity check needs to know the payload's step is all
+    /// the trainer's next state follows from.
+    pub trained: PreviousRound,
     pub retry_every: Duration,
     pub time_to_reveal: Duration,
 }
@@ -99,6 +103,21 @@ impl RoundDraw {
             epoch_start: round.epoch_start,
             data_assignments: round.data_assignments.clone(),
         }
+    }
+}
+
+/// The batches `trainer` was assigned in `round`, the round of a payload of
+/// its this node audits. Unknown if the draw this node kept assigns it none.
+pub(crate) fn round_training(round: &RoundState, trainer: &NodeIdentity) -> PreviousRound {
+    let batches: Vec<BatchId> = round
+        .data_assignments
+        .iter()
+        .filter(|(_, assignee)| *assignee == trainer)
+        .map(|(batch, _)| *batch)
+        .collect();
+    match batches.is_empty() {
+        true => PreviousRound::Unknown,
+        false => PreviousRound::Trained(batches),
     }
 }
 
@@ -157,12 +176,20 @@ pub(crate) async fn reveal_audited_state(reveal: StateToReveal) {
         return;
     }
     // Beside the dump before the state is, so a reader that finds the state
-    // finds this too.
+    // finds these too.
     let previous_path = previous_round_path(&reveal.dump);
     if let Err(err) = write_whole(&previous_path, reveal.previous.encode().as_bytes()).await {
         warn!(
             dump,
             "Cannot keep what an audited payload's trainer did the round before: {err}"
+        );
+        return;
+    }
+    let trained_path = round_training_path(&reveal.dump);
+    if let Err(err) = write_whole(&trained_path, reveal.trained.encode().as_bytes()).await {
+        warn!(
+            dump,
+            "Cannot keep what an audited payload's trainer trained in its round: {err}"
         );
         return;
     }
@@ -219,6 +246,29 @@ mod tests {
             data_assignments: assignments.iter().copied().collect::<BTreeMap<_, _>>(),
             ..RoundState::new()
         }
+    }
+
+    /// The batches the trainer was assigned in its payload's own round, and
+    /// only its own; none assigned is a draw this node does not know.
+    #[test]
+    fn what_a_trainer_trained_in_its_round_is_its_own_batches() {
+        let (trainer, other) = (identity(1), identity(2));
+        let one = round(5, 90, &[(batch(0), other), (batch(4), trainer)]);
+        assert_eq!(
+            round_training(&one, &trainer),
+            PreviousRound::Trained(vec![batch(4)])
+        );
+        let two = round(
+            5,
+            90,
+            &[(batch(0), trainer), (batch(4), trainer), (batch(8), other)],
+        );
+        assert_eq!(
+            round_training(&two, &trainer),
+            PreviousRound::Trained(vec![batch(0), batch(4)])
+        );
+        let none = round(5, 90, &[(batch(0), other)]);
+        assert_eq!(round_training(&none, &trainer), PreviousRound::Unknown);
     }
 
     /// The batches the trainer was assigned in the round before, and only

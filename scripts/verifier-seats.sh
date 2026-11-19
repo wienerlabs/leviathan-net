@@ -11,7 +11,9 @@
 # the payload it audits commits to (wienerlabs/leviathan-net#89): every one
 # has to be revealed, and be the state its payload commits to. One of the
 # clients forges every result it sends; replayed from the states revealed,
-# its payloads have to be convicted and every other one cleared.
+# its payloads have to be convicted and every other one cleared. Each round
+# replayed whose trainer trained the next one too has to leave, once what the
+# next round applied is applied, the state that next round committed to.
 #
 #   cargo build --bin psyche-centralized-server --bin psyche-centralized-client \
 #     --bin check-revealed-states --bin audit-revealed-rounds
@@ -85,5 +87,5 @@ echo "$LABEL every verifier fetched the state each payload it audited commits to
 # exact replay to: the forger convicted, everyone else cleared.
 echo "$LABEL replaying the audited rounds from their revealed states"
 "$BIN/audit-revealed-rounds" --run-config "$RUN_CONFIG" --dumps "${dumps[@]}" \
-    --forged-by "$WORK/dumps$FORGER" --churn-band 0 --flip-band 0
-echo "$LABEL passed: every forged payload convicted and every honest one cleared, replayed from the states their trainers revealed"
+    --forged-by "$WORK/dumps$FORGER" --churn-band 0 --flip-band 0 --continuity
+echo "$LABEL passed: every forged payload convicted and every honest one cleared, replayed from the states their trainers revealed, and each round checked left the state its trainer's next round committed to"

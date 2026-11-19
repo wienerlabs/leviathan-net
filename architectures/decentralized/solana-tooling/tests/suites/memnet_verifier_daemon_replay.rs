@@ -64,9 +64,9 @@ const RUN_ID: &str = "Leviathan daemon replay slash";
 const RUN_ID_MOVED: &str = "Leviathan replay moved seat";
 const RUN_ID_REVEALED: &str = "Leviathan replay revealed state";
 const BOND: u64 = 500;
-const SLASHING_RATE: u64 = 200;
+pub(super) const SLASHING_RATE: u64 = 200;
 
-fn scratch(tag: &str) -> PathBuf {
+pub(super) fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("levdaemonreplay-{}-{}", std::process::id(), tag));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -75,7 +75,7 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// The model of the genesis rehearsal, which this run trains: a 1-bit DisTrO
 /// payload under a Cosine warmup, as every Leviathan configuration has.
-fn genesis_model() -> LLM {
+pub(super) fn genesis_model() -> LLM {
     read_run_model(std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../config/leviathan/genesis-rehearsal.toml"
@@ -97,7 +97,7 @@ fn batch_data(llm: &LLM) -> Vec<BatchDataCPU> {
 
 /// A trainer built from the run's model, as the client and the daemon build
 /// one.
-fn trainer_for(llm: &LLM) -> (Trainer, ReplayTrainerConfig) {
+pub(super) fn trainer_for(llm: &LLM) -> (Trainer, ReplayTrainerConfig) {
     let config = ReplayTrainerConfig::for_run(
         llm,
         checkpoint_repo_files(&published_checkpoint(llm).unwrap()).unwrap(),
@@ -122,7 +122,10 @@ fn first_step_payload(
 
 /// The samples of `batch_id` in a dataset whose batches differ from one
 /// another, so that one batch's honest result is not another's.
-fn distinct_batch_data(llm: &LLM, batch_id: BatchId) -> Vec<BatchDataCPU> {
+pub(super) fn distinct_batch_data(
+    llm: &LLM,
+    batch_id: BatchId,
+) -> Vec<BatchDataCPU> {
     let offset = batch_id.0.start as i32;
     let input_ids: Vec<i32> = (0..llm.max_seq_len as i32)
         .map(|i| (i * 7 + offset * 11 + 3) % 29)
@@ -181,26 +184,26 @@ fn flipped(payload: &[DistroResult]) -> Vec<DistroResult> {
 }
 
 /// The pieces of a bonded run the replay suites drive.
-struct ReplayRun {
-    endpoint: ToolboxEndpoint,
-    payer: Keypair,
-    main_authority: Keypair,
-    ticker: Keypair,
-    run: Pubkey,
-    coordinator_instance: Pubkey,
-    coordinator_account: Pubkey,
-    clients: Vec<Keypair>,
-    p2ps: Vec<Keypair>,
+pub(super) struct ReplayRun {
+    pub(super) endpoint: ToolboxEndpoint,
+    pub(super) payer: Keypair,
+    pub(super) main_authority: Keypair,
+    pub(super) ticker: Keypair,
+    pub(super) run: Pubkey,
+    pub(super) coordinator_instance: Pubkey,
+    pub(super) coordinator_account: Pubkey,
+    pub(super) clients: Vec<Keypair>,
+    pub(super) p2ps: Vec<Keypair>,
 }
 
 const WARMUP_TIME: u64 = 10;
 const ROUND_WITNESS_TIME: u64 = 10;
-const COOLDOWN_TIME: u64 = 88;
+pub(super) const COOLDOWN_TIME: u64 = 88;
 
 /// A run of the genesis rehearsal model with four clients, `bonded` of them
 /// bonded, ticked into its first round: the round that trains the run's first
 /// step, the one step a replay reproduces.
-async fn start_replay_run(
+pub(super) async fn start_replay_run(
     run_index: u64,
     run_id: &str,
     bonded: &[usize],
@@ -420,7 +423,7 @@ async fn start_replay_run(
 
 /// Every client the round draws as a witness reports it, and the run is ticked
 /// on past its witness phase.
-async fn witness_round(
+pub(super) async fn witness_round(
     endpoint: &mut ToolboxEndpoint,
     payer: &Keypair,
     ticker: &Keypair,
@@ -624,6 +627,7 @@ pub async fn run() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
 
     let mut convicted = HashSet::new();
@@ -826,6 +830,7 @@ pub async fn an_honest_node_whose_seat_moved_is_judged_against_its_own_batch() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
     let mut convicted = HashSet::new();
     let report = audit_pass(
@@ -1062,6 +1067,7 @@ pub async fn a_later_round_is_judged_from_the_state_its_trainer_revealed() {
         audit_assigned: false,
         dry_run: false,
         verdict_mode: false,
+        continuity: false,
     };
     let mut convicted = HashSet::new();
     let report = audit_pass(
@@ -1119,7 +1125,7 @@ pub async fn a_later_round_is_judged_from_the_state_its_trainer_revealed() {
 
 /// `header`, committing to the state `state`, the one its trainer trained
 /// from, rather than the one the shared fixtures claim.
-fn signed_commitment_header(
+pub(super) fn signed_commitment_header(
     header: psyche_solana_tooling::signed_commitment::PayloadHeader,
     state: [u8; 32],
 ) -> psyche_solana_tooling::signed_commitment::PayloadHeader {

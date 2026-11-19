@@ -8,15 +8,22 @@
 //! is judged against the replay by the band. Given the dumps of a client that
 //! sent forged results, its payloads have to be convicted and every other one
 //! cleared; without, every one has to be cleared.
+//!
+//! With `--continuity`, each round whose trainer trained the next one too is
+//! also checked to leave the state that next round committed to: replayed
+//! from its revealed state, with what the verifier's node applied at the
+//! start of the next round applied, it has to hold that state to the bit.
+//! Every one checked has to hold it, the clients training the verifier's
+//! class of hardware.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use leviathan_verifier::fidelity::read_client_dumps;
+use leviathan_verifier::fidelity::{read_client_dumps, ClientDump};
 use leviathan_verifier::replay::ReplayWork;
-use leviathan_verifier::revealed::revealed_round;
+use leviathan_verifier::revealed::{next_round, revealed_round, Continuity, RevealedRound};
 use leviathan_verifier::run_data::RunData;
 use leviathan_verifier::{
     build_replay_trainer, checkpoint_repo_files, judge_payload, parse_device, parse_dtype,
@@ -56,6 +63,10 @@ struct Args {
     device: String,
     #[arg(long, default_value = "bf16")]
     dtype: String,
+    /// Also check that each round leaves the state its trainer's next round
+    /// commits to.
+    #[arg(long)]
+    continuity: bool,
 }
 
 /// The signer whose own payloads the client with dumps in `dir` kept: those
@@ -75,6 +86,70 @@ fn own_signer(dir: &Path) -> Result<String> {
             dir.display(),
             other.len()
         ),
+    }
+}
+
+/// The first bytes of `digest`, in hex, for a line a human reads.
+fn short(digest: &[u8; 32]) -> String {
+    digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// What `--continuity` found.
+#[derive(Default)]
+struct ContinuityTally {
+    held: usize,
+    /// Of those held, the rounds whose next one applied results first.
+    held_applying: usize,
+    broken: Vec<String>,
+    pending: usize,
+    unchecked: Vec<String>,
+}
+
+impl ContinuityTally {
+    fn check(
+        &mut self,
+        engine: &TrainerReplayEngine,
+        dump: &ClientDump,
+        round: &RevealedRound,
+    ) -> Result<()> {
+        let next = match next_round(&dump.path) {
+            Continuity::Ready(next) => next,
+            Continuity::Pending => {
+                self.pending += 1;
+                return Ok(());
+            }
+            Continuity::Unchecked(why) => {
+                self.unchecked
+                    .push(format!("{} at step {}: {why}", dump.signer, dump.key.step));
+                return Ok(());
+            }
+        };
+        let left = engine
+            .replay_continuity(&dump.key, round, &next)
+            .map_err(|err| {
+                anyhow!(
+                    "replaying {} on to the next round: {err}",
+                    dump.path.display()
+                )
+            })?;
+        match left == next.committed {
+            true => {
+                self.held += 1;
+                self.held_applying += usize::from(next.applied.is_some());
+            }
+            false => self.broken.push(format!(
+                "{} at step {}: left {}, its step {} commits to {}",
+                dump.signer,
+                dump.key.step,
+                short(&left),
+                next.step,
+                short(&next.committed),
+            )),
+        }
+        Ok(())
     }
 }
 
@@ -149,6 +224,7 @@ async fn main() -> Result<()> {
 
     let mut tally: BTreeMap<bool, Tally> = BTreeMap::new();
     let mut wrong = vec![];
+    let mut continuity = ContinuityTally::default();
     for (dump, round, _) in &revealed {
         let replayed = engine
             .replay_revealed_work(&dump.key, round)
@@ -177,6 +253,9 @@ async fn main() -> Result<()> {
                     .unwrap_or_default(),
             ));
         }
+        if args.continuity {
+            continuity.check(&engine, dump, round)?;
+        }
     }
     let honest = tally.remove(&false).unwrap_or_default();
     let forged = tally.remove(&true).unwrap_or_default();
@@ -188,8 +267,36 @@ async fn main() -> Result<()> {
         forged.convicted,
         forged.cleared,
     );
+    if args.continuity {
+        println!(
+            "continuity: {} rounds left the state their trainer's next round committed to ({} of them once the results that round applied first were applied), {} did not; {} had no next payload of their trainer, {} could not be checked here{}",
+            continuity.held,
+            continuity.held_applying,
+            continuity.broken.len(),
+            continuity.pending,
+            continuity.unchecked.len(),
+            match continuity.unchecked.is_empty() {
+                true => String::new(),
+                false => format!(" ({})", continuity.unchecked.join("; ")),
+            },
+        );
+    }
     if !wrong.is_empty() {
         bail!("misjudged:\n{}", wrong.join("\n"));
+    }
+    if args.continuity {
+        if !continuity.broken.is_empty() {
+            bail!(
+                "rounds that did not leave the state their trainer's next round committed to:\n{}",
+                continuity.broken.join("\n")
+            );
+        }
+        if continuity.held == 0 {
+            bail!("no round could be checked for continuity");
+        }
+        if continuity.held_applying == 0 {
+            bail!("no round checked for continuity was followed by one that applied results");
+        }
     }
     if honest.cleared == 0 {
         bail!("no honest payload was replayed, so nothing was cleared");

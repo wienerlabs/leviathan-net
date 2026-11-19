@@ -487,10 +487,38 @@ pub fn previous_round_path(payload_path: &Path) -> PathBuf {
     payload_path.with_extension("previous")
 }
 
+/// Where a verifier keeps what the trainer of the payload dump at
+/// `payload_path` trained in the payload's own round (`PreviousRound`, which
+/// names the batches): the state its next round commits to follows from
+/// this payload's step alone only if it trained no other batch there.
+pub fn round_training_path(payload_path: &Path) -> PathBuf {
+    payload_path.with_extension("round")
+}
+
 #[cfg(test)]
 mod previous_round_tests {
     use super::*;
     use psyche_core::ClosedInterval;
+
+    /// What a verifier keeps beside a payload's dump is named after the dump,
+    /// each under its own name.
+    #[test]
+    fn what_is_kept_beside_a_dump_is_named_after_it() {
+        let dump = Path::new("/kept/result-5rvG-epoch1795040087-step3-batchB[20, 23].vec-postcard");
+        let beside = [
+            crate::revealed_state_path(dump),
+            previous_round_path(dump),
+            round_training_path(dump),
+        ];
+        for path in &beside {
+            assert_eq!(path.parent(), dump.parent());
+            assert_eq!(path.file_stem(), dump.file_stem());
+            assert_ne!(path.as_path(), dump);
+        }
+        assert_ne!(beside[0], beside[1]);
+        assert_ne!(beside[1], beside[2]);
+        assert_ne!(beside[0], beside[2]);
+    }
 
     #[test]
     fn what_a_trainer_did_reads_back_as_written() {
@@ -517,6 +545,94 @@ mod previous_round_tests {
             "trained\nB[0 3]\n",
         ] {
             assert!(PreviousRound::decode(text).is_err(), "{text:?}");
+        }
+    }
+}
+
+/// What a node applied at the start of a round: the results of the round two
+/// before, the consensus payload of each batch in the round's order, by the
+/// name its dump is kept under; or nothing, at the round that follows an
+/// epoch's first, which applies none. Every node that stays in the run
+/// applies the same, so a verifier's own record says what the node it
+/// audits applied between two rounds (wienerlabs/leviathan-net#89).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedResults {
+    Skipped,
+    Applied(Vec<String>),
+}
+
+const SKIPPED: &str = "skipped";
+const APPLIED: &str = "applied";
+
+impl AppliedResults {
+    pub fn encode(&self) -> String {
+        match self {
+            AppliedResults::Skipped => format!("{SKIPPED}\n"),
+            AppliedResults::Applied(dumps) => {
+                let mut text = format!("{APPLIED}\n");
+                for dump in dumps {
+                    text.push_str(dump);
+                    text.push('\n');
+                }
+                text
+            }
+        }
+    }
+
+    pub fn decode(text: &str) -> Result<Self, String> {
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(SKIPPED) if lines.next().is_none() => Ok(AppliedResults::Skipped),
+            Some(APPLIED) => {
+                let dumps: Vec<String> = lines.map(str::to_string).collect();
+                match dumps
+                    .iter()
+                    .any(|dump| dump.is_empty() || dump.contains('/'))
+                {
+                    true => Err("a dump is named by its file name alone".to_string()),
+                    false => Ok(AppliedResults::Applied(dumps)),
+                }
+            }
+            other => Err(format!("not what a node applied: {other:?}")),
+        }
+    }
+}
+
+/// Where a verifier keeps, in its dumps directory `dir`, what it applied at
+/// the start of the round at `step` of the epoch that started at
+/// `epoch_start`.
+pub fn applied_results_path(dir: &Path, epoch_start: u64, step: u32) -> PathBuf {
+    dir.join(format!("applied-epoch{epoch_start}-step{step}.list"))
+}
+
+#[cfg(test)]
+mod applied_results_tests {
+    use super::*;
+
+    #[test]
+    fn what_a_node_applied_reads_back_as_written() {
+        for applied in [
+            AppliedResults::Skipped,
+            AppliedResults::Applied(vec![]),
+            AppliedResults::Applied(vec![
+                "result-a-epoch9-step3-batchB[0, 3].vec-postcard".to_string(),
+                "result-b-epoch9-step3-batchB[4, 7].vec-postcard".to_string(),
+            ]),
+        ] {
+            assert_eq!(AppliedResults::decode(&applied.encode()), Ok(applied));
+        }
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        for text in [
+            "",
+            "skipped\nx\n",
+            "applied\n../x\n",
+            "applied\n\n",
+            "kept\n",
+        ] {
+            assert!(AppliedResults::decode(text).is_err(), "{text:?}");
         }
     }
 }

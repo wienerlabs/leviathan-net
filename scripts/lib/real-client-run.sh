@@ -63,6 +63,7 @@ run_real_clients() {
     until grep -aq "Server listening on" "$WORK/server.log"; do
         if ! kill -0 "$server" 2>/dev/null || ((SECONDS > ready)); then
             echo "$LABEL the server did not start on port $PORT; logs in $WORK" >&2
+            show_log "$WORK/server.log"
             exit 1
         fi
         sleep 1
