@@ -32,6 +32,7 @@ pub mod error_feedback;
 pub mod fidelity;
 pub mod hardware;
 pub mod replay;
+pub mod revealed;
 pub mod round_states;
 pub mod run_data;
 

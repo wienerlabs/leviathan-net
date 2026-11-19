@@ -31,6 +31,7 @@ use iroh_blobs::store::GcConfig;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash};
+use psyche_core::BatchId;
 use psyche_modeling::{ROUND_STATE_EXTENSION, round_state_file};
 use thiserror::Error;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -418,4 +419,104 @@ async fn write_fetched(
     }
     file.flush().await?;
     Ok(())
+}
+
+/// What a verifier saw a payload's trainer do in the round before the
+/// payload's. A node's step takes its own results of the round before out of
+/// its buffer first, so a replay of its round from the state it revealed
+/// needs to know which they were (wienerlabs/leviathan-net#89).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviousRound {
+    /// It trained nothing there, or the payload's round opens its epoch,
+    /// which starts every node's rounds afresh: its step takes nothing out
+    /// first.
+    Idle,
+    /// It trained these batches there, and its step takes its results for
+    /// them out first.
+    Trained(Vec<BatchId>),
+    /// The verifier did not see that round.
+    Unknown,
+}
+
+const IDLE: &str = "idle";
+const TRAINED: &str = "trained";
+const UNKNOWN: &str = "unknown";
+
+impl PreviousRound {
+    /// The text kept beside a payload's dump: what the trainer did, then each
+    /// batch it trained, one a line.
+    pub fn encode(&self) -> String {
+        match self {
+            PreviousRound::Idle => format!("{IDLE}\n"),
+            PreviousRound::Unknown => format!("{UNKNOWN}\n"),
+            PreviousRound::Trained(batches) => {
+                let mut text = format!("{TRAINED}\n");
+                for batch in batches {
+                    text.push_str(&format!("{batch}\n"));
+                }
+                text
+            }
+        }
+    }
+
+    pub fn decode(text: &str) -> Result<Self, String> {
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(IDLE) if lines.next().is_none() => Ok(PreviousRound::Idle),
+            Some(UNKNOWN) if lines.next().is_none() => Ok(PreviousRound::Unknown),
+            Some(TRAINED) => {
+                let batches = lines
+                    .map(|line| {
+                        line.parse::<BatchId>()
+                            .map_err(|err| format!("{line}: {err}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if batches.is_empty() {
+                    return Err("trained, but no batch named".to_string());
+                }
+                Ok(PreviousRound::Trained(batches))
+            }
+            other => Err(format!("not what a trainer did in a round: {other:?}")),
+        }
+    }
+}
+
+/// Where a verifier keeps what the trainer of the payload dump at
+/// `payload_path` did in the round before (`PreviousRound`).
+pub fn previous_round_path(payload_path: &Path) -> PathBuf {
+    payload_path.with_extension("previous")
+}
+
+#[cfg(test)]
+mod previous_round_tests {
+    use super::*;
+    use psyche_core::ClosedInterval;
+
+    #[test]
+    fn what_a_trainer_did_reads_back_as_written() {
+        for previous in [
+            PreviousRound::Idle,
+            PreviousRound::Unknown,
+            PreviousRound::Trained(vec![BatchId(ClosedInterval::new(8, 11))]),
+            PreviousRound::Trained(vec![
+                BatchId(ClosedInterval::new(0, 3)),
+                BatchId(ClosedInterval::new(12, 15)),
+            ]),
+        ] {
+            assert_eq!(PreviousRound::decode(&previous.encode()), Ok(previous));
+        }
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        for text in [
+            "",
+            "trained\n",
+            "idle\nB[0, 3]\n",
+            "slept\n",
+            "trained\nB[0 3]\n",
+        ] {
+            assert!(PreviousRound::decode(text).is_err(), "{text:?}");
+        }
+    }
 }

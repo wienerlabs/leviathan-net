@@ -39,6 +39,10 @@ path = "src/bin/check_round_states.rs"
 name = "check-revealed-states"
 path = "src/bin/check_revealed_states.rs"
 
+[[bin]]
+name = "audit-revealed-rounds"
+path = "src/bin/audit_revealed_rounds.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -55,6 +59,7 @@ psyche-modeling.workspace = true
 psyche-metrics.workspace = true
 blake3 = "1.8.3"
 tempfile = "3"
+thiserror.workspace = true
 psyche-verifier.workspace = true
 
 [dev-dependencies]

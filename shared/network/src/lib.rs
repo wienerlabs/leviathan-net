@@ -99,8 +99,8 @@ use iroh_relay::{RelayMap, RelayQuicConfig};
 use rustls_pki_types::CertificateDer;
 pub use latency_sorted::LatencySorted;
 pub use round_states::{
-    FetchRoundStateError, ROUND_STATE_ALPN, RevealError, RoundStates, RoundStatesError,
-    fetch_round_state, reveal_round_state,
+    FetchRoundStateError, PreviousRound, ROUND_STATE_ALPN, RevealError, RoundStates,
+    RoundStatesError, fetch_round_state, previous_round_path, reveal_round_state,
 };
 pub use p2p_model_sharing::{
     ALPN, ModelRequestType, SharableModel, SharableModelError, TransmittableModelConfig,

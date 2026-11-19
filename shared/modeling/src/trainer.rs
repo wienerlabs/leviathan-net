@@ -288,6 +288,9 @@ enum ParallelAssignment {
         kind: Kind,
     },
     RoundStateLen,
+    PreviousResults {
+        previous: Vec<DistroResult>,
+    },
 }
 
 #[derive(Debug)]
@@ -318,6 +321,9 @@ enum ParallelResult {
     },
     RoundStateLen {
         len: Result<Option<u64>, String>,
+    },
+    PreviousResults {
+        results: Result<Vec<DistroResult>, String>,
     },
 }
 
@@ -436,6 +442,24 @@ impl Trainer {
             #[cfg(feature = "python")]
             Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
                 "say how long its state is",
+            )),
+        }
+    }
+
+    /// The values this trainer's buffer holds at the indices of `previous`,
+    /// a node's previous result as it broadcast it: what that node sent,
+    /// unquantized, and takes out of its buffer at its next step
+    /// (`Distro::results_at`). A replay of a node's round from the state it
+    /// revealed trains with them (wienerlabs/leviathan-net#89).
+    pub fn previous_results(
+        &mut self,
+        previous: &[DistroResult],
+    ) -> Result<Vec<DistroResult>, TrainerThreadCommunicationError> {
+        match self {
+            Trainer::Local(local_trainer) => local_trainer.previous_results(previous),
+            #[cfg(feature = "python")]
+            Trainer::PythonDistributed(_) => Err(TrainerThreadCommunicationError::Unsupported(
+                "read a previous result off its buffer",
             )),
         }
     }
@@ -559,6 +583,9 @@ pub enum TrainerThreadCommunicationError {
 
     #[error("A model thread could not say how long its round state is: {0}")]
     RoundStateLen(String),
+
+    #[error("A model thread could not read a previous result off its buffer: {0}")]
+    PreviousResults(String),
 
     #[cfg(feature = "python")]
     #[error("Python error: {0}")]
@@ -1036,6 +1063,45 @@ impl LocalTrainer {
         match first {
             Some(Ok(len)) => Ok(len),
             Some(Err(error)) => Err(TrainerThreadCommunicationError::RoundStateLen(error)),
+            None => Err(TrainerThreadCommunicationError::RecvResult),
+        }
+    }
+
+    /// The values the first model thread's buffer holds at the indices of
+    /// `previous` (`Distro::results_at`). Every thread reads them, as a
+    /// sharded model gathers each buffer together.
+    pub fn previous_results(
+        &mut self,
+        previous: &[DistroResult],
+    ) -> Result<Vec<DistroResult>, TrainerThreadCommunicationError> {
+        self.barrier.reset();
+        for (tx, _) in &self.models {
+            tx.send(ParallelAssignment::PreviousResults {
+                previous: previous.to_vec(),
+            })
+            .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
+        }
+        let mut first = None;
+        for (_, rx) in &self.models {
+            match rx
+                .recv()
+                .map_err(|_| TrainerThreadCommunicationError::RecvResult)?
+            {
+                ParallelResult::PreviousResults { results } => {
+                    if first.is_none() {
+                        first = Some(results);
+                    }
+                }
+                result => {
+                    return Err(TrainerThreadCommunicationError::UnexpectedResult(format!(
+                        "{result:?}"
+                    )));
+                }
+            }
+        }
+        match first {
+            Some(Ok(results)) => Ok(results),
+            Some(Err(error)) => Err(TrainerThreadCommunicationError::PreviousResults(error)),
             None => Err(TrainerThreadCommunicationError::RecvResult),
         }
     }
@@ -1548,6 +1614,22 @@ impl LocalTrainer {
                     };
                     if submission
                         .send(ParallelResult::SetErrorFeedbackKind { error })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ParallelAssignment::PreviousResults { previous }) => {
+                    let results = match &mut optimizer {
+                        Optimizer::Distro { optimizer, .. } => optimizer
+                            .results_at(model.as_ref(), &previous)
+                            .map_err(|error| error.to_string()),
+                        Optimizer::Torch { .. } | Optimizer::Null => {
+                            Err("the optimizer keeps no error feedback".to_string())
+                        }
+                    };
+                    if submission
+                        .send(ParallelResult::PreviousResults { results })
                         .is_err()
                     {
                         return;

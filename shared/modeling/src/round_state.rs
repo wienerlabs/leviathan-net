@@ -35,6 +35,22 @@ pub enum RoundStateError {
     Kind(Kind),
     #[error("writing a round's state failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("the bytes are not a round's state: they do not start with its domain")]
+    Domain,
+    #[error("a round's state ends {0} bytes early")]
+    Truncated(usize),
+    #[error("a round's state names a dtype tag {0} that has no tensor kind")]
+    Tag(u8),
+    #[error("a tensor of a round's state has a name that is not UTF-8")]
+    Name,
+    #[error("tensor {name} of a round's state holds {len} bytes for its shape {shape:?}")]
+    Data {
+        name: String,
+        shape: Vec<i64>,
+        len: usize,
+    },
+    #[error("a round's state has {0} bytes after its last tensor")]
+    Trailing(usize),
 }
 
 /// The tag a tensor's dtype is written under. Only the dtypes a model trains
@@ -56,6 +72,17 @@ fn tensor_len(name: &str, shape: &[i64], kind: Kind) -> Result<u64, RoundStateEr
     let numel: i64 = shape.iter().product();
     let header = 4 + name.len() + 1 + 4 + 8 * shape.len() + 8;
     Ok(header as u64 + numel as u64 * kind.elt_size_in_bytes() as u64)
+}
+
+/// The tensor kind a dtype's tag is written for.
+fn tag_kind(tag: u8) -> Result<Kind, RoundStateError> {
+    match tag {
+        1 => Ok(Kind::Float),
+        2 => Ok(Kind::BFloat16),
+        3 => Ok(Kind::Half),
+        4 => Ok(Kind::Double),
+        other => Err(RoundStateError::Tag(other)),
+    }
 }
 
 /// Writes `tensor` under `name`: the name's length and bytes, the dtype's
@@ -251,5 +278,89 @@ fn discard(partial: &Path) {
             path = %partial.display(),
             "Could not remove a round state's partial file: {err}"
         ),
+    }
+}
+
+/// A round's state read back from `write_round_state`'s encoding: the model's
+/// variables, then the error-feedback buffer, each by name, in the order the
+/// model holds them, on the CPU.
+#[derive(Debug)]
+pub struct RoundStateTensors {
+    pub variables: Vec<(String, Tensor)>,
+    pub buffers: Vec<(String, Tensor)>,
+}
+
+/// Reads `bytes` as `write_round_state` encodes them, refusing anything that
+/// is not one round's state, whole: another domain, a dtype tag it does not
+/// know, a tensor whose data does not fit its shape, or bytes past the end.
+pub fn read_round_state(bytes: &[u8]) -> Result<RoundStateTensors, RoundStateError> {
+    let mut reader = StateReader { bytes, at: 0 };
+    if reader.take(ROUND_STATE_DOMAIN.len())? != ROUND_STATE_DOMAIN {
+        return Err(RoundStateError::Domain);
+    }
+    let variables = reader.section()?;
+    let buffers = reader.section()?;
+    let trailing = bytes.len() - reader.at;
+    if trailing > 0 {
+        return Err(RoundStateError::Trailing(trailing));
+    }
+    Ok(RoundStateTensors { variables, buffers })
+}
+
+struct StateReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> StateReader<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], RoundStateError> {
+        let end = self
+            .at
+            .checked_add(len)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(RoundStateError::Truncated(
+                len.saturating_sub(self.bytes.len() - self.at),
+            ))?;
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> Result<u32, RoundStateError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, RoundStateError> {
+        let mut le = [0u8; 8];
+        le.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(le))
+    }
+
+    fn section(&mut self) -> Result<Vec<(String, Tensor)>, RoundStateError> {
+        let count = self.u32()?;
+        (0..count).map(|_| self.tensor()).collect()
+    }
+
+    fn tensor(&mut self) -> Result<(String, Tensor), RoundStateError> {
+        let name_len = self.u32()? as usize;
+        let name = std::str::from_utf8(self.take(name_len)?)
+            .map_err(|_| RoundStateError::Name)?
+            .to_string();
+        let kind = tag_kind(self.take(1)?[0])?;
+        let dims = self.u32()?;
+        let shape = (0..dims)
+            .map(|_| self.u64().map(|dim| dim as i64))
+            .collect::<Result<Vec<i64>, _>>()?;
+        let len = self.u64()? as usize;
+        let data = self.take(len)?;
+        let numel = shape.iter().try_fold(1usize, |numel, dim| {
+            usize::try_from(*dim).ok()?.checked_mul(numel)
+        });
+        let expected = numel.and_then(|numel| numel.checked_mul(kind.elt_size_in_bytes()));
+        if expected != Some(len) {
+            return Err(RoundStateError::Data { name, shape, len });
+        }
+        Ok((name, Tensor::from_data_size(data, &shape, kind)))
     }
 }

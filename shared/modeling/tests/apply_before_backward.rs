@@ -39,7 +39,7 @@ fn a_node_that_has_trained_nothing_applies_its_peers_results() {
             .all(|variable| !variable.logical_tensor().grad().defined()),
         "no backward pass has reached the untrained node's variables"
     );
-    distro(&recipe, &*untrained).apply(&*untrained, &[results.clone()], recipe.lr);
+    distro(&recipe, &*untrained).apply(&*untrained, std::slice::from_ref(&results), recipe.lr);
 
     let trained = load(&recipe);
     give_zero_gradients(&*trained);

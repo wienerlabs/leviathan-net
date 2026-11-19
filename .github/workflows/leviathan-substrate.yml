@@ -206,5 +206,5 @@ jobs:
       # it audits commits to (wienerlabs/leviathan-net#89).
       - name: Verifier seats keep every honest client and fetch audited states, against real clients
         run: |
-          cargo build --locked --bin psyche-centralized-server --bin psyche-centralized-client --bin check-revealed-states
+          cargo build --locked --bin psyche-centralized-server --bin psyche-centralized-client --bin check-revealed-states --bin audit-revealed-rounds
           bash scripts/verifier-seats.sh
