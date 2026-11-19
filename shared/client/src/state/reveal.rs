@@ -66,13 +66,19 @@ pub(crate) struct StateToReveal {
     pub time_to_reveal: Duration,
 }
 
+/// How often a verifier asks again for a state it has not got. Its daemon
+/// votes a non-reveal once the run's reveal window has passed in a witness
+/// phase, a window shorter than the witness phase, so an honest trainer's
+/// state has to be asked for again well within it: the first request can
+/// come before the trainer kept it (wienerlabs/leviathan-net#89).
+pub(crate) const REVEAL_RETRY: Duration = Duration::from_secs(1);
+
 impl StateToReveal {
     /// How long a verifier asks for the state of a payload trained in the
     /// epoch `state` is in: until the epoch is over, as the treasurer convicts
-    /// only on a commitment from it. It asks again every round witness time,
-    /// the span a round's results are broadcast in.
+    /// only on a commitment from it. It asks again every `REVEAL_RETRY`.
     pub fn windows(state: &Coordinator) -> (Duration, Duration) {
-        let retry_every = Duration::from_secs(state.config.round_witness_time.max(1));
+        let retry_every = REVEAL_RETRY;
         let epoch_over = state.epoch_state.start_timestamp
             + state.config.epoch_time
             + state.config.cooldown_time;
@@ -273,6 +279,29 @@ mod tests {
 
     /// The batches the trainer was assigned in the round before, and only
     /// its own.
+    /// A state is asked for again every second, however long the run's
+    /// witness phase, until the payload's epoch is over.
+    #[test]
+    fn a_state_is_asked_for_again_every_second_until_the_epoch_is_over() {
+        let mut state: Coordinator = bytemuck::Zeroable::zeroed();
+        state.config.round_witness_time = 30;
+        state.config.epoch_time = 100;
+        state.config.cooldown_time = 10;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state.epoch_state.start_timestamp = now;
+        let (retry_every, time_to_reveal) = StateToReveal::windows(&state);
+        assert_eq!(retry_every, Duration::from_secs(1));
+        assert!(
+            (108..=110).contains(&time_to_reveal.as_secs()),
+            "{time_to_reveal:?}"
+        );
+        state.epoch_state.start_timestamp = now - 200;
+        assert_eq!(StateToReveal::windows(&state).1, Duration::ZERO);
+    }
+
     #[test]
     fn a_trainer_that_trained_the_round_before_took_its_results_out() {
         let (trainer, other) = (identity(1), identity(2));

@@ -29,6 +29,7 @@ use psyche_solana_treasurer::state::commitment_run;
 use psyche_solana_treasurer::state::committee_matches_roster;
 use psyche_solana_treasurer::state::AuditVerdict;
 use psyche_solana_treasurer::state::CommitmentEvidence;
+use psyche_solana_treasurer::state::VerdictKind;
 use psyche_solana_treasurer::state::VerdictStatus;
 use psyche_verifier::hash_delta;
 use solana_sdk::pubkey::Pubkey;
@@ -38,9 +39,11 @@ use tch::Device;
 
 use crate::daemon_continuity::ContinuityPass;
 use crate::daemon_equivocation::EquivocationPass;
+use crate::daemon_non_reveal::NonRevealPass;
 use crate::get_accounts::get_coordinator_account_state;
 use crate::process_treasurer_instructions::process_treasurer_run_slash;
 use crate::process_treasurer_instructions::process_treasurer_run_submit_audit_verdict;
+use crate::process_treasurer_instructions::process_treasurer_run_submit_non_reveal_verdict;
 use crate::slash_reports::settle_slash_reports;
 use crate::verdict_votes::settle_open_disputes;
 use crate::verdict_votes::settle_previous_dispute;
@@ -618,6 +621,7 @@ async fn run_pass(
             index,
             signed,
             replayed_hash,
+            kind: VerdictKind::Replay,
         })
         .await;
     }
@@ -639,6 +643,24 @@ async fn run_pass(
             judged: &mut *judged,
         }
         .check_all(&submitted)
+        .await;
+    }
+
+    // Then, voting on verdicts, each of this daemon's own audits whose state
+    // its node did not get within the run's reveal window is voted a
+    // non-reveal (wienerlabs/leviathan-net#89). It needs no replay.
+    if config.verdict_mode {
+        NonRevealPass {
+            endpoint: &mut *endpoint,
+            authority,
+            coordinator_account,
+            run,
+            config,
+            coordinator,
+            report: &mut report,
+            judged: &mut *judged,
+        }
+        .vote_all(&submitted)
         .await;
     }
 
@@ -715,6 +737,10 @@ pub struct Conviction {
     pub index: usize,
     pub signed: SignedCommitment,
     pub replayed_hash: [u8; 32],
+    /// What it convicts of: a replay outside the band, or a state the target
+    /// did not reveal (wienerlabs/leviathan-net#89). A non-reveal is only ever
+    /// voted, never slashed by the run authority.
+    pub kind: VerdictKind,
 }
 
 impl Convicting<'_> {
@@ -730,6 +756,7 @@ impl Convicting<'_> {
             index,
             signed,
             replayed_hash,
+            kind,
         } = conviction;
         let index = *index;
         let replayed_hash = *replayed_hash;
@@ -790,7 +817,24 @@ impl Convicting<'_> {
                 ),
             }
         }
-        let result = if config.verdict_mode {
+        let result = if config.verdict_mode && *kind == VerdictKind::NonReveal {
+            process_treasurer_run_submit_non_reveal_verdict(
+                endpoint,
+                authority,
+                authority,
+                run,
+                coordinator_account,
+                &config.run_id,
+                &target_signer,
+                index as u64,
+                signed,
+            )
+            .await
+        } else if *kind == VerdictKind::NonReveal {
+            println!("  a non-reveal of {committer} is only voted, and this daemon slashes; not sent");
+            judged.insert(key.clone());
+            return;
+        } else if config.verdict_mode {
             process_treasurer_run_submit_audit_verdict(
                 endpoint,
                 authority,

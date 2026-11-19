@@ -286,13 +286,13 @@ so its old signature no longer checks against the roster.
 - It needs both exporters up. The alerts on a down or stale indexer or verifier
   cover that.
 
-Today the binding window is wider. The verifier replays only a run's first
-step (wienerlabs/leviathan-net#48), whose window is the rest of epoch 0. The
-final round's window binds once later steps are replayable, and the alert says
-whether the run is ready for it. Later steps become checkable when an audited
-node reveals its error feedback and weights (`docs/ERROR_FEEDBACK.md`, built in
-wienerlabs/leviathan-net#89 as `docs/ROUND_AUDIT.md` designs it). That reveal
-needs a window of its own: for a 1B model trained in bf16 it is about 3.7 GiB.
+The final round's window binds. The verifier replays every round whose state
+its trainer revealed, not only a run's first step (wienerlabs/leviathan-net#48,
+#89, `docs/ROUND_AUDIT.md`), and the alert says whether the run is ready for
+it. The reveal needs a window of its own: for a 1B model trained in bf16 the
+state is about 3.7 GiB. Set it with `run_set_reveal_window`, shorter than the
+run's `round_witness_time`, and give a run with a large state a witness phase
+long enough to fetch it (`docs/OPS_RUNBOOK.md`).
 
 ### Stage one is still bondless
 

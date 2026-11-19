@@ -23,6 +23,7 @@ use leviathan_verifier::revealed::Continuity;
 use leviathan_verifier::CommitmentCheck;
 use leviathan_verifier::ReplayWork;
 use psyche_coordinator::Coordinator;
+use psyche_solana_treasurer::state::VerdictKind;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_toolbox_endpoint::ToolboxEndpoint;
@@ -233,6 +234,7 @@ impl ContinuityPass<'_> {
             index,
             signed,
             replayed_hash: left,
+            kind: VerdictKind::Replay,
         }))
     }
 }

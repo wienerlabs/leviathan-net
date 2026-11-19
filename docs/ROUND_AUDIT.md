@@ -137,9 +137,10 @@ reaches it at that key.
   once more on every verifier.
 - **Asking again.** A trainer keeps a state beside its payload's broadcast,
   not before it, so the first request can find it missing. The verifier asks
-  again every round witness time, the span a round's results are broadcast
-  in, until the payload's epoch is over: after that the treasurer convicts
-  nobody on it. A state of another length is refused at once.
+  again every second, well within the reveal window its daemon votes a
+  non-reveal after, until the payload's epoch is over: after that the
+  treasurer convicts nobody on it. A state of another length is refused at
+  once.
 
 - **The fetch checks itself.** iroh verifies a blob against its hash as it
   arrives, and the hash is the digest the trainer signed. A state that does
@@ -293,6 +294,19 @@ let verifiers claim a non-reveal falsely.
 
 So a false non-reveal claim needs a colluding quorum, as a false fraud vote
 does, and it fails against a target that serves its state on appeal.
+
+**The daemon's vote.** In verdict mode, each pass the daemon reads the run's
+window and the chain's clock. Once the window has passed in a witness phase
+(or the final round's cooldown), it votes a non-reveal for each payload:
+- that the round's audit lottery assigns its own key;
+- that its node set out to fetch the state of, which `<dump>.previous`,
+  written before the fetch, shows;
+- whose state is not beside its dump;
+- whose payload commits to a state, signed by the target.
+
+A missing state of a payload its node never asked for says nothing of the
+trainer, so it is never voted. The node asks every second, well within the
+window.
 
 ## What is built, PR by PR
 
